@@ -8,6 +8,7 @@ pub mod bus;
 pub mod dag;
 pub mod governor;
 pub mod knobs;
+pub mod registry;
 pub mod types;
 
 pub use bus::{
@@ -17,6 +18,7 @@ pub use bus::{
 pub use dag::{Dag, DagNode, Edge, OpHash, RamCache};
 pub use governor::{MemoryGovernor, MemoryPermit, RenderEpoch, evaluate_with_airbag};
 pub use knobs::{KnobTable, KnobValue};
+pub use registry::{NodeCartridgeDescriptor, find_cartridge, registered_cartridge_kinds};
 pub use types::{EvalContext, NodeError, NodeTrait, Packet, Time, TypeMap, View};
 
 #[cfg(test)]

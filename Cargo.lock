@@ -2289,6 +2289,7 @@ dependencies = [
  "egui",
  "pollster 0.4.0",
  "tanova-kernel",
+ "tanova-nodes",
  "tanova-render",
  "tanova-ui",
  "wgpu",
@@ -2300,6 +2301,7 @@ version = "0.1.0"
 dependencies = [
  "tanova-io",
  "tanova-kernel",
+ "tanova-nodes",
  "tanova-parse",
 ]
 

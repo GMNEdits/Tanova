@@ -13,6 +13,7 @@ use indexmap::IndexMap;
 use crate::bus::{NodeId, PortId, UndoableCommand};
 use crate::governor::{MemoryGovernor, RenderEpoch, evaluate_with_airbag};
 use crate::knobs::{KnobTable, KnobValue, canonical_f64};
+use crate::registry::find_cartridge;
 use crate::types::{EvalContext, NodeError, NodeTrait, Packet};
 
 /// A directed connection from an upstream output to a downstream input.
@@ -286,9 +287,20 @@ impl Dag {
         &mut self.cache
     }
 
-    /// Adds a node without an implementation.
+    /// Adds a node, auto-wiring its cartridge from the registry when the kind
+    /// is registered.
+    ///
+    /// Registered cartridges contribute their default knobs and factory
+    /// implementation. Unknown kinds are still added, ready for the UI to
+    /// attach an implementation manually.
     pub fn add_node(&mut self, id: NodeId, kind: impl Into<String>) -> Result<(), NodeError> {
-        self.insert_node(DagNode::new(id, kind))
+        let kind = kind.into();
+        let mut node = DagNode::new(id, kind.clone());
+        if let Some(descriptor) = find_cartridge(&kind) {
+            node.knobs = (descriptor.default_knobs)();
+            node.implementation = Some((descriptor.factory)());
+        }
+        self.insert_node(node)
     }
 
     /// Adds a node with its cartridge attached.

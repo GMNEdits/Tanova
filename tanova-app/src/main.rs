@@ -46,6 +46,7 @@ pub async fn init_gpu() -> Result<GpuContext, Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    tanova_nodes::ensure_linked();
     let gpu = pollster::block_on(init_gpu())?;
     println!(
         "wgpu device ready; holding {} shared GPU handle(s)",
