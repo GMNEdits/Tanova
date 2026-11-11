@@ -166,6 +166,15 @@ pub enum NodeError {
         reason: String,
     },
 
+    /// A memory reservation would push the kernel past its cap.
+    #[error("memory limit exceeded: requested {requested} bytes, {available} available")]
+    MemoryExceeded {
+        /// Bytes the caller asked for.
+        requested: usize,
+        /// Bytes still available when the request was made.
+        available: usize,
+    },
+
     /// The node's own code panicked; captured by the airbag in the kernel.
     #[error("node panicked during evaluation: {0}")]
     Panic(String),
