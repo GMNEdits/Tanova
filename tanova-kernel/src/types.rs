@@ -10,6 +10,7 @@
 
 use std::any::Any;
 
+use crate::governor::MemoryGovernor;
 use crate::knobs::KnobTable;
 
 /// The backing type map: one value per concrete type, safe to move between
@@ -155,6 +156,14 @@ impl EvalContext {
     /// The live knobs of the node currently being evaluated, if injected.
     pub fn knobs(&self) -> Option<&KnobTable> {
         self.get::<KnobTable>()
+    }
+
+    /// The kernel's memory governor, if injected.
+    ///
+    /// Cartridges allocating tile buffers reserve from this governor so the
+    /// kernel can enforce its cap before the allocator runs.
+    pub fn governor(&self) -> Option<&MemoryGovernor> {
+        self.get::<MemoryGovernor>()
     }
 }
 

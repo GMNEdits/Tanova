@@ -10,5 +10,6 @@ repository.workspace = true
 [dependencies]
 tanova-kernel.workspace = true
 bytemuck.workspace = true
+indexmap.workspace = true
 pollster.workspace = true
 wgpu.workspace = true

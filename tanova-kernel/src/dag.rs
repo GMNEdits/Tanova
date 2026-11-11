@@ -511,11 +511,13 @@ impl Dag {
         let evaluated = {
             // Knobs live on the DagNode; inject them into a per-node context so
             // cartridges can read live values without changing `evaluate`'s
-            // signature.
+            // signature. The governor rides along so tile allocations reserve
+            // from the same cap the kernel enforces.
             let mut node_ctx = ctx.clone();
             if let Some(node) = self.nodes.get(&id) {
                 node_ctx.insert(node.knobs.clone());
             }
+            node_ctx.insert(governor.clone());
             evaluate_with_airbag(implementation.as_ref(), &node_ctx, &inputs)
         };
 
@@ -702,6 +704,23 @@ mod tests {
 
         fn serialize_to_tcl(&self) -> String {
             "BumpingNode {}".to_string()
+        }
+    }
+
+    struct GovernorProbe;
+
+    impl NodeTrait for GovernorProbe {
+        fn evaluate(&self, ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
+            let governor = ctx
+                .governor()
+                .ok_or_else(|| NodeError::Other("governor was not injected".to_string()))?;
+            let mut packet = Packet::new();
+            packet.insert(governor.max_bytes());
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            "GovernorProbe {}".to_string()
         }
     }
 
@@ -906,5 +925,29 @@ mod tests {
             Some("dag airbag test")
         );
         assert!(dag.cache().is_empty());
+    }
+
+    #[test]
+    fn governor_is_injected_into_the_eval_context() {
+        let mut dag = Dag::new();
+        dag.add_node_with_implementation(NodeId(1), "GovernorProbe", Arc::new(GovernorProbe))
+            .unwrap();
+
+        let governor = MemoryGovernor::new(4096);
+        let packet = dag
+            .evaluate_pull(
+                NodeId(1),
+                &EvalContext::new(),
+                &governor,
+                &RenderEpoch::new(),
+                0,
+            )
+            .expect("governor probe should evaluate");
+
+        assert_eq!(
+            packet.get::<usize>(),
+            Some(&4096),
+            "the cartridge must see the kernel's governor through EvalContext"
+        );
     }
 }
