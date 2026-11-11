@@ -5,14 +5,18 @@
 //! command/texture message bus. Deliberately blind to VFX math.
 
 pub mod bus;
+pub mod dag;
 pub mod governor;
+pub mod knobs;
 pub mod types;
 
 pub use bus::{
     FrameNotification, KernelEvent, KernelHandle, KernelMessage, NodeId, PortId, UndoStack,
     UndoableCommand,
 };
+pub use dag::{Dag, DagNode, Edge, OpHash, RamCache};
 pub use governor::{MemoryGovernor, MemoryPermit, RenderEpoch, evaluate_with_airbag};
+pub use knobs::{KnobTable, KnobValue};
 pub use types::{EvalContext, NodeError, NodeTrait, Packet, Time, TypeMap, View};
 
 #[cfg(test)]
@@ -101,11 +105,9 @@ mod tests {
     fn background_kernel_applies_undoes_and_redoes_commands() {
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
 
-        let command = UndoableCommand::SetKnob {
-            node: NodeId(7),
-            knob: "gain".to_string(),
-            value: "2.0".to_string(),
-            previous: "1.0".to_string(),
+        let command = UndoableCommand::AddNode {
+            id: NodeId(7),
+            kind: "Dummy".to_string(),
         };
 
         kernel

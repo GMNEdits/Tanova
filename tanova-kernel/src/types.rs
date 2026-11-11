@@ -14,8 +14,10 @@ use std::any::Any;
 /// the UI and the kernel thread.
 ///
 /// anymap keys on its own `Any` trait (a `std`-`Any` extension), which is what
-/// makes the `Send + Sync` bounds expressible.
-pub type TypeMap = anymap::Map<dyn anymap::any::Any + Send + Sync>;
+/// makes the `Send + Sync` bounds expressible. `CloneAny` keeps packets
+/// cheaply copyable for the RAM cache; heavy payloads should be stored behind
+/// an `Arc` so a clone does not copy pixels.
+pub type TypeMap = anymap::Map<dyn anymap::any::CloneAny + Send + Sync>;
 
 /// Render state carried top-down: the frame time in seconds.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
@@ -26,7 +28,7 @@ pub struct Time(pub f64);
 pub struct View(pub String);
 
 /// Generic data travelling bottom-up from a node to its consumers.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Packet {
     data: TypeMap,
 }
@@ -53,27 +55,27 @@ impl Packet {
     }
 
     /// Inserts a value, returning the previous value of the same type, if any.
-    pub fn insert<T: Any + Send + Sync>(&mut self, value: T) -> Option<T> {
+    pub fn insert<T: Any + Send + Sync + Clone>(&mut self, value: T) -> Option<T> {
         self.data.insert(value)
     }
 
     /// Borrows the value of type `T`.
-    pub fn get<T: Any + Send + Sync>(&self) -> Option<&T> {
+    pub fn get<T: Any + Send + Sync + Clone>(&self) -> Option<&T> {
         self.data.get()
     }
 
     /// Mutably borrows the value of type `T`.
-    pub fn get_mut<T: Any + Send + Sync>(&mut self) -> Option<&mut T> {
+    pub fn get_mut<T: Any + Send + Sync + Clone>(&mut self) -> Option<&mut T> {
         self.data.get_mut()
     }
 
     /// Removes and returns the value of type `T`.
-    pub fn remove<T: Any + Send + Sync>(&mut self) -> Option<T> {
+    pub fn remove<T: Any + Send + Sync + Clone>(&mut self) -> Option<T> {
         self.data.remove()
     }
 
     /// Returns `true` if the packet holds a value of type `T`.
-    pub fn contains<T: Any + Send + Sync>(&self) -> bool {
+    pub fn contains<T: Any + Send + Sync + Clone>(&self) -> bool {
         self.data.contains::<T>()
     }
 
@@ -94,7 +96,7 @@ impl Packet {
 }
 
 /// Render context travelling top-down from the viewer into the DAG.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EvalContext {
     data: TypeMap,
 }
@@ -114,27 +116,27 @@ impl EvalContext {
     }
 
     /// Inserts a value, returning the previous value of the same type, if any.
-    pub fn insert<T: Any + Send + Sync>(&mut self, value: T) -> Option<T> {
+    pub fn insert<T: Any + Send + Sync + Clone>(&mut self, value: T) -> Option<T> {
         self.data.insert(value)
     }
 
     /// Borrows the value of type `T`.
-    pub fn get<T: Any + Send + Sync>(&self) -> Option<&T> {
+    pub fn get<T: Any + Send + Sync + Clone>(&self) -> Option<&T> {
         self.data.get()
     }
 
     /// Mutably borrows the value of type `T`.
-    pub fn get_mut<T: Any + Send + Sync>(&mut self) -> Option<&mut T> {
+    pub fn get_mut<T: Any + Send + Sync + Clone>(&mut self) -> Option<&mut T> {
         self.data.get_mut()
     }
 
     /// Removes and returns the value of type `T`.
-    pub fn remove<T: Any + Send + Sync>(&mut self) -> Option<T> {
+    pub fn remove<T: Any + Send + Sync + Clone>(&mut self) -> Option<T> {
         self.data.remove()
     }
 
     /// Returns `true` if the context holds a value of type `T`.
-    pub fn contains<T: Any + Send + Sync>(&self) -> bool {
+    pub fn contains<T: Any + Send + Sync + Clone>(&self) -> bool {
         self.data.contains::<T>()
     }
 
@@ -174,6 +176,31 @@ pub enum NodeError {
         /// Bytes still available when the request was made.
         available: usize,
     },
+
+    /// The requested node is not in the graph.
+    #[error("unknown node {0}")]
+    UnknownNode(u64),
+
+    /// A node with this id is already in the graph.
+    #[error("node {0} already exists")]
+    NodeAlreadyExists(u64),
+
+    /// Connecting the two nodes would close a loop in the DAG.
+    #[error("connecting node {from} to node {to} would create a cycle")]
+    CycleDetected {
+        /// Upstream node of the rejected edge.
+        from: u64,
+        /// Downstream node of the rejected edge.
+        to: u64,
+    },
+
+    /// The node has no cartridge attached, so it cannot be evaluated.
+    #[error("node {0} has no cartridge implementation")]
+    NoImplementation(u64),
+
+    /// A newer render was requested; this evaluation is stale.
+    #[error("render preempted by a newer request")]
+    Preempted,
 
     /// The node's own code panicked; captured by the airbag in the kernel.
     #[error("node panicked during evaluation: {0}")]

@@ -8,7 +8,9 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 
+use crate::dag::Dag;
 use crate::governor::{MemoryGovernor, RenderEpoch};
+use crate::knobs::KnobValue;
 
 /// Identifies a node instance in the graph.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -22,7 +24,7 @@ pub struct PortId(pub u16);
 ///
 /// Every variant carries enough state to build its own inverse, which is what
 /// makes undo and redo mechanical instead of per-command special cases.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UndoableCommand {
     /// Add a node of `kind` under `id`.
     AddNode {
@@ -66,10 +68,10 @@ pub enum UndoableCommand {
         node: NodeId,
         /// Knob name.
         knob: String,
-        /// New serialized value.
-        value: String,
+        /// New value.
+        value: KnobValue,
         /// Value before this command.
-        previous: String,
+        previous: KnobValue,
     },
 }
 
@@ -123,7 +125,7 @@ impl UndoableCommand {
 }
 
 /// Work sent from the UI thread to the kernel thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum KernelMessage {
     /// Apply a reversible command.
     Execute(UndoableCommand),
@@ -138,7 +140,7 @@ pub enum KernelMessage {
 }
 
 /// Notifications sent from the kernel thread back to the UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum KernelEvent {
     /// A command was applied and recorded in the undo stack.
     Applied(UndoableCommand),
@@ -146,6 +148,13 @@ pub enum KernelEvent {
     Undone(UndoableCommand),
     /// A previously undone command was re-applied.
     Redone(UndoableCommand),
+    /// A command was rejected and the graph is unchanged.
+    CommandFailed {
+        /// Command that could not be applied.
+        command: UndoableCommand,
+        /// Why it failed.
+        message: String,
+    },
     /// The render epoch advanced to the given value.
     EpochChanged(u64),
     /// A cartridge panicked; the kernel survived.
@@ -300,26 +309,54 @@ fn kernel_loop(
     epoch: RenderEpoch,
 ) {
     let mut undo = UndoStack::new();
-    // The governor is wired in now; DAG evaluations start reserving from it in
-    // a later milestone.
+    let mut dag = Dag::new();
+
+    // The governor is wired in now; DAG evaluations start reserving from it
+    // when pixel allocation lands.
     let _governor = governor;
 
     while let Ok(message) = messages.recv() {
         match message {
-            KernelMessage::Execute(command) => {
-                // Graph mutation lands with the DAG; the undo ledger is real
-                // from day one so the UI can already round-trip commands.
-                undo.push(command.clone());
-                let _ = events.send(KernelEvent::Applied(command));
-            }
+            KernelMessage::Execute(command) => match dag.apply_command(&command) {
+                Ok(()) => {
+                    undo.push(command.clone());
+                    let _ = events.send(KernelEvent::Applied(command));
+                }
+                Err(error) => {
+                    let _ = events.send(KernelEvent::CommandFailed {
+                        command,
+                        message: error.to_string(),
+                    });
+                }
+            },
             KernelMessage::Undo => {
                 if let Some(command) = undo.undo() {
-                    let _ = events.send(KernelEvent::Undone(command));
+                    match dag.undo_command(&command) {
+                        Ok(()) => {
+                            let _ = events.send(KernelEvent::Undone(command));
+                        }
+                        Err(error) => {
+                            let _ = events.send(KernelEvent::CommandFailed {
+                                command,
+                                message: error.to_string(),
+                            });
+                        }
+                    }
                 }
             }
             KernelMessage::Redo => {
                 if let Some(command) = undo.redo() {
-                    let _ = events.send(KernelEvent::Redone(command));
+                    match dag.apply_command(&command) {
+                        Ok(()) => {
+                            let _ = events.send(KernelEvent::Redone(command));
+                        }
+                        Err(error) => {
+                            let _ = events.send(KernelEvent::CommandFailed {
+                                command,
+                                message: error.to_string(),
+                            });
+                        }
+                    }
                 }
             }
             KernelMessage::BumpEpoch => {

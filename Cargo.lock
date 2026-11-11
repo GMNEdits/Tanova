@@ -2317,6 +2317,7 @@ dependencies = [
  "anymap",
  "blake3",
  "crossbeam-channel",
+ "indexmap",
  "inventory",
  "thiserror 2.0.21",
 ]

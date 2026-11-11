@@ -23,6 +23,7 @@ repository = "https://github.com/tanova/tanova"
 anymap = "0.12"
 blake3 = "1"
 crossbeam-channel = "0.5"
+indexmap = "2"
 inventory = "0.3"
 thiserror = "2"
 
