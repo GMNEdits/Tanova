@@ -1,0 +1,12 @@
+[package]
+name = "tanova-nodes"
+description = "Tanova node cartridges, one feature per file."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tanova-kernel.workspace = true
+inventory.workspace = true

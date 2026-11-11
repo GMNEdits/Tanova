@@ -1,0 +1,13 @@
+[package]
+name = "tanova-cli"
+description = "Headless Tanova command-line renderer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tanova-kernel.workspace = true
+tanova-parse.workspace = true
+tanova-io.workspace = true

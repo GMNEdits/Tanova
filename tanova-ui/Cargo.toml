@@ -1,0 +1,12 @@
+[package]
+name = "tanova-ui"
+description = "Stateless Tanova UI: custom egui widgets and node canvas."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tanova-kernel.workspace = true
+egui.workspace = true

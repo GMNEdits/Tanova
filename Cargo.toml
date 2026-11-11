@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = [
+    "tanova-kernel",
+    "tanova-nodes",
+    "tanova-ui",
+    "tanova-render",
+    "tanova-parse",
+    "tanova-io",
+    "tanova-cli",
+    "tanova-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tanova/tanova"
+
+[workspace.dependencies]
+# Kernel: blackboard, hashing, messaging, cartridge registry.
+anymap = "0.12"
+blake3 = "1"
+crossbeam-channel = "0.5"
+inventory = "0.3"
+thiserror = "2"
+
+# Hardware / rendering.
+bytemuck = "1"
+pollster = "0.4"
+wgpu = "30.0"
+
+# UI shell.
+eframe = { version = "0.37", default-features = false, features = [
+    "default_fonts",
+    "wayland",
+    "wgpu",
+    "x11",
+] }
+egui = "0.37"
+
+# Internal crates.
+tanova-kernel = { path = "tanova-kernel" }
+tanova-nodes = { path = "tanova-nodes" }
+tanova-ui = { path = "tanova-ui" }
+tanova-render = { path = "tanova-render" }
+tanova-parse = { path = "tanova-parse" }
+tanova-io = { path = "tanova-io" }

@@ -1,0 +1,15 @@
+[package]
+name = "tanova-kernel"
+description = "Tanova microkernel: blackboard types, DAG engine, message bus."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anymap.workspace = true
+blake3.workspace = true
+crossbeam-channel.workspace = true
+inventory.workspace = true
+thiserror.workspace = true
