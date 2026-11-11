@@ -70,8 +70,15 @@ impl DummyNode {
 }
 
 impl NodeTrait for DummyNode {
-    fn evaluate(&self, _ctx: &EvalContext, inputs: &[Packet]) -> Result<Packet, NodeError> {
-        let message = self.message();
+    fn evaluate(&self, ctx: &EvalContext, inputs: &[Packet]) -> Result<Packet, NodeError> {
+        // The DAG injects live knobs into the context; standalone use falls
+        // back to the node's own table.
+        let knobs = ctx.knobs().unwrap_or(&self.knobs);
+        let message = match knobs.get("message") {
+            Some(KnobValue::Text(message)) => message.as_str(),
+            _ => DEFAULT_MESSAGE,
+        };
+
         let text = match inputs
             .iter()
             .find_map(|packet| packet.get::<DummyPayload>())

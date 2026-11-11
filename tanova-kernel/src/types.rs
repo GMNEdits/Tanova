@@ -10,6 +10,8 @@
 
 use std::any::Any;
 
+use crate::knobs::KnobTable;
+
 /// The backing type map: one value per concrete type, safe to move between
 /// the UI and the kernel thread.
 ///
@@ -148,6 +150,11 @@ impl EvalContext {
     /// The requested viewer, if one was provided.
     pub fn view(&self) -> Option<&str> {
         self.get::<View>().map(|view| view.0.as_str())
+    }
+
+    /// The live knobs of the node currently being evaluated, if injected.
+    pub fn knobs(&self) -> Option<&KnobTable> {
+        self.get::<KnobTable>()
     }
 }
 

@@ -508,7 +508,16 @@ impl Dag {
             inputs.push((*packet).clone());
         }
 
-        let evaluated = evaluate_with_airbag(implementation.as_ref(), ctx, &inputs);
+        let evaluated = {
+            // Knobs live on the DagNode; inject them into a per-node context so
+            // cartridges can read live values without changing `evaluate`'s
+            // signature.
+            let mut node_ctx = ctx.clone();
+            if let Some(node) = self.nodes.get(&id) {
+                node_ctx.insert(node.knobs.clone());
+            }
+            evaluate_with_airbag(implementation.as_ref(), &node_ctx, &inputs)
+        };
 
         if !epoch.is_current(target_epoch) {
             visiting.remove(&id);
