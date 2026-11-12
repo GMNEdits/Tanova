@@ -3,12 +3,14 @@
 //! Each node lives in exactly one file (e.g. `src/blur.rs`) and registers
 //! itself with the kernel's global registry via `inventory`.
 
+pub mod blur;
 pub mod constant;
 pub mod dummy;
 pub mod grade;
 pub mod merge;
 pub mod util;
 
+pub use blur::BlurNode;
 pub use constant::{ConstantNode, DEFAULT_COLOR};
 pub use dummy::{DEFAULT_MESSAGE, DummyNode, DummyPayload};
 pub use grade::{GradeNode, grade_op};

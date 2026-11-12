@@ -33,3 +33,15 @@ Stream `Arc<wgpu::TextureView>` frames from the kernel thread to an egui viewer 
 
 **Milestone 10: The `.nk` TCL Stack-Machine Parser & Headless Render CLI (`tanova-parse` & `tanova-cli`)**
 Implement the `.nk` TCL stack-machine parser, round-trip graph serialization, and a headless `tanova-cli` render path that loads a script, evaluates the DAG, and writes a display-transformed image.
+
+# TANOVA ROADMAP - PHASE 3: THE SPATIAL ENGINE
+*AI DIRECTIVE: Execute one milestone at a time. Do not skip or combine milestones.*
+
+**Milestone 11: The Spatial Engine (Gaussian Blur, BBox Expansion & Storage Buffers)**
+Add a `blur.wgsl` compute pipeline backed by `var<storage>` pixel buffers so padded apron tiles larger than 3 MB still dispatch, and implement the `Blur` cartridge with BBox expansion, non-RGBA channel pass-through, and a matching CPU fallback.
+
+**Milestone 12: Transform Concatenation (Matrix Math & Filter Sampling) + Interactive Viewer Overlays**
+Implement a `Transform` cartridge with 3x3 matrix concatenation and bilinear filter sampling, and add interactive viewer overlays (bounding boxes, handles) driven by the same transform data.
+
+**Milestone 13: Multi-Channel EXR I/O & Timeline Playback (`tanova-io`)**
+Read and write multi-channel OpenEXR frames and drive timeline playback through the message bus.

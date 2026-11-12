@@ -17,9 +17,11 @@ pub use coords::{
     world_to_tile,
 };
 pub use ops::{
-    GradeOp, MergeOp, MergeRequest, grade_raster, mask_value, merge_pixel, merge_raster, rgba_at,
+    GradeOp, MergeOp, MergeRequest, blur_padded_rgba, blur_padded_tile, grade_raster,
+    is_rgba_channel, mask_value, merge_pixel, merge_raster, rgba_at,
 };
 pub use shader::{
-    DISPATCH_SIZE, EvalContextGpu, GpuComputeEngine, GradeParams, MergeParams, WORKGROUP_SIZE,
+    BlurParams, DISPATCH_SIZE, EvalContextGpu, GpuComputeEngine, GradeParams, MergeParams,
+    WORKGROUP_SIZE,
 };
 pub use tile::{Channel, ChannelPlane, Raster2D, TILE_BYTES, TileBuffer, extract_padded_tile};

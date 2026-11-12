@@ -102,6 +102,35 @@ impl MergeParams {
     }
 }
 
+/// `Blur` uniforms: radius, Gaussian sigma, apron, and padded row stride.
+///
+/// Four `u32`/`f32` scalars occupy one 16-byte uniform slot, so the struct
+/// matches WGSL's uniform layout without padding.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct BlurParams {
+    /// Convolution radius in pixels (`size.ceil()`).
+    pub radius: u32,
+    /// Gaussian standard deviation.
+    pub sigma: f32,
+    /// Apron halo on every side of the output tile.
+    pub apron: u32,
+    /// Row stride of the padded input buffer, in pixels.
+    pub padded_width: u32,
+}
+
+impl BlurParams {
+    /// Packs the blur geometry into GPU-ready uniforms.
+    pub fn new(radius: u32, sigma: f32, padded_width: u32) -> Self {
+        Self {
+            radius,
+            sigma,
+            apron: radius,
+            padded_width,
+        }
+    }
+}
+
 /// One compiled compute pass: its bind-group layout and pipeline.
 struct ComputePass {
     layout: wgpu::BindGroupLayout,
@@ -115,6 +144,7 @@ struct EngineInner {
     queue: Arc<wgpu::Queue>,
     grade: ComputePass,
     merge: ComputePass,
+    blur: ComputePass,
 }
 
 /// A cached `wgpu` compute engine for `Grade` and `Merge2`.
@@ -165,6 +195,20 @@ impl GpuComputeEngine {
                 storage_read_write(),
             ],
         );
+        let blur = build_pass(
+            &device,
+            "tanova-blur",
+            BLUR_WGSL,
+            &[
+                storage_read(),
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                storage_read_write(),
+            ],
+        );
 
         Self {
             inner: Arc::new(EngineInner {
@@ -172,6 +216,7 @@ impl GpuComputeEngine {
                 queue,
                 grade,
                 merge,
+                blur,
             }),
         }
     }
@@ -269,6 +314,41 @@ impl GpuComputeEngine {
         });
 
         self.run(&self.inner.merge, &bind_group, &output, TILE_RGBA_BYTES)
+    }
+
+    /// Runs the Gaussian `Blur` over one padded RGBA tile.
+    ///
+    /// `padded` is `padded_width^2` interleaved pixels (the 256x256 tile plus
+    /// an `apron` halo). The output is one dense 256x256 interleaved RGBA tile.
+    pub fn blur_tile(
+        &self,
+        padded: &[[f32; 4]],
+        params: &BlurParams,
+    ) -> Result<Vec<f32>, NodeError> {
+        let expected = params.padded_width as usize * params.padded_width as usize;
+        if padded.len() != expected {
+            return Err(NodeError::Other(format!(
+                "blur input needs {expected} pixels, got {}",
+                padded.len()
+            )));
+        }
+
+        let device = &self.inner.device;
+        let input = create_buffer(device, "tanova-blur-input", padded, true);
+        let uniform = create_uniform_buffer(device, "tanova-blur-params", &[*params]);
+        let output = create_output_buffer(device, TILE_RGBA_BYTES);
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tanova-blur-bind-group"),
+            layout: &self.inner.blur.layout,
+            entries: &[
+                binding(0, &input),
+                binding(1, &uniform),
+                binding(2, &output),
+            ],
+        });
+
+        self.run(&self.inner.blur, &bind_group, &output, TILE_RGBA_BYTES)
     }
 
     /// Records one dispatch, waits for it, and reads the output back.
@@ -565,6 +645,52 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+const BLUR_WGSL: &str = r#"
+struct BlurParams {
+    radius: u32,
+    sigma: f32,
+    apron: u32,
+    padded_width: u32,
+};
+
+// Padded apron tiles can exceed the 64 KiB uniform limit, so pixel data must
+// live in storage buffers rather than `var<uniform>`.
+@group(0) @binding(0) var<storage, read> input_pixels: array<vec4<f32>>;
+@group(0) @binding(1) var<uniform> params: BlurParams;
+@group(0) @binding(2) var<storage, read_write> output_pixels: array<vec4<f32>>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= 256u || id.y >= 256u) {
+        return;
+    }
+
+    let radius = i32(params.radius);
+    let stride = i32(params.padded_width);
+    let center_x = i32(id.x) + i32(params.apron);
+    let center_y = i32(id.y) + i32(params.apron);
+    let center = input_pixels[center_y * stride + center_x];
+
+    let sigma = max(params.sigma, 1e-5);
+    let denom = max(2.0 * sigma * sigma, 1e-10);
+
+    var sum = vec3<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var dy = -radius; dy <= radius; dy = dy + 1) {
+        for (var dx = -radius; dx <= radius; dx = dx + 1) {
+            let weight = exp(-f32(dx * dx + dy * dy) / denom);
+            let sample = input_pixels[(center_y + dy) * stride + (center_x + dx)];
+            sum = sum + sample.rgb * weight;
+            weight_sum = weight_sum + weight;
+        }
+    }
+
+    // Alpha is intentionally untouched: the pipeline is premultiplied, so the
+    // center coverage must survive the RGB convolution.
+    output_pixels[id.y * 256u + id.x] = vec4<f32>(sum / weight_sum, center.a);
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +737,7 @@ mod tests {
     fn uniform_structs_match_wgsl_alignment() {
         assert_eq!(std::mem::size_of::<GradeParams>(), 144);
         assert_eq!(std::mem::size_of::<MergeParams>(), 32);
+        assert_eq!(std::mem::size_of::<BlurParams>(), 16);
         assert_eq!(std::mem::align_of::<GradeParams>(), 4);
     }
 
@@ -647,6 +774,46 @@ mod tests {
             for channel in 0..4 {
                 assert!(
                     (actual[channel] - expected[channel]).abs() <= 1e-5,
+                    "pixel {index} channel {channel}: gpu {} vs cpu {}",
+                    actual[channel],
+                    expected[channel]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_blur_matches_cpu_fallback() {
+        let Some(engine) = test_engine() else {
+            eprintln!("no GPU adapter available; skipping Blur parity test");
+            return;
+        };
+
+        let radius = 5u32;
+        let sigma = 2.0f32;
+        let padded_width = TILE_SIZE + 2 * radius;
+        let mut padded = vec![[0.0f32; 4]; (padded_width * padded_width) as usize];
+        for (index, pixel) in padded.iter_mut().enumerate() {
+            let x = (index as u32 % padded_width) as f32;
+            let y = (index as u32 / padded_width) as f32;
+            *pixel = [
+                (x * 0.013).sin() * 0.5 + 0.5,
+                (y * 0.017).cos() * 0.5 + 0.5,
+                ((x + y) * 0.007).fract(),
+                (x * 0.01 + y * 0.02).fract(),
+            ];
+        }
+
+        let gpu = engine
+            .blur_tile(&padded, &BlurParams::new(radius, sigma, padded_width))
+            .expect("blur dispatch");
+        let cpu = crate::ops::blur_padded_rgba(&padded, radius, sigma, padded_width);
+
+        assert_eq!(gpu.len(), TILE_RGBA_VALUES);
+        for (index, (actual, expected)) in gpu.chunks_exact(4).zip(cpu.iter()).enumerate() {
+            for channel in 0..4 {
+                assert!(
+                    (actual[channel] - expected[channel]).abs() <= 1e-4,
                     "pixel {index} channel {channel}: gpu {} vs cpu {}",
                     actual[channel],
                     expected[channel]

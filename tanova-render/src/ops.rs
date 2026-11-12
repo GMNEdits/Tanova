@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tanova_kernel::{MemoryGovernor, NodeError};
 
 use crate::coords::{BBox, EdgeMode, TILE_PIXELS, TILE_SIZE, TileCoord};
-use crate::shader::{GpuComputeEngine, GradeParams, MergeParams};
+use crate::shader::{BlurParams, GpuComputeEngine, GradeParams, MergeParams};
 use crate::tile::{Channel, ChannelPlane, Raster2D, TileBuffer};
 
 /// `Grade` parameters in Nuke's knob order.
@@ -322,6 +322,83 @@ fn bbox_contains(outer: BBox, inner: BBox) -> bool {
             && outer.min_y <= inner.min_y
             && outer.max_x >= inner.max_x
             && outer.max_y >= inner.max_y)
+}
+
+/// Convolves one padded RGBA tile with a normalized 2D Gaussian on the CPU.
+///
+/// The math mirrors the `blur.wgsl` kernel: RGB is weighted, alpha is passed
+/// through from the center pixel. Returns one dense 256x256 interleaved tile.
+pub fn blur_padded_rgba(
+    padded: &[[f32; 4]],
+    radius: u32,
+    sigma: f32,
+    padded_width: u32,
+) -> Vec<[f32; 4]> {
+    let radius_i = radius as i32;
+    let stride = padded_width as usize;
+    let denom = (2.0 * sigma * sigma).max(1e-10);
+    let taps = (2 * radius + 1) as usize;
+
+    // The Gaussian weight depends only on the tap offset, so build the kernel
+    // once per tile instead of calling `exp` per pixel.
+    let mut weights = Vec::with_capacity(taps * taps);
+    let mut weight_sum = 0.0f32;
+    for dy in -radius_i..=radius_i {
+        for dx in -radius_i..=radius_i {
+            let distance = (dx * dx + dy * dy) as f32;
+            let weight = (-distance / denom).exp();
+            weights.push(weight);
+            weight_sum += weight;
+        }
+    }
+
+    let mut out = Vec::with_capacity(TILE_PIXELS);
+    for y in 0..TILE_SIZE {
+        for x in 0..TILE_SIZE {
+            let center_x = x as i32 + radius_i;
+            let center_y = y as i32 + radius_i;
+            let center = padded[center_y as usize * stride + center_x as usize];
+
+            let mut rgb = [0.0f32; 3];
+            let mut weight_index = 0usize;
+            for dy in -radius_i..=radius_i {
+                let row = (center_y + dy) as usize * stride;
+                for dx in -radius_i..=radius_i {
+                    let weight = weights[weight_index];
+                    weight_index += 1;
+                    let sample = padded[row + (center_x + dx) as usize];
+                    rgb[0] += sample[0] * weight;
+                    rgb[1] += sample[1] * weight;
+                    rgb[2] += sample[2] * weight;
+                }
+            }
+
+            out.push([
+                rgb[0] / weight_sum,
+                rgb[1] / weight_sum,
+                rgb[2] / weight_sum,
+                center[3],
+            ]);
+        }
+    }
+    out
+}
+
+/// Runs the Gaussian blur over one padded tile, using the GPU when present.
+pub fn blur_padded_tile(
+    padded: &[[f32; 4]],
+    radius: u32,
+    sigma: f32,
+    padded_width: u32,
+    gpu: Option<&GpuComputeEngine>,
+) -> Result<Vec<f32>, NodeError> {
+    match gpu {
+        Some(engine) => engine.blur_tile(padded, &BlurParams::new(radius, sigma, padded_width)),
+        None => Ok(blur_padded_rgba(padded, radius, sigma, padded_width)
+            .into_iter()
+            .flatten()
+            .collect()),
+    }
 }
 
 /// Applies `Grade` across every tile of `input`, preserving non-RGBA channels.
