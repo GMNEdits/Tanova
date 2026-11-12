@@ -41,6 +41,24 @@ impl Edge {
     }
 }
 
+/// Fallback cartridge for node kinds the registry does not know.
+///
+/// Proprietary Foundry nodes (and any other unregistered class) must not break
+/// a script: they pass their `B` input (`PortId(0)`) straight through so the
+/// rest of the graph still renders.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PassthroughNode;
+
+impl NodeTrait for PassthroughNode {
+    fn evaluate(&self, _ctx: &EvalContext, inputs: &[Packet]) -> Result<Packet, NodeError> {
+        Ok(inputs.first().cloned().unwrap_or_default())
+    }
+
+    fn serialize_to_tcl(&self) -> String {
+        "Passthrough {}".to_string()
+    }
+}
+
 /// One node in the DAG, plus the live state the kernel tracks for it.
 pub struct DagNode {
     /// Stable identity of this node.
@@ -287,18 +305,121 @@ impl Dag {
         &mut self.cache
     }
 
+    /// Serializes the whole graph back into Nuke `.nk` stack syntax.
+    ///
+    /// Nodes are emitted in topological order so every `push $N...` refers to
+    /// an upstream node that is already on the stack. Disconnected ports are
+    /// written as `push 0`, which the parser reads back as "no input".
+    pub fn export_to_tcl(&self) -> String {
+        use std::fmt::Write as _;
+
+        let order = self.topological_order();
+        let mut variables: HashMap<NodeId, usize> = HashMap::with_capacity(order.len());
+        for (index, id) in order.iter().enumerate() {
+            variables.insert(*id, index + 1);
+        }
+
+        let mut out = String::from("version 15.0 v5\n");
+        for id in &order {
+            let Some(node) = self.nodes.get(id) else {
+                continue;
+            };
+
+            let mut incoming: Vec<Edge> = self
+                .edges
+                .iter()
+                .filter(|edge| edge.to_node == *id)
+                .copied()
+                .collect();
+            incoming.sort_by_key(|edge| edge.to_port.0);
+            let total_inputs = incoming
+                .last()
+                .map_or(0, |edge| edge.to_port.0 as usize + 1);
+
+            // Highest port first: the parser pops the top of the stack for
+            // port 0, matching Nuke's reverse push order.
+            for port in (0..total_inputs).rev() {
+                match incoming.iter().find(|edge| edge.to_port.0 as usize == port) {
+                    Some(edge) => {
+                        let variable = variables.get(&edge.from_node).copied().unwrap_or(0);
+                        let _ = writeln!(out, "push $N{variable}");
+                    }
+                    None => out.push_str("push 0\n"),
+                }
+            }
+
+            let _ = writeln!(out, "{} {{", node.kind);
+            let _ = writeln!(out, " inputs {total_inputs}");
+            for (name, value) in node.knobs.iter() {
+                let _ = writeln!(out, " {name} {}", format_knob_value(value));
+            }
+            out.push_str("}\n");
+
+            if let Some(variable) = variables.get(id) {
+                let _ = writeln!(out, "set N{variable} [stack 0]");
+            }
+        }
+        out
+    }
+
+    /// Orders nodes so every node appears after all of its inputs.
+    fn topological_order(&self) -> Vec<NodeId> {
+        let mut indegree: HashMap<NodeId, usize> = self.nodes.keys().map(|id| (*id, 0)).collect();
+        for edge in &self.edges {
+            if let Some(degree) = indegree.get_mut(&edge.to_node) {
+                *degree += 1;
+            }
+        }
+
+        let mut queue: VecDeque<NodeId> = self
+            .nodes
+            .keys()
+            .filter(|id| indegree.get(id).copied().unwrap_or(0) == 0)
+            .copied()
+            .collect();
+        let mut order = Vec::with_capacity(self.nodes.len());
+
+        while let Some(id) = queue.pop_front() {
+            order.push(id);
+            for edge in self.edges.iter().filter(|edge| edge.from_node == id) {
+                if let Some(degree) = indegree.get_mut(&edge.to_node) {
+                    *degree = degree.saturating_sub(1);
+                    if *degree == 0 {
+                        queue.push_back(edge.to_node);
+                    }
+                }
+            }
+        }
+
+        // A cycle should be impossible; keep the remaining nodes visible rather
+        // than silently dropping them.
+        if order.len() < self.nodes.len() {
+            for id in self.nodes.keys() {
+                if !order.contains(id) {
+                    order.push(*id);
+                }
+            }
+        }
+        order
+    }
+
     /// Adds a node, auto-wiring its cartridge from the registry when the kind
     /// is registered.
     ///
     /// Registered cartridges contribute their default knobs and factory
-    /// implementation. Unknown kinds are still added, ready for the UI to
-    /// attach an implementation manually.
+    /// implementation. Unknown kinds receive a [`PassthroughNode`] so scripts
+    /// containing proprietary nodes still evaluate end-to-end.
     pub fn add_node(&mut self, id: NodeId, kind: impl Into<String>) -> Result<(), NodeError> {
         let kind = kind.into();
         let mut node = DagNode::new(id, kind.clone());
-        if let Some(descriptor) = find_cartridge(&kind) {
-            node.knobs = (descriptor.default_knobs)();
-            node.implementation = Some((descriptor.factory)());
+        match find_cartridge(&kind) {
+            Some(descriptor) => {
+                node.knobs = (descriptor.default_knobs)();
+                node.implementation = Some((descriptor.factory)());
+            }
+            None => {
+                node.implementation = Some(Arc::new(PassthroughNode));
+            }
         }
         self.insert_node(node)
     }
@@ -629,6 +750,47 @@ impl Default for Dag {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Formats one knob value for `.nk` serialization.
+fn format_knob_value(value: &KnobValue) -> String {
+    match value {
+        KnobValue::Float(value) => {
+            if value.fract() == 0.0 {
+                format!("{value:.1}")
+            } else {
+                format!("{value}")
+            }
+        }
+        KnobValue::Int(value) => value.to_string(),
+        KnobValue::Bool(value) => {
+            if *value {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        KnobValue::Text(text) => format!("\"{}\"", escape_tcl_text(text)),
+        KnobValue::Color(channels) => format!(
+            "{{{} {} {} {}}}",
+            channels[0], channels[1], channels[2], channels[3]
+        ),
+    }
+}
+
+/// Escapes text for a double-quoted TCL string.
+fn escape_tcl_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 /// Feeds only the render state the hash contract covers.
@@ -1020,5 +1182,69 @@ mod tests {
         assert_eq!(report[0], (false, Some(11)));
         assert_eq!(report[1], (true, None), "port 1 must be an empty slot");
         assert_eq!(report[2], (false, Some(33)));
+    }
+
+    #[test]
+    fn unknown_kinds_get_a_passthrough_implementation() {
+        let mut dag = Dag::new();
+        dag.add_node_with_implementation(NodeId(1), "Source", Arc::new(TagNode(7)))
+            .unwrap();
+        dag.add_node(NodeId(2), "Foundry_CameraShake").unwrap();
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .unwrap();
+
+        assert!(
+            dag.node(NodeId(2)).unwrap().implementation.is_some(),
+            "unknown kinds must not be left without an implementation"
+        );
+
+        let packet = dag
+            .evaluate_pull(
+                NodeId(2),
+                &EvalContext::new(),
+                &MemoryGovernor::new(usize::MAX),
+                &RenderEpoch::new(),
+                0,
+            )
+            .expect("passthrough should evaluate");
+        assert_eq!(
+            packet.get::<u32>(),
+            Some(&7),
+            "port 0 must be forwarded untouched"
+        );
+    }
+
+    #[test]
+    fn export_uses_nuke_stack_syntax_and_live_knobs() {
+        let mut dag = Dag::new();
+        dag.add_node(NodeId(1), "Source").unwrap();
+        dag.add_node(NodeId(2), "Sink").unwrap();
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .unwrap();
+        dag.set_knob(NodeId(1), "gain", KnobValue::Float(2.0))
+            .unwrap();
+        dag.set_knob(NodeId(2), "secret_knob", KnobValue::Int(42))
+            .unwrap();
+
+        let text = dag.export_to_tcl();
+        assert!(text.starts_with("version "), "missing header: {text}");
+        assert!(text.contains("push $N1"), "missing upstream push: {text}");
+        assert!(
+            text.contains("set N1 [stack 0]"),
+            "missing var capture: {text}"
+        );
+        assert!(
+            text.contains("set N2 [stack 0]"),
+            "missing var capture: {text}"
+        );
+        assert!(
+            text.contains("gain 2.0"),
+            "float knobs must survive: {text}"
+        );
+        assert!(
+            text.contains("secret_knob 42"),
+            "unknown-node knobs must survive: {text}"
+        );
+        assert!(text.contains("inputs 1"), "input count missing: {text}");
     }
 }

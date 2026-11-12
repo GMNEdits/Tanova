@@ -2299,10 +2299,10 @@ dependencies = [
 name = "tanova-cli"
 version = "0.1.0"
 dependencies = [
- "tanova-io",
  "tanova-kernel",
  "tanova-nodes",
  "tanova-parse",
+ "tanova-render",
 ]
 
 [[package]]
@@ -2337,6 +2337,9 @@ dependencies = [
 name = "tanova-parse"
 version = "0.1.0"
 dependencies = [
+ "tanova-kernel",
+ "tanova-nodes",
+ "tanova-render",
  "thiserror 2.0.21",
 ]
 

@@ -8,4 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+tanova-kernel.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tanova-nodes.workspace = true
+tanova-render.workspace = true

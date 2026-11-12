@@ -11,4 +11,4 @@ repository.workspace = true
 tanova-kernel.workspace = true
 tanova-nodes.workspace = true
 tanova-parse.workspace = true
-tanova-io.workspace = true
+tanova-render.workspace = true
