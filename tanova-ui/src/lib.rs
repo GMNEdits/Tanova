@@ -5,5 +5,9 @@
 //! a custom `egui::Painter` with top-to-bottom B-pipe topology.
 
 pub mod canvas;
+pub mod properties;
+pub mod viewer;
 
 pub use canvas::{CanvasEdge, CanvasNode, GraphMirror, NodeCanvas, NodeCanvasState, WireDrag};
+pub use properties::PropertiesPanel;
+pub use viewer::ViewerPanel;

@@ -10,7 +10,9 @@ use egui::{
     Align2, Color32, CornerRadius, FontId, Painter, PointerButton, Pos2, Rect, Sense, Shape,
     Stroke, StrokeKind, Ui, Vec2, epaint::CubicBezierShape,
 };
-use tanova_kernel::{KernelEvent, KernelMessage, NodeId, PortId, UndoableCommand};
+use tanova_kernel::{
+    KernelEvent, KernelMessage, KnobTable, NodeId, PortId, UndoableCommand, find_cartridge,
+};
 
 const NODE_W: f32 = 168.0;
 const NODE_H: f32 = 72.0;
@@ -30,6 +32,7 @@ const CRASH_BORDER: Color32 = Color32::from_rgb(230, 70, 70);
 const CRASH_FILL: Color32 = Color32::from_rgb(58, 22, 24);
 const CRASH_HEADER: Color32 = Color32::from_rgb(92, 30, 34);
 const SELECTED: Color32 = Color32::from_rgb(90, 190, 255);
+const VIEWER: Color32 = Color32::from_rgb(255, 190, 40);
 
 /// One node as the UI knows it.
 #[derive(Debug, Clone)]
@@ -40,6 +43,8 @@ pub struct CanvasNode {
     pub kind: String,
     /// Last panic message, if the kernel reported one.
     pub crashed: Option<String>,
+    /// UI-side copy of the node's knobs, updated from `KernelEvent`s.
+    pub knobs: KnobTable,
 }
 
 /// One connection as the UI knows it.
@@ -125,10 +130,14 @@ impl GraphMirror {
         match command {
             UndoableCommand::AddNode { id, kind } => {
                 if !self.nodes.iter().any(|node| node.id == *id) {
+                    let knobs = find_cartridge(kind)
+                        .map(|descriptor| (descriptor.default_knobs)())
+                        .unwrap_or_default();
                     self.nodes.push(CanvasNode {
                         id: *id,
                         kind: kind.clone(),
                         crashed: None,
+                        knobs,
                     });
                 }
             }
@@ -167,7 +176,17 @@ impl GraphMirror {
                 };
                 self.edges.retain(|candidate| *candidate != edge);
             }
-            UndoableCommand::SetKnob { .. } => {}
+            UndoableCommand::SetKnob {
+                node, knob, value, ..
+            } => {
+                if let Some(node) = self
+                    .nodes
+                    .iter_mut()
+                    .find(|candidate| candidate.id == *node)
+                {
+                    node.knobs.insert(knob.clone(), value.clone());
+                }
+            }
         }
     }
 }
@@ -238,6 +257,7 @@ impl NodeCanvas {
         state: &mut NodeCanvasState,
         graph: &GraphMirror,
         cartridge_kinds: &[&'static str],
+        viewer: Option<NodeId>,
     ) -> Vec<KernelMessage> {
         let mut messages = Vec::new();
 
@@ -260,6 +280,15 @@ impl NodeCanvas {
             }
             if ui.button("Bump Epoch").clicked() {
                 messages.push(KernelMessage::BumpEpoch);
+            }
+            ui.separator();
+            if ui.button("View (1)").clicked() {
+                if let Some(selected) = state.selected {
+                    messages.push(KernelMessage::SetViewerNode(Some(selected)));
+                }
+            }
+            if let Some(viewer) = viewer {
+                ui.colored_label(VIEWER, format!("VIEWER 1: #{}", viewer.0));
             }
             ui.separator();
             ui.label(format!("zoom {:.0}%", state.zoom * 100.0));
@@ -349,6 +378,15 @@ impl NodeCanvas {
             state.panning = false;
         }
 
+        // Nuke binds `1` to "view this node".
+        if ui.input(|input| input.key_pressed(egui::Key::Num1))
+            && !ui.ctx().egui_wants_keyboard_input()
+        {
+            if let Some(selected) = state.selected {
+                messages.push(KernelMessage::SetViewerNode(Some(selected)));
+            }
+        }
+
         draw_grid(&painter, rect, state.pan, state.zoom);
 
         for edge in graph.edges() {
@@ -374,6 +412,7 @@ impl NodeCanvas {
                 node_rect,
                 node,
                 state.selected == Some(node.id),
+                viewer == Some(node.id),
                 state.zoom,
             );
         }
@@ -509,7 +548,14 @@ fn draw_grid(painter: &Painter, rect: Rect, pan: Vec2, zoom: f32) {
     }
 }
 
-fn draw_node(painter: &Painter, rect: Rect, node: &CanvasNode, selected: bool, zoom: f32) {
+fn draw_node(
+    painter: &Painter,
+    rect: Rect,
+    node: &CanvasNode,
+    selected: bool,
+    is_viewer: bool,
+    zoom: f32,
+) {
     let crashed = node.crashed.is_some();
     let (fill, header, border) = if crashed {
         (CRASH_FILL, CRASH_HEADER, CRASH_BORDER)
@@ -587,6 +633,27 @@ fn draw_node(painter: &Painter, rect: Rect, node: &CanvasNode, selected: bool, z
             radius,
             Stroke::new(2.0, SELECTED),
             StrokeKind::Outside,
+        );
+    }
+
+    if is_viewer {
+        painter.rect_stroke(
+            rect.expand(4.0),
+            radius,
+            Stroke::new(2.0, VIEWER),
+            StrokeKind::Outside,
+        );
+        let tag = Rect::from_min_size(
+            rect.right_top() + Vec2::new(-58.0 * zoom, 3.0 * zoom),
+            Vec2::new(54.0 * zoom, 13.0 * zoom),
+        );
+        painter.rect_filled(tag, CornerRadius::same(2), VIEWER);
+        painter.text(
+            tag.center(),
+            Align2::CENTER_CENTER,
+            "VIEWER 1",
+            FontId::proportional((9.0 * zoom).clamp(7.0, 11.0)),
+            Color32::from_rgb(30, 24, 8),
         );
     }
 }

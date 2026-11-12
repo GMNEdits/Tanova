@@ -9,4 +9,8 @@ repository.workspace = true
 
 [dependencies]
 tanova-kernel.workspace = true
+tanova-render.workspace = true
 egui.workspace = true
+
+[dev-dependencies]
+tanova-nodes.workspace = true

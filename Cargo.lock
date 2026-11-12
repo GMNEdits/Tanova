@@ -2357,6 +2357,8 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "tanova-kernel",
+ "tanova-nodes",
+ "tanova-render",
 ]
 
 [[package]]

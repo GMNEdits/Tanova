@@ -324,6 +324,23 @@ impl Raster2D {
             .map_or(0.0, |plane| plane.sample(x, y, self.bbox, self.edge_mode))
     }
 
+    /// Samples all four RGBA channels at one Bottom-Left `(x, y)` pixel.
+    ///
+    /// A missing alpha plane reads as fully opaque, matching the display path.
+    pub fn sample_rgba(&self, x: i32, y: i32) -> [f32; 4] {
+        let alpha = if self.channels.contains_key(&Channel::RgbaAlpha) {
+            self.sample(&Channel::RgbaAlpha, x, y)
+        } else {
+            1.0
+        };
+        [
+            self.sample(&Channel::RgbaRed, x, y),
+            self.sample(&Channel::RgbaGreen, x, y),
+            self.sample(&Channel::RgbaBlue, x, y),
+            alpha,
+        ]
+    }
+
     /// Writes one channel pixel, creating the plane on demand.
     pub fn set_pixel(
         &mut self,
@@ -346,6 +363,20 @@ impl Raster2D {
     /// consumed by `egui` and `wgpu` uploads. A missing alpha channel is
     /// treated as fully opaque.
     pub fn to_top_left_rgba8(&self, display_bbox: BBox) -> Vec<u8> {
+        self.to_top_left_rgba8_with_display(display_bbox, 1.0, 1.0)
+    }
+
+    /// Converts to Top-Left `RGBA8` through the viewer's exposure and gamma.
+    ///
+    /// `gain` multiplies RGB before `gamma` applies the inverse power. Alpha is
+    /// left untouched so transparent edges keep their coverage. Non-positive
+    /// RGB values skip `pow`, which keeps super-blacks finite.
+    pub fn to_top_left_rgba8_with_display(
+        &self,
+        display_bbox: BBox,
+        gain: f32,
+        gamma: f32,
+    ) -> Vec<u8> {
         let width = display_bbox.width().max(0) as usize;
         let height = display_bbox.height().max(0) as usize;
         let mut out = vec![0u8; width * height * 4];
@@ -354,6 +385,13 @@ impl Raster2D {
         }
 
         let has_alpha = self.channels.contains_key(&Channel::RgbaAlpha);
+        let display = |value: f32| {
+            let mut value = value * gain;
+            if value > 0.0 && gamma > 1e-6 {
+                value = value.powf(1.0 / gamma);
+            }
+            to_unorm8(value)
+        };
 
         for row in 0..height {
             let y = display_bbox.max_y - 1 - row as i32;
@@ -361,9 +399,9 @@ impl Raster2D {
                 let x = display_bbox.min_x + col as i32;
                 let index = (row * width + col) * 4;
 
-                out[index] = to_unorm8(self.sample(&Channel::RgbaRed, x, y));
-                out[index + 1] = to_unorm8(self.sample(&Channel::RgbaGreen, x, y));
-                out[index + 2] = to_unorm8(self.sample(&Channel::RgbaBlue, x, y));
+                out[index] = display(self.sample(&Channel::RgbaRed, x, y));
+                out[index + 1] = display(self.sample(&Channel::RgbaGreen, x, y));
+                out[index + 2] = display(self.sample(&Channel::RgbaBlue, x, y));
                 out[index + 3] = if has_alpha {
                     to_unorm8(self.sample(&Channel::RgbaAlpha, x, y))
                 } else {
@@ -596,5 +634,61 @@ mod tests {
 
         let bytes = raster.to_top_left_rgba8(bbox);
         assert_eq!(&bytes[0..4], &[0, 0, 0, 128]);
+    }
+
+    #[test]
+    fn display_gain_and_gamma_affect_rgb_but_not_alpha() {
+        let bbox = BBox::new(0, 0, 1, 1);
+        let mut raster = Raster2D::new(Format::new("1x1", 1, 1, 1.0), bbox, EdgeMode::BlackOutside);
+        raster
+            .set_pixel(Channel::RgbaRed, 0, 0, 0.25, None)
+            .unwrap();
+        raster
+            .set_pixel(Channel::RgbaAlpha, 0, 0, 0.5, None)
+            .unwrap();
+
+        // 0.25 * 2 = 0.5, then pow(0.5, 1 / 2.0) = 0.7071.
+        let bytes = raster.to_top_left_rgba8_with_display(bbox, 2.0, 2.0);
+        assert_eq!(bytes[0], 180);
+        assert_eq!(bytes[3], 128, "viewer display must not touch alpha");
+
+        // Super-blacks skip pow and clamp to zero instead of going NaN.
+        let mut negative =
+            Raster2D::new(Format::new("1x1", 1, 1, 1.0), bbox, EdgeMode::BlackOutside);
+        negative
+            .set_pixel(Channel::RgbaRed, 0, 0, -0.5, None)
+            .unwrap();
+        let bytes = negative.to_top_left_rgba8_with_display(bbox, 1.0, 2.2);
+        assert_eq!(bytes[0], 0);
+    }
+
+    #[test]
+    fn sample_rgba_reads_bottom_left_pixels() {
+        let bbox = BBox::new(0, 0, 2, 2);
+        let mut raster = Raster2D::new(Format::new("2x2", 2, 2, 1.0), bbox, EdgeMode::BlackOutside);
+        raster.set_pixel(Channel::RgbaRed, 0, 0, 0.1, None).unwrap();
+        raster
+            .set_pixel(Channel::RgbaGreen, 0, 0, 0.2, None)
+            .unwrap();
+        raster
+            .set_pixel(Channel::RgbaBlue, 0, 0, 0.3, None)
+            .unwrap();
+        raster
+            .set_pixel(Channel::RgbaAlpha, 0, 0, 0.4, None)
+            .unwrap();
+
+        let pixel = raster.sample_rgba(0, 0);
+        assert!((pixel[0] - 0.1).abs() < 1e-6);
+        assert!((pixel[1] - 0.2).abs() < 1e-6);
+        assert!((pixel[2] - 0.3).abs() < 1e-6);
+        assert!((pixel[3] - 0.4).abs() < 1e-6);
+
+        // Missing alpha reads as opaque.
+        let mut no_alpha =
+            Raster2D::new(Format::new("2x2", 2, 2, 1.0), bbox, EdgeMode::BlackOutside);
+        no_alpha
+            .set_pixel(Channel::RgbaRed, 1, 1, 0.7, None)
+            .unwrap();
+        assert_eq!(no_alpha.sample_rgba(1, 1)[3], 1.0);
     }
 }

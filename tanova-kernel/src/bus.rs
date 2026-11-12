@@ -4,6 +4,7 @@
 //! one channel and receives [`KernelEvent`]s over another, so the microkernel
 //! can live on its own thread while the UI stays stateless.
 
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
@@ -11,6 +12,7 @@ use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 use crate::dag::Dag;
 use crate::governor::{MemoryGovernor, RenderEpoch};
 use crate::knobs::KnobValue;
+use crate::types::{EvalContext, NodeError, Packet};
 
 /// Identifies a node instance in the graph.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -125,7 +127,7 @@ impl UndoableCommand {
 }
 
 /// Work sent from the UI thread to the kernel thread.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum KernelMessage {
     /// Apply a reversible command.
     Execute(UndoableCommand),
@@ -135,6 +137,12 @@ pub enum KernelMessage {
     Redo,
     /// Invalidate in-flight renders.
     BumpEpoch,
+    /// Replace the base render context (render state, GPU engine, ...).
+    SetBaseContext(EvalContext),
+    /// Choose which node the viewer displays; `None` clears the viewer.
+    SetViewerNode(Option<NodeId>),
+    /// Evaluate the active viewer target even if nothing else changed.
+    RequestRender,
     /// Ask the kernel thread to exit.
     Shutdown,
 }
@@ -168,16 +176,16 @@ pub enum KernelEvent {
 
 /// Metadata for a rendered frame delivered off-screen to the UI.
 ///
-/// The pixels themselves will travel as shared `wgpu::TextureView` handles in
-/// a later milestone; this is the typed notification side of that channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The packet carries the cartridge output (for the current renderer, a
+/// `Raster2D` behind an `Arc`); the kernel itself stays blind to its type.
+#[derive(Debug, Clone)]
 pub struct FrameNotification {
+    /// Node the viewer asked to render.
+    pub node: NodeId,
     /// Render epoch that produced the frame.
     pub epoch: u64,
-    /// Frame width in pixels.
-    pub width: u32,
-    /// Frame height in pixels.
-    pub height: u32,
+    /// The evaluated packet, ready for the UI to inspect.
+    pub packet: Arc<Packet>,
 }
 
 /// Linear undo/redo history of applied commands.
@@ -194,8 +202,35 @@ impl UndoStack {
     }
 
     /// Records a newly applied command and drops any redo branch.
+    ///
+    /// Consecutive `SetKnob` commands for the same `(node, knob)` are coalesced
+    /// so a continuous slider drag undoes in one step. Coalescing is skipped
+    /// when a redo branch exists, because the previous undo entry may no longer
+    /// describe the current value.
     pub fn push(&mut self, command: UndoableCommand) {
+        let can_coalesce = self.redo.is_empty();
         self.redo.clear();
+
+        if can_coalesce {
+            if let UndoableCommand::SetKnob {
+                node, knob, value, ..
+            } = &command
+            {
+                if let Some(UndoableCommand::SetKnob {
+                    node: last_node,
+                    knob: last_knob,
+                    value: last_value,
+                    ..
+                }) = self.undo.last_mut()
+                {
+                    if last_node == node && last_knob == knob {
+                        *last_value = value.clone();
+                        return;
+                    }
+                }
+            }
+        }
+
         self.undo.push(command);
     }
 
@@ -304,65 +339,243 @@ impl Drop for KernelHandle {
 fn kernel_loop(
     messages: Receiver<KernelMessage>,
     events: Sender<KernelEvent>,
-    _frames: Sender<FrameNotification>,
+    frames: Sender<FrameNotification>,
     governor: MemoryGovernor,
     epoch: RenderEpoch,
 ) {
     let mut undo = UndoStack::new();
     let mut dag = Dag::new();
+    let mut base_ctx = EvalContext::new();
+    let mut viewer_node: Option<NodeId> = None;
+    let mut render_dirty = false;
 
-    // The governor is wired in now; DAG evaluations start reserving from it
-    // when pixel allocation lands.
-    let _governor = governor;
-
-    while let Ok(message) = messages.recv() {
-        match message {
-            KernelMessage::Execute(command) => match dag.apply_command(&command) {
-                Ok(()) => {
-                    undo.push(command.clone());
-                    let _ = events.send(KernelEvent::Applied(command));
-                }
-                Err(error) => {
-                    let _ = events.send(KernelEvent::CommandFailed {
-                        command,
-                        message: error.to_string(),
-                    });
-                }
-            },
-            KernelMessage::Undo => {
-                if let Some(command) = undo.undo() {
-                    match dag.undo_command(&command) {
-                        Ok(()) => {
-                            let _ = events.send(KernelEvent::Undone(command));
-                        }
-                        Err(error) => {
-                            let _ = events.send(KernelEvent::CommandFailed {
-                                command,
-                                message: error.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-            KernelMessage::Redo => {
-                if let Some(command) = undo.redo() {
-                    match dag.apply_command(&command) {
-                        Ok(()) => {
-                            let _ = events.send(KernelEvent::Redone(command));
-                        }
-                        Err(error) => {
-                            let _ = events.send(KernelEvent::CommandFailed {
-                                command,
-                                message: error.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-            KernelMessage::BumpEpoch => {
-                let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
-            }
-            KernelMessage::Shutdown => break,
+    while let Ok(first) = messages.recv() {
+        // Drain-then-render: apply every queued mutation before paying for a
+        // render, so a burst of seed commands produces exactly one frame.
+        let mut batch = vec![first];
+        while let Ok(message) = messages.try_recv() {
+            batch.push(message);
         }
+
+        let mut shutdown = false;
+        for message in batch {
+            match message {
+                KernelMessage::Execute(command) => match dag.apply_command(&command) {
+                    Ok(()) => {
+                        undo.push(command.clone());
+                        render_dirty = true;
+                        let _ = events.send(KernelEvent::Applied(command));
+                    }
+                    Err(error) => {
+                        let _ = events.send(KernelEvent::CommandFailed {
+                            command,
+                            message: error.to_string(),
+                        });
+                    }
+                },
+                KernelMessage::Undo => {
+                    if let Some(command) = undo.undo() {
+                        match dag.undo_command(&command) {
+                            Ok(()) => {
+                                render_dirty = true;
+                                let _ = events.send(KernelEvent::Undone(command));
+                            }
+                            Err(error) => {
+                                let _ = events.send(KernelEvent::CommandFailed {
+                                    command,
+                                    message: error.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                KernelMessage::Redo => {
+                    if let Some(command) = undo.redo() {
+                        match dag.apply_command(&command) {
+                            Ok(()) => {
+                                render_dirty = true;
+                                let _ = events.send(KernelEvent::Redone(command));
+                            }
+                            Err(error) => {
+                                let _ = events.send(KernelEvent::CommandFailed {
+                                    command,
+                                    message: error.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                KernelMessage::BumpEpoch => {
+                    let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+                }
+                KernelMessage::SetBaseContext(context) => {
+                    base_ctx = context;
+                    render_dirty = true;
+                }
+                KernelMessage::SetViewerNode(node) => {
+                    viewer_node = node;
+                    render_dirty = true;
+                }
+                KernelMessage::RequestRender => {
+                    render_dirty = true;
+                }
+                KernelMessage::Shutdown => shutdown = true,
+            }
+        }
+
+        if shutdown {
+            break;
+        }
+        if !render_dirty {
+            continue;
+        }
+        render_dirty = false;
+
+        let Some(target) = viewer_node else {
+            continue;
+        };
+        if dag.node(target).is_none() {
+            continue;
+        }
+
+        let current_epoch = epoch.bump();
+        let context = base_ctx.clone();
+        match dag.evaluate_pull(target, &context, &governor, &epoch, current_epoch) {
+            Ok(packet) => {
+                let _ = frames.send(FrameNotification {
+                    node: target,
+                    epoch: current_epoch,
+                    packet,
+                });
+            }
+            Err(NodeError::Panic(message)) => {
+                let _ = events.send(KernelEvent::NodeCrashed {
+                    node: target,
+                    message,
+                });
+            }
+            Err(_) => {
+                // Missing inputs, memory pressure, and preemption are normal
+                // during interactive editing; the next change retries.
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    use crate::knobs::KnobTable;
+    use crate::registry::NodeCartridgeDescriptor;
+
+    struct ConstantProbe;
+
+    impl crate::types::NodeTrait for ConstantProbe {
+        fn evaluate(&self, _ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
+            let mut packet = Packet::new();
+            packet.insert(7u32);
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            "Constant {}".to_string()
+        }
+    }
+
+    fn constant_knobs() -> KnobTable {
+        KnobTable::new()
+    }
+
+    fn constant_factory() -> Arc<dyn crate::types::NodeTrait> {
+        Arc::new(ConstantProbe)
+    }
+
+    inventory::submit! {
+        NodeCartridgeDescriptor {
+            kind: "Constant",
+            default_knobs: constant_knobs,
+            factory: constant_factory,
+        }
+    }
+
+    fn set_knob(name: &str, value: f32, previous: f32) -> UndoableCommand {
+        UndoableCommand::SetKnob {
+            node: NodeId(1),
+            knob: name.to_string(),
+            value: KnobValue::Float(value as f64),
+            previous: KnobValue::Float(previous as f64),
+        }
+    }
+
+    #[test]
+    fn consecutive_set_knobs_coalesce_into_one_undo_step() {
+        let mut stack = UndoStack::new();
+        stack.push(set_knob("gain", 1.0, 0.0));
+        stack.push(set_knob("gain", 2.0, 1.0));
+        stack.push(set_knob("gain", 3.0, 2.0));
+
+        let undone = stack.undo().expect("one coalesced step");
+        match undone {
+            UndoableCommand::SetKnob {
+                value, previous, ..
+            } => {
+                assert_eq!(value, KnobValue::Float(3.0));
+                assert_eq!(previous, KnobValue::Float(0.0));
+            }
+            other => panic!("expected SetKnob, got {other:?}"),
+        }
+        assert!(!stack.can_undo(), "the drag must undo in one step");
+    }
+
+    #[test]
+    fn coalescing_stops_at_different_knobs_and_redo_branches() {
+        let mut stack = UndoStack::new();
+        stack.push(set_knob("gain", 1.0, 0.0));
+        stack.push(set_knob("gamma", 2.0, 1.0));
+        assert!(stack.undo().is_some());
+        assert!(stack.undo().is_some());
+        assert!(!stack.can_undo());
+
+        // A redo branch means the previous entry no longer describes the world.
+        stack.push(set_knob("gain", 1.0, 0.0));
+        let _ = stack.undo();
+        assert!(stack.can_redo());
+        stack.push(set_knob("gain", 4.0, 1.0));
+        assert!(!stack.can_redo(), "a new edit clears the redo branch");
+        assert!(stack.undo().is_some());
+        assert!(
+            !stack.can_undo(),
+            "the pre-undo command was already consumed"
+        );
+    }
+
+    #[test]
+    fn background_viewer_renders_after_set_viewer_node() {
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+
+        kernel
+            .send(KernelMessage::SetBaseContext(EvalContext::new()))
+            .expect("base context");
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(1),
+                kind: "Constant".to_string(),
+            }))
+            .expect("add node");
+        kernel
+            .send(KernelMessage::SetViewerNode(Some(NodeId(1))))
+            .expect("set viewer");
+
+        let frame = kernel
+            .frames()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("viewer should render automatically");
+
+        assert_eq!(frame.node, NodeId(1));
+        assert_eq!(frame.packet.get::<u32>(), Some(&7));
+
+        kernel.shutdown();
     }
 }

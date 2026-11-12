@@ -2,6 +2,8 @@
 //!
 //! The UI thread owns no graph state: it mirrors the kernel's graph from
 //! [`KernelEvent`]s and sends every mutation back as a [`KernelMessage`].
+//! The kernel thread evaluates the viewer target and delivers frames
+//! off-screen through [`FrameNotification`]s.
 
 use std::error::Error;
 use std::sync::Arc;
@@ -9,16 +11,23 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tanova_kernel::{
-    FrameNotification, KernelEvent, KernelHandle, KernelMessage, NodeId, PortId, UndoableCommand,
-    registered_cartridge_kinds,
+    EvalContext, FrameNotification, KernelEvent, KernelHandle, KernelMessage, KnobValue, NodeId,
+    Packet, PortId, UndoableCommand, registered_cartridge_kinds,
 };
-use tanova_ui::{GraphMirror, NodeCanvas, NodeCanvasState};
+use tanova_render::{GpuComputeEngine, Raster2D};
+use tanova_ui::{GraphMirror, NodeCanvas, NodeCanvasState, PropertiesPanel, ViewerPanel};
 
 /// Errors crossing the app boundary (eframe requires `Send + Sync`).
 type AppError = Box<dyn Error + Send + Sync>;
 
-/// Seeded commands: two `Dummy` nodes plus one B-pipe wire, then an epoch bump.
-const SEED_EVENTS: usize = 4;
+/// Node ids of the starter comp.
+const CONSTANT: NodeId = NodeId(1);
+const GRADE: NodeId = NodeId(2);
+
+/// Starter constant color, graded by an identity Grade.
+const STARTER_COLOR: [f32; 4] = [0.18, 0.35, 0.65, 1.0];
+/// Small resolution keeps startup and the headless check fast.
+const STARTER_SIZE: i64 = 256;
 
 /// GPU handles shared by the UI thread and the background render thread.
 ///
@@ -114,7 +123,7 @@ fn gpu_from_render_state(cc: &eframe::CreationContext<'_>) -> Result<GpuContext,
     })
 }
 
-/// Boots GPU + kernel + UI state, verifies the seeded graph, and exits.
+/// Boots GPU + kernel + UI state, verifies the starter comp renders, and exits.
 fn run_headless_check() -> Result<(), AppError> {
     println!("check-headless: initializing GPU");
     let gpu = pollster::block_on(init_gpu())?;
@@ -124,16 +133,12 @@ fn run_headless_check() -> Result<(), AppError> {
     );
 
     let mut app = TanovaApp::new(KernelHandle::spawn().map_err(kernel_error)?, gpu);
-    let folded = app.wait_for_events(SEED_EVENTS, Duration::from_secs(10))?;
-    println!("check-headless: folded {folded} kernel event(s)");
-
-    app.pump();
-    app.canvas.layout_nodes(&app.graph);
-
-    let nodes = app.graph.node_count();
-    let edges = app.graph.edge_count();
+    let packet = app.wait_for_frame(GRADE, Duration::from_secs(60))?;
     println!(
-        "check-headless: nodes={nodes} edges={edges} epoch={}",
+        "check-headless: viewer frame from #{}; nodes={} edges={} epoch={}",
+        GRADE.0,
+        app.graph.node_count(),
+        app.graph.edge_count(),
         app.epoch
     );
 
@@ -142,31 +147,49 @@ fn run_headless_check() -> Result<(), AppError> {
             "kernel reported a failure: {failure}"
         )));
     }
-    if nodes != 2 {
+    if app.graph.node_count() != 2 {
         return Err(check_failed(format!(
-            "expected 2 seeded nodes, found {nodes}"
+            "expected 2 seeded nodes, found {}",
+            app.graph.node_count()
         )));
     }
-    if edges != 1 {
+    if app.graph.edge_count() != 1 {
         return Err(check_failed(format!(
-            "expected 1 seeded wire, found {edges}"
-        )));
-    }
-    if app.epoch != 1 {
-        return Err(check_failed(format!(
-            "expected epoch 1 after the seed bump, found {}",
-            app.epoch
+            "expected 1 seeded wire, found {}",
+            app.graph.edge_count()
         )));
     }
 
     let wire = app.graph.edges()[0];
-    if wire.from_node != NodeId(1) || wire.to_node != NodeId(2) {
+    if wire.from_node != CONSTANT || wire.to_node != GRADE {
         return Err(check_failed(format!(
             "expected a #1 -> #2 wire, found #{} -> #{}",
             wire.from_node.0, wire.to_node.0
         )));
     }
 
+    let raster = packet
+        .get::<Raster2D>()
+        .ok_or_else(|| check_failed("the viewer frame carried no Raster2D"))?;
+    if raster.format.width != STARTER_SIZE as u32 || raster.format.height != STARTER_SIZE as u32 {
+        return Err(check_failed(format!(
+            "expected a {}x{} frame, found {}x{}",
+            STARTER_SIZE, STARTER_SIZE, raster.format.width, raster.format.height
+        )));
+    }
+
+    // Grade defaults are identity, so the graded pixel equals the Constant.
+    let pixel = raster.sample_rgba(STARTER_SIZE as i32 / 2, STARTER_SIZE as i32 / 2);
+    for (index, (actual, expected)) in pixel.iter().zip(STARTER_COLOR.iter()).enumerate() {
+        if (actual - expected).abs() > 1e-3 {
+            return Err(check_failed(format!(
+                "graded channel {index} was {actual}, expected {expected}"
+            )));
+        }
+    }
+    println!("check-headless: graded pixel RGBA = {pixel:?}");
+
+    app.canvas.layout_nodes(&app.graph);
     println!(
         "check-headless: canvas laid out {} node position(s); GPU handle(s) = {}",
         app.canvas.positions.len(),
@@ -184,6 +207,7 @@ struct TanovaApp {
     kernel: KernelHandle,
     graph: GraphMirror,
     canvas: NodeCanvasState,
+    viewer: ViewerPanel,
     cartridge_kinds: Vec<&'static str>,
     epoch: u64,
     last_frame: Option<FrameNotification>,
@@ -197,6 +221,7 @@ impl TanovaApp {
             kernel,
             graph: GraphMirror::default(),
             canvas: NodeCanvasState::default(),
+            viewer: ViewerPanel::new(),
             cartridge_kinds: registered_cartridge_kinds(),
             epoch: 0,
             last_frame: None,
@@ -207,26 +232,52 @@ impl TanovaApp {
         app
     }
 
-    /// Queues the two-node starter graph the window opens with.
+    /// Queues the live starter comp: Constant -> Grade, viewed at #2.
     fn seed_graph(&mut self) {
+        let mut context = EvalContext::new();
+        context.insert(GpuComputeEngine::new(
+            self.gpu.device.clone(),
+            self.gpu.queue.clone(),
+        ));
+
         let seed = [
+            KernelMessage::SetBaseContext(context),
             KernelMessage::Execute(UndoableCommand::AddNode {
-                id: NodeId(1),
-                kind: "Dummy".to_string(),
+                id: CONSTANT,
+                kind: "Constant".to_string(),
             }),
             KernelMessage::Execute(UndoableCommand::AddNode {
-                id: NodeId(2),
-                kind: "Dummy".to_string(),
+                id: GRADE,
+                kind: "Grade".to_string(),
             }),
             KernelMessage::Execute(UndoableCommand::ConnectEdge {
-                from_node: NodeId(1),
+                from_node: CONSTANT,
                 from_port: PortId(0),
-                to_node: NodeId(2),
+                to_node: GRADE,
                 to_port: PortId(0),
             }),
-            KernelMessage::BumpEpoch,
+            KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: CONSTANT,
+                knob: "color".to_string(),
+                value: KnobValue::Color(STARTER_COLOR),
+                previous: KnobValue::Color([0.0, 0.0, 0.0, 1.0]),
+            }),
+            KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: CONSTANT,
+                knob: "format_width".to_string(),
+                value: KnobValue::Int(STARTER_SIZE),
+                previous: KnobValue::Int(1920),
+            }),
+            KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: CONSTANT,
+                knob: "format_height".to_string(),
+                value: KnobValue::Int(STARTER_SIZE),
+                previous: KnobValue::Int(1080),
+            }),
+            KernelMessage::SetViewerNode(Some(GRADE)),
         ];
 
+        self.viewer.bind(Some(GRADE));
         for message in seed {
             if let Err(error) = self.kernel.send(message) {
                 self.failure = Some(format!("failed to seed the kernel: {error}"));
@@ -240,6 +291,7 @@ impl TanovaApp {
             self.fold_event(event);
         }
         while let Ok(frame) = self.kernel.frames().try_recv() {
+            self.viewer.set_frame(&frame);
             self.last_frame = Some(frame);
         }
     }
@@ -256,33 +308,39 @@ impl TanovaApp {
         self.graph.apply_event(&event);
     }
 
-    /// Blocks (with a deadline) until `expected` events have been folded.
-    fn wait_for_events(&mut self, expected: usize, timeout: Duration) -> Result<usize, AppError> {
+    /// Blocks (with a deadline) until the viewer delivers a frame from `node`.
+    fn wait_for_frame(&mut self, node: NodeId, timeout: Duration) -> Result<Arc<Packet>, AppError> {
         let deadline = Instant::now() + timeout;
-        let mut folded = 0;
 
-        while folded < expected {
+        loop {
             while let Ok(event) = self.kernel.events().try_recv() {
                 self.fold_event(event);
-                folded += 1;
             }
-            if folded >= expected {
-                break;
+            while let Ok(frame) = self.kernel.frames().try_recv() {
+                let matches = frame.node == node;
+                let packet = Arc::clone(&frame.packet);
+                self.viewer.set_frame(&frame);
+                self.last_frame = Some(frame);
+                if matches {
+                    return Ok(packet);
+                }
             }
             if Instant::now() >= deadline {
                 return Err(check_failed(format!(
-                    "timed out after {folded}/{expected} kernel event(s)"
+                    "timed out waiting for a frame from #{}",
+                    node.0
                 )));
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-
-        Ok(folded)
     }
 
-    /// Sends every message the canvas asked for.
+    /// Sends every message the UI asked for, syncing viewer state first.
     fn dispatch(&mut self, messages: Vec<KernelMessage>) {
         for message in messages {
+            if let KernelMessage::SetViewerNode(node) = &message {
+                self.viewer.bind(*node);
+            }
             if let Err(error) = self.kernel.send(message) {
                 self.failure = Some(format!("kernel send failed: {error}"));
             }
@@ -306,9 +364,14 @@ impl eframe::App for TanovaApp {
                 ui.separator();
                 ui.label(format!("{} node(s)", self.graph.node_count()));
                 ui.label(format!("{} wire(s)", self.graph.edge_count()));
-                if let Some(frame) = self.last_frame {
-                    ui.separator();
-                    ui.label(format!("frame {}x{}", frame.width, frame.height));
+                if let Some(frame) = &self.last_frame {
+                    if let Some(raster) = frame.packet.get::<Raster2D>() {
+                        ui.separator();
+                        ui.label(format!(
+                            "frame {}x{}",
+                            raster.format.width, raster.format.height
+                        ));
+                    }
                 }
                 if let Some(failure) = &self.failure {
                     ui.separator();
@@ -317,11 +380,41 @@ impl eframe::App for TanovaApp {
             });
         });
 
+        // Nuke layout: Viewer on top, Properties on the right, graph below.
+        egui::Panel::top("tanova_viewer")
+            .resizable(true)
+            .default_size(380.0)
+            .min_size(160.0)
+            .show(ui, |ui| {
+                self.viewer.show(ui);
+            });
+
+        egui::Panel::right("tanova_properties")
+            .resizable(true)
+            .default_size(320.0)
+            .min_size(180.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let messages = PropertiesPanel::show(
+                        ui,
+                        &self.graph,
+                        self.canvas.selected,
+                        self.viewer.viewer_node(),
+                    );
+                    self.dispatch(messages);
+                });
+            });
+
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
-                let messages =
-                    NodeCanvas::show(ui, &mut self.canvas, &self.graph, &self.cartridge_kinds);
+                let messages = NodeCanvas::show(
+                    ui,
+                    &mut self.canvas,
+                    &self.graph,
+                    &self.cartridge_kinds,
+                    self.viewer.viewer_node(),
+                );
                 self.dispatch(messages);
             });
 
