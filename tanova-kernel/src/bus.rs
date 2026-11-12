@@ -113,9 +113,37 @@ pub enum UndoableCommand {
         /// Value before this command.
         previous: KnobValue,
     },
+    /// Move a node from one canvas position to another.
+    MoveNode {
+        /// Node being moved.
+        id: NodeId,
+        /// Canvas-space X before the move.
+        from_x: f32,
+        /// Canvas-space Y before the move.
+        from_y: f32,
+        /// Canvas-space X after the move.
+        to_x: f32,
+        /// Canvas-space Y after the move.
+        to_y: f32,
+    },
+    /// A batch of commands applied atomically as one undo step.
+    ///
+    /// All sub-commands succeed together or none do. Inverse applies each
+    /// sub-command's inverse in reverse order.
+    Batch(Vec<UndoableCommand>),
 }
 
 impl UndoableCommand {
+    /// Builds a [`Batch`] from a vector of commands, collapsing a single
+    /// command back to itself and returning `None` for an empty vector.
+    pub fn from_vec(cmds: Vec<UndoableCommand>) -> Option<UndoableCommand> {
+        match cmds.len() {
+            0 => None,
+            1 => Some(cmds.into_iter().next().unwrap()),
+            _ => Some(UndoableCommand::Batch(cmds)),
+        }
+    }
+
     /// Returns the command that exactly reverses `self`.
     pub fn inverse(&self) -> Self {
         match self {
@@ -196,6 +224,24 @@ impl UndoableCommand {
                 value: previous.clone(),
                 previous: value.clone(),
             },
+            Self::MoveNode {
+                id,
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            } => Self::MoveNode {
+                id: *id,
+                from_x: *to_x,
+                from_y: *to_y,
+                to_x: *from_x,
+                to_y: *from_y,
+            },
+            Self::Batch(cmds) => {
+                let inverses: Vec<UndoableCommand> =
+                    cmds.iter().rev().map(|cmd| cmd.inverse()).collect();
+                Self::Batch(inverses)
+            }
         }
     }
 }
@@ -315,7 +361,12 @@ impl FrameNotification {
 pub struct UndoStack {
     undo: Vec<UndoableCommand>,
     redo: Vec<UndoableCommand>,
+    /// Time of the last `push`, used for time-bounded gesture coalescing.
+    last_push_time: Option<std::time::Instant>,
 }
+
+/// Maximum time between pushes for gestures to be coalesced.
+const COALESCE_WINDOW_MS: u64 = 400;
 
 impl UndoStack {
     /// Creates an empty history.
@@ -323,37 +374,120 @@ impl UndoStack {
         Self::default()
     }
 
+    /// Breaks the coalescing window so the next push starts a new gesture.
+    /// Useful as a test helper or when a deliberate user action (e.g. mouse
+    /// release) ends a drag.
+    pub fn break_coalescing(&mut self) {
+        self.last_push_time = None;
+    }
+
     /// Records a newly applied command and drops any redo branch.
     ///
-    /// Consecutive `SetKnob` commands for the same `(node, knob)` are coalesced
-    /// so a continuous slider drag undoes in one step. Coalescing is skipped
-    /// when a redo branch exists, because the previous undo entry may no longer
-    /// describe the current value.
+    /// Within [`COALESCE_WINDOW_MS`] of the previous push (and with an empty
+    /// redo stack), consecutive `SetKnob` on the same `(node, knob)`,
+    /// consecutive `MoveNode` on the same `id`, and consecutive `Batch` moves
+    /// for the same node sequence are coalesced into a single undo step.
     pub fn push(&mut self, command: UndoableCommand) {
-        let can_coalesce = self.redo.is_empty();
-        self.redo.clear();
+        let now = std::time::Instant::now();
+        let can_coalesce = self.redo.is_empty()
+            && self
+                .last_push_time
+                .is_some_and(|t| now.duration_since(t).as_millis() <= COALESCE_WINDOW_MS as u128);
 
-        if can_coalesce {
-            if let UndoableCommand::SetKnob {
-                node, knob, value, ..
-            } = &command
-            {
-                if let Some(UndoableCommand::SetKnob {
-                    node: last_node,
-                    knob: last_knob,
-                    value: last_value,
-                    ..
-                }) = self.undo.last_mut()
-                {
-                    if last_node == node && last_knob == knob {
-                        *last_value = value.clone();
-                        return;
-                    }
-                }
-            }
+        self.redo.clear();
+        self.last_push_time = Some(now);
+
+        if can_coalesce && self.try_coalesce(&command).is_some() {
+            return;
         }
 
         self.undo.push(command);
+    }
+
+    /// Attempts to coalesce `command` with the top of the undo stack.
+    ///
+    /// Returns `Some(())` when coalescing happened (the stack was modified in
+    /// place), `None` otherwise.
+    fn try_coalesce(&mut self, command: &UndoableCommand) -> Option<()> {
+        let last = self.undo.last_mut()?;
+
+        match (last, command) {
+            // Coalesce consecutive SetKnob on the same (node, knob).
+            (
+                UndoableCommand::SetKnob {
+                    node: last_node,
+                    knob: last_knob,
+                    value: last_value,
+                    previous: last_previous,
+                    ..
+                },
+                UndoableCommand::SetKnob {
+                    node,
+                    knob,
+                    value,
+                    previous,
+                    ..
+                },
+            ) if last_node == node && last_knob == knob => {
+                *last_value = value.clone();
+                // Keep the earliest `previous` for correct undo semantics.
+                Some(())
+            }
+            // Coalesce consecutive MoveNode on the same id.
+            (
+                UndoableCommand::MoveNode {
+                    id: last_id,
+                    from_x: last_from_x,
+                    from_y: last_from_y,
+                    to_x: last_to_x,
+                    to_y: last_to_y,
+                    ..
+                },
+                UndoableCommand::MoveNode {
+                    id,
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                    ..
+                },
+            ) if last_id == id => {
+                *last_to_x = *to_x;
+                *last_to_y = *to_y;
+                // Keep the earliest from_x/from_y.
+                Some(())
+            }
+            // Coalesce consecutive Batch of MoveNodes for the same node sequence.
+            (UndoableCommand::Batch(last_cmds), UndoableCommand::Batch(cmds))
+                if last_cmds.len() == cmds.len()
+                    && last_cmds.iter().zip(cmds.iter()).all(|(a, b)| {
+                        matches!(
+                            (a, b),
+                            (
+                                UndoableCommand::MoveNode { id: id_a, .. },
+                                UndoableCommand::MoveNode { id: id_b, .. },
+                            ) if id_a == id_b
+                        )
+                    }) =>
+            {
+                for (last_cmd, cmd) in last_cmds.iter_mut().zip(cmds.iter()) {
+                    if let (
+                        UndoableCommand::MoveNode {
+                            to_x: last_to_x,
+                            to_y: last_to_y,
+                            ..
+                        },
+                        UndoableCommand::MoveNode { to_x, to_y, .. },
+                    ) = (last_cmd, cmd)
+                    {
+                        *last_to_x = *to_x;
+                        *last_to_y = *to_y;
+                    }
+                }
+                Some(())
+            }
+            _ => None,
+        }
     }
 
     /// Pops the last applied command, moving it onto the redo stack.
@@ -493,26 +627,52 @@ fn kernel_loop(
         // clean.
         let mut coalesced: Vec<KernelMessage> = Vec::with_capacity(batch.len());
         for message in batch {
-            if let KernelMessage::Execute(UndoableCommand::SetKnob {
-                ref node,
-                ref knob,
-                ref value,
-                ..
-            }) = message
-            {
-                if let Some(&mut KernelMessage::Execute(UndoableCommand::SetKnob {
-                    node: ref last_node,
-                    knob: ref last_knob,
-                    value: ref mut last_value,
-                    ..
-                })) = coalesced.last_mut()
-                {
-                    if last_node == node && last_knob == knob {
-                        // Keep the latest `value`; `previous` stays from the
-                        // first message in the run for correct undo semantics.
-                        *last_value = value.clone();
-                        continue;
+            if let KernelMessage::Execute(ref command) = message {
+                let can_coalesce = match command {
+                    UndoableCommand::SetKnob {
+                        node, knob, value, ..
+                    } => {
+                        if let Some(KernelMessage::Execute(UndoableCommand::SetKnob {
+                            node: last_node,
+                            knob: last_knob,
+                            value: last_value,
+                            ..
+                        })) = coalesced.last_mut()
+                        {
+                            if last_node == node && last_knob == knob {
+                                *last_value = value.clone();
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
                     }
+                    UndoableCommand::MoveNode { id, to_x, to_y, .. } => {
+                        if let Some(KernelMessage::Execute(UndoableCommand::MoveNode {
+                            id: last_id,
+                            to_x: last_to_x,
+                            to_y: last_to_y,
+                            ..
+                        })) = coalesced.last_mut()
+                        {
+                            if last_id == id {
+                                *last_to_x = *to_x;
+                                *last_to_y = *to_y;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                    UndoableCommand::Batch(_) => false, // Batches are already atomic
+                    _ => false,
+                };
+                if can_coalesce {
+                    continue;
                 }
             }
             coalesced.push(message);
@@ -552,8 +712,8 @@ fn kernel_loop(
                 }
                 KernelMessage::Redo => {
                     if let Some(command) = undo.redo() {
-                        match dag.apply_command(&command) {
-                            Ok(()) => {
+                        match dag.apply_command(command.clone()) {
+                            Ok(_) => {
                                 dag.cache_mut().clear();
                                 render_dirty = true;
                                 let _ = events.send(KernelEvent::Redone(command));
@@ -714,22 +874,23 @@ fn apply_and_record(
     command: UndoableCommand,
 ) -> bool {
     let command = dag.enrich(command);
-    match dag.apply_command(&command) {
-        Ok(()) => {
+    let command_for_error = command.clone();
+    match dag.apply_command(command) {
+        Ok(enriched_command) => {
             // Topology changes alter every downstream op hash. Dropping the
             // RAM cache guarantees the very next pull re-evaluates, so
             // detaching a wire updates the viewer immediately instead of
             // serving a packet cached for the old wiring.
-            if changes_topology(&command) {
+            if changes_topology(&enriched_command) {
                 dag.cache_mut().clear();
             }
-            undo.push(command.clone());
-            let _ = events.send(KernelEvent::Applied(command));
+            undo.push(enriched_command.clone());
+            let _ = events.send(KernelEvent::Applied(enriched_command));
             true
         }
         Err(error) => {
             let _ = events.send(KernelEvent::CommandFailed {
-                command,
+                command: command_for_error,
                 message: error.to_string(),
             });
             false
@@ -749,14 +910,19 @@ fn changes_topology(command: &UndoableCommand) -> bool {
             | UndoableCommand::RestoreNode { .. }
             | UndoableCommand::ConnectEdge { .. }
             | UndoableCommand::DisconnectEdge { .. }
+            | UndoableCommand::Batch(_)
+            | UndoableCommand::MoveNode { .. }
     )
 }
 
 /// Atomically routes a physical `Viewer` node at `target_node`.
 ///
-/// Returns the viewer id when the route succeeded. Every mutation goes through
-/// [`apply_and_record`], so creating the Viewer, rewiring port 0, and the
-/// resulting undo entries are one linear history.
+/// Collects all DAG mutations (optional `AddNode("Viewer")`, optional
+/// `DisconnectEdge` on `PortId(0)`, and `ConnectEdge` on `PortId(0)`) and
+/// executes them through [`UndoStack`] as a single [`UndoableCommand::Batch`]
+/// so pressing `Ctrl+Z` undoes the entire viewer routing operation in one step.
+///
+/// Returns the viewer id when the route succeeded.
 fn route_nuke_viewer(
     dag: &mut Dag,
     undo: &mut UndoStack,
@@ -780,19 +946,20 @@ fn route_nuke_viewer(
         .nodes()
         .find(|node| node.kind == "Viewer")
         .map(|node| node.id);
+
+    // Build all mutations up front so they can be applied atomically.
+    let mut cmds: Vec<UndoableCommand> = Vec::new();
+
     let viewer_id = match existing_viewer {
         Some(id) => id,
         None => {
             let id = dag.next_node_id();
-            let command = UndoableCommand::AddNode {
+            cmds.push(UndoableCommand::AddNode {
                 id,
                 kind: "Viewer".to_string(),
                 x: fallback_pos.0,
                 y: fallback_pos.1,
-            };
-            if !apply_and_record(dag, undo, events, command) {
-                return None;
-            }
+            });
             id
         }
     };
@@ -806,30 +973,27 @@ fn route_nuke_viewer(
         if edge.from_node == target_node && edge.from_port == PortId(0) {
             return Some(viewer_id);
         }
-        let command = UndoableCommand::DisconnectEdge {
+        cmds.push(UndoableCommand::DisconnectEdge {
             from_node: edge.from_node,
             from_port: edge.from_port,
             to_node: edge.to_node,
             to_port: edge.to_port,
-        };
-        if !apply_and_record(dag, undo, events, command) {
-            return None;
-        }
+        });
     }
 
-    let command = UndoableCommand::ConnectEdge {
+    cmds.push(UndoableCommand::ConnectEdge {
         from_node: target_node,
         from_port: PortId(0),
         to_node: viewer_id,
         to_port: PortId(0),
-    };
-    // The DAG rejects cycles and dangling endpoints; surface that as a failed
-    // command instead of binding the viewer to a broken route.
-    if !apply_and_record(dag, undo, events, command) {
-        return None;
-    }
+    });
 
-    Some(viewer_id)
+    let batch = UndoableCommand::from_vec(cmds)?;
+    if apply_and_record(dag, undo, events, batch) {
+        Some(viewer_id)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1149,7 +1313,7 @@ mod tests {
 
         // Detaching the upstream wire must clear the image instead of leaving
         // the last frame frozen on screen.
-        dag.apply_command(&UndoableCommand::DisconnectEdge {
+        dag.apply_command(UndoableCommand::DisconnectEdge {
             from_node: NodeId(1),
             from_port: PortId(0),
             to_node: NodeId(2),
@@ -1294,20 +1458,28 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                KernelEvent::Applied(UndoableCommand::AddNode { kind, x, y, .. })
-                    if kind == "Viewer" && *x == 5.0 && *y == 125.0
+                KernelEvent::Applied(UndoableCommand::Batch(cmds))
+                    if cmds.iter().any(|cmd| matches!(
+                        cmd,
+                        UndoableCommand::AddNode { kind, x, y, .. }
+                            if kind == "Viewer" && *x == 5.0 && *y == 125.0
+                    ))
             )),
             "the created Viewer must be reported: {events:?}"
         );
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                KernelEvent::Applied(UndoableCommand::ConnectEdge {
-                    from_node,
-                    to_node,
-                    to_port,
-                    ..
-                }) if *from_node == NodeId(1) && *to_node == viewer && *to_port == PortId(0)
+                KernelEvent::Applied(UndoableCommand::Batch(cmds))
+                    if cmds.iter().any(|cmd| matches!(
+                        cmd,
+                        UndoableCommand::ConnectEdge {
+                            from_node,
+                            to_node,
+                            to_port,
+                            ..
+                        } if *from_node == NodeId(1) && *to_port == PortId(0)
+                    ))
             )),
             "the Viewer must be wired to the target: {events:?}"
         );
@@ -1359,21 +1531,26 @@ mod tests {
         let mut viewer = None;
         loop {
             match next_event(&kernel) {
-                KernelEvent::Applied(UndoableCommand::AddNode { id, kind, x, y, .. })
-                    if kind == "Viewer" =>
-                {
-                    assert_eq!((x, y), (12.0, 132.0));
-                    viewer = Some(id);
-                }
-                KernelEvent::Applied(UndoableCommand::ConnectEdge {
-                    from_node,
-                    to_node,
-                    to_port,
-                    ..
-                }) => {
-                    assert_eq!(from_node, target);
-                    assert_eq!(to_port, PortId(0));
-                    assert_eq!(Some(to_node), viewer);
+                KernelEvent::Applied(UndoableCommand::Batch(cmds)) => {
+                    for cmd in &cmds {
+                        match cmd {
+                            UndoableCommand::AddNode { id, kind, x, y, .. } if kind == "Viewer" => {
+                                assert_eq!((*x, *y), (12.0, 132.0));
+                                viewer = Some(*id);
+                            }
+                            UndoableCommand::ConnectEdge {
+                                from_node,
+                                to_node,
+                                to_port,
+                                ..
+                            } => {
+                                assert_eq!(*from_node, target);
+                                assert_eq!(*to_port, PortId(0));
+                                assert_eq!(Some(*to_node), viewer);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 KernelEvent::ViewerChanged(Some(id)) => assert_eq!(Some(id), viewer),
                 KernelEvent::EpochChanged(_) => break,

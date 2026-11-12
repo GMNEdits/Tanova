@@ -71,6 +71,10 @@ impl NodeTrait for BlurNode {
         let knobs = ctx.knobs().unwrap_or(&self.knobs);
         let size = float_knob(knobs, "size", DEFAULT_SIZE);
 
+        // Clamp size to a safe range so negative or huge values never panic
+        // or hang during convolution.
+        let size = size.clamp(0.0, 250.0);
+
         // Zero-radius bypass: hand the upstream packet back untouched so the
         // cached `Arc<TileBuffer>` handles stay shared.
         if size < MIN_BLUR_SIZE {

@@ -733,15 +733,27 @@ impl Dag {
     }
 
     /// Applies a bus command to the graph.
-    pub fn apply_command(&mut self, command: &UndoableCommand) -> Result<(), NodeError> {
+    ///
+    /// Returns the (possibly enriched) command that was applied, so callers
+    /// can store it in the undo stack. For [`UndoableCommand::Batch`],
+    /// sub-commands are enriched and applied one at a time; if any sub-command
+    /// fails, all previously applied sub-commands are rolled back.
+    pub fn apply_command(
+        &mut self,
+        command: UndoableCommand,
+    ) -> Result<UndoableCommand, NodeError> {
         match command {
             UndoableCommand::AddNode { id, kind, x, y } => {
-                self.add_node_at(*id, kind.clone(), *x, *y)
+                self.add_node_at(id, kind.clone(), x, y)?;
+                Ok(UndoableCommand::AddNode { id, kind, x, y })
             }
-            UndoableCommand::RemoveNode { id, .. } => self
-                .remove_node(*id)
-                .map(|_| ())
-                .ok_or(NodeError::UnknownNode(id.0)),
+            UndoableCommand::RemoveNode { id, .. } => {
+                self.remove_node(id)
+                    .map(|_| ())
+                    .ok_or(NodeError::UnknownNode(id.0))?;
+                // Reconstruct the command with the same fields for return.
+                Ok(command)
+            }
             UndoableCommand::RestoreNode {
                 id,
                 kind,
@@ -749,31 +761,82 @@ impl Dag {
                 y,
                 knobs,
                 edges,
-            } => self.restore_node(*id, kind, *x, *y, knobs, edges),
+            } => {
+                self.restore_node(id, &kind, x, y, &knobs, &edges)?;
+                Ok(UndoableCommand::RestoreNode {
+                    id,
+                    kind,
+                    x,
+                    y,
+                    knobs,
+                    edges,
+                })
+            }
             UndoableCommand::ConnectEdge {
                 from_node,
                 from_port,
                 to_node,
                 to_port,
-            } => self.connect_edge(Edge::new(*from_node, *from_port, *to_node, *to_port)),
+            } => {
+                self.connect_edge(Edge::new(from_node, from_port, to_node, to_port))?;
+                Ok(command)
+            }
             UndoableCommand::DisconnectEdge {
                 from_node,
                 from_port,
                 to_node,
                 to_port,
             } => {
-                self.disconnect_edge(&Edge::new(*from_node, *from_port, *to_node, *to_port));
-                Ok(())
+                self.disconnect_edge(&Edge::new(from_node, from_port, to_node, to_port));
+                Ok(command)
             }
-            UndoableCommand::SetKnob {
-                node, knob, value, ..
-            } => self.set_knob(*node, knob.clone(), value.clone()),
+            UndoableCommand::SetKnob { .. } => {
+                let cmd = command.clone();
+                if let UndoableCommand::SetKnob {
+                    node,
+                    knob,
+                    value,
+                    previous: _,
+                } = cmd
+                {
+                    self.set_knob(node, knob.clone(), value.clone())?;
+                }
+                Ok(command)
+            }
+            UndoableCommand::MoveNode {
+                id,
+                from_x: _,
+                from_y: _,
+                to_x,
+                to_y,
+            } => {
+                self.set_position(id, to_x, to_y)?;
+                Ok(command)
+            }
+            UndoableCommand::Batch(cmds) => {
+                let mut applied: Vec<UndoableCommand> = Vec::with_capacity(cmds.len());
+                for sub_cmd in cmds {
+                    let enriched = self.enrich(sub_cmd);
+                    match self.apply_command(enriched) {
+                        Ok(applied_cmd) => applied.push(applied_cmd),
+                        Err(e) => {
+                            // Roll back everything applied so far, in reverse order.
+                            for rolled in applied.into_iter().rev() {
+                                let _ = self.apply_command(rolled.inverse());
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                Ok(UndoableCommand::Batch(applied))
+            }
         }
     }
 
     /// Reverses a bus command.
     pub fn undo_command(&mut self, command: &UndoableCommand) -> Result<(), NodeError> {
-        self.apply_command(&command.inverse())
+        let _ = self.apply_command(command.inverse())?;
+        Ok(())
     }
 
     /// Computes the content hash of `target` and everything it pulls from.
@@ -1221,16 +1284,17 @@ mod tests {
         };
 
         let mut dag = Dag::new();
-        dag.apply_command(&command).expect("AddNode should apply");
+        dag.apply_command(command.clone())
+            .expect("AddNode should apply");
         let node = dag.node(NodeId(1)).expect("node exists");
         assert_eq!((node.x, node.y), (12.5, -4.0));
 
         // Undo removes the node, and redo restores the same coordinates.
-        dag.apply_command(&command.inverse())
+        dag.apply_command(command.inverse())
             .expect("undo should apply");
         assert!(dag.node(NodeId(1)).is_none());
 
-        dag.apply_command(&command.inverse().inverse())
+        dag.apply_command(command.inverse().inverse())
             .expect("redo should apply");
         let node = dag.node(NodeId(1)).expect("node re-created");
         assert_eq!((node.x, node.y), (12.5, -4.0));
@@ -1549,7 +1613,7 @@ mod tests {
             other => panic!("expected RemoveNode, got {other:?}"),
         }
 
-        dag.apply_command(&command).unwrap();
+        dag.apply_command(command.clone()).unwrap();
         assert!(dag.node(NodeId(2)).is_none());
         assert_eq!(dag.edge_count(), 0, "no dangling edge may survive");
         assert!(
@@ -1570,7 +1634,7 @@ mod tests {
         assert!(edges.contains(&Edge::new(NodeId(2), PortId(0), NodeId(3), PortId(0))));
 
         // Redo must remove it again, still without dangling edges.
-        dag.apply_command(&command).unwrap();
+        dag.apply_command(command).unwrap();
         assert!(dag.node(NodeId(2)).is_none());
         assert_eq!(dag.edge_count(), 0);
     }
@@ -1582,7 +1646,7 @@ mod tests {
         let command = dag.removal_command(NodeId(1)).unwrap();
 
         assert!(matches!(
-            dag.apply_command(&command.inverse()),
+            dag.apply_command(command.inverse()),
             Err(NodeError::NodeAlreadyExists(1))
         ));
     }
@@ -1782,5 +1846,184 @@ mod tests {
             other => panic!("expected SetKnob, got {other:?}"),
         }
         assert!(!stack.can_undo(), "drag must undo in one step");
+    }
+
+    #[test]
+    fn batch_rollback_on_cycle_detection() {
+        use crate::dag::Edge;
+
+        let mut dag = Dag::new();
+        dag.add_node(NodeId(1), "Constant").unwrap();
+        dag.add_node(NodeId(2), "Grade").unwrap();
+        dag.add_node(NodeId(3), "Blur").unwrap();
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .unwrap();
+        dag.connect_edge(Edge::new(NodeId(2), PortId(0), NodeId(3), PortId(0)))
+            .unwrap();
+
+        // Attempt to create a cycle: disconnect #1->#2, connect #3->#2.
+        // #3->#2 would make #3 feed #2, but #2 already feeds #3, so this is a cycle.
+        let batch = UndoableCommand::from_vec(vec![
+            UndoableCommand::DisconnectEdge {
+                from_node: NodeId(1),
+                from_port: PortId(0),
+                to_node: NodeId(2),
+                to_port: PortId(0),
+            },
+            UndoableCommand::ConnectEdge {
+                from_node: NodeId(3),
+                from_port: PortId(0),
+                to_node: NodeId(2),
+                to_port: PortId(0),
+            },
+        ])
+        .expect("batch should be created");
+
+        let result = dag.apply_command(batch);
+        assert!(
+            matches!(result, Err(NodeError::CycleDetected { from: 3, to: 2 })),
+            "expected cycle detection error, got {result:?}"
+        );
+
+        // The original wire #1->#2 must still be connected.
+        let edges: Vec<Edge> = dag.edges().copied().collect();
+        assert_eq!(edges.len(), 2, "both original edges must remain");
+        assert!(edges.contains(&Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0))));
+        assert!(edges.contains(&Edge::new(NodeId(2), PortId(0), NodeId(3), PortId(0))));
+    }
+
+    #[test]
+    fn multi_node_delete_single_step_undo() {
+        use crate::dag::Edge;
+
+        let mut dag = Dag::new();
+        dag.add_node(NodeId(1), "Constant").unwrap();
+        dag.add_node(NodeId(2), "Grade").unwrap();
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .unwrap();
+
+        // Delete both nodes in a single Batch.
+        let batch = UndoableCommand::from_vec(vec![
+            dag.removal_command(NodeId(2)).unwrap(),
+            dag.removal_command(NodeId(1)).unwrap(),
+        ])
+        .expect("batch should be created");
+
+        assert!(dag.apply_command(batch.clone()).is_ok());
+        assert!(dag.node(NodeId(1)).is_none());
+        assert!(dag.node(NodeId(2)).is_none());
+        assert_eq!(dag.edge_count(), 0);
+
+        // Undo once restores both nodes and the edge.
+        dag.apply_command(batch.inverse())
+            .expect("undo should work");
+        assert!(dag.node(NodeId(1)).is_some());
+        assert!(dag.node(NodeId(2)).is_some());
+        assert_eq!(dag.edge_count(), 1);
+        assert!(
+            dag.edges()
+                .any(|e| *e == Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+        );
+
+        // Redo once removes both again.
+        dag.apply_command(batch.clone()).expect("redo should work");
+        assert!(dag.node(NodeId(1)).is_none());
+        assert!(dag.node(NodeId(2)).is_none());
+        assert_eq!(dag.edge_count(), 0);
+
+        // Undo once more restores again.
+        dag.apply_command(batch.inverse())
+            .expect("undo should work");
+        assert!(dag.node(NodeId(1)).is_some());
+        assert!(dag.node(NodeId(2)).is_some());
+        assert_eq!(dag.edge_count(), 1);
+    }
+
+    #[test]
+    fn group_drag_single_step_undo() {
+        use crate::UndoStack;
+
+        let mut dag = Dag::new();
+        dag.add_node_at(NodeId(1), "Constant", 10.0, 20.0).unwrap();
+        dag.add_node_at(NodeId(2), "Grade", 100.0, 200.0).unwrap();
+
+        let mut undo = UndoStack::new();
+
+        // Push 4 consecutive Batch group-move commands for [1, 2].
+        for i in 0..4 {
+            let dx = (i + 1) as f32 * 10.0;
+            let dy = (i + 1) as f32 * 5.0;
+            let batch = UndoableCommand::from_vec(vec![
+                UndoableCommand::MoveNode {
+                    id: NodeId(1),
+                    from_x: 10.0,
+                    from_y: 20.0,
+                    to_x: 10.0 + dx,
+                    to_y: 20.0 + dy,
+                },
+                UndoableCommand::MoveNode {
+                    id: NodeId(2),
+                    from_x: 100.0,
+                    from_y: 200.0,
+                    to_x: 100.0 + dx,
+                    to_y: 200.0 + dy,
+                },
+            ])
+            .expect("batch should be created");
+            assert!(dag.apply_command(batch.clone()).is_ok());
+            undo.push(batch);
+        }
+
+        // All batches should coalesce into one undo step.
+        assert!(undo.can_undo());
+        assert!(!undo.can_redo());
+
+        // Undo once should move both nodes back to initial positions.
+        let undone = undo.undo().expect("undo should work");
+        assert!(matches!(undone, UndoableCommand::Batch(_)));
+        dag.undo_command(&undone).expect("apply undo should work");
+        assert_eq!(dag.node(NodeId(1)).unwrap().x, 10.0);
+        assert_eq!(dag.node(NodeId(1)).unwrap().y, 20.0);
+        assert_eq!(dag.node(NodeId(2)).unwrap().x, 100.0);
+        assert_eq!(dag.node(NodeId(2)).unwrap().y, 200.0);
+        assert!(!undo.can_undo(), "the drag must undo in one step");
+    }
+
+    #[test]
+    fn time_bounded_coalescing_break() {
+        let mut stack = UndoStack::new();
+        stack.break_coalescing();
+
+        stack.push(UndoableCommand::SetKnob {
+            node: NodeId(1),
+            knob: "translate".to_string(),
+            value: KnobValue::Color([1.0, 2.0, 0.0, 1.0]),
+            previous: KnobValue::Color([0.0, 0.0, 0.0, 1.0]),
+        });
+        stack.break_coalescing();
+        stack.push(UndoableCommand::SetKnob {
+            node: NodeId(1),
+            knob: "translate".to_string(),
+            value: KnobValue::Color([3.0, 4.0, 0.0, 1.0]),
+            previous: KnobValue::Color([1.0, 2.0, 0.0, 1.0]),
+        });
+
+        // Two SetKnobs separated by break_coalescing() should be two distinct steps.
+        assert!(stack.can_undo());
+        let first = stack.undo().expect("first undo");
+        match first {
+            UndoableCommand::SetKnob {
+                value, previous, ..
+            } => {
+                assert_eq!(
+                    value,
+                    KnobValue::Color([3.0, 4.0, 0.0, 1.0]),
+                    "first undo should return the most recent value"
+                );
+                assert_eq!(previous, KnobValue::Color([1.0, 2.0, 0.0, 1.0]),);
+            }
+            other => panic!("expected SetKnob, got {other:?}"),
+        }
+        assert!(stack.can_undo(), "second undo step should remain");
     }
 }

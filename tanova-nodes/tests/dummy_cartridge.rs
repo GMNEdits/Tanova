@@ -22,7 +22,7 @@ fn dummy_cartridge_is_discovered_and_evaluated() {
     assert!(registered_cartridge_kinds().contains(&"Dummy"));
 
     let mut dag = Dag::new();
-    dag.apply_command(&UndoableCommand::AddNode {
+    dag.apply_command(UndoableCommand::AddNode {
         id: NodeId(1),
         kind: "Dummy".to_string(),
         x: 0.0,
@@ -62,7 +62,7 @@ fn set_knob_updates_payload_through_eval_context() {
     ensure_linked();
 
     let mut dag = Dag::new();
-    dag.apply_command(&UndoableCommand::AddNode {
+    dag.apply_command(UndoableCommand::AddNode {
         id: NodeId(1),
         kind: "Dummy".to_string(),
         x: 0.0,
@@ -82,7 +82,7 @@ fn set_knob_updates_payload_through_eval_context() {
         Some(&DummyPayload("hello from dummy".to_string()))
     );
 
-    dag.apply_command(&UndoableCommand::SetKnob {
+    dag.apply_command(UndoableCommand::SetKnob {
         node: NodeId(1),
         knob: "message".to_string(),
         value: KnobValue::Text("edited by the canvas".to_string()),

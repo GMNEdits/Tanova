@@ -66,19 +66,24 @@ impl NodeTrait for ConstantNode {
         let knobs = ctx.knobs().unwrap_or(&self.knobs);
         let color = color_knob(knobs, "color", DEFAULT_COLOR);
 
-        // Use the project format from EvalContext when available, so every
-        // Constant in the graph shares the active project resolution
-        // (e.g. 256x256) instead of its own default (1920x1080).
-        let (width, height) = match ctx.project_format() {
-            Some(fmt) => (fmt.width, fmt.height),
-            None => {
-                let width =
-                    int_knob(knobs, "format_width", DEFAULT_WIDTH).clamp(1, i32::MAX as i64) as u32;
-                let height = int_knob(knobs, "format_height", DEFAULT_HEIGHT)
-                    .clamp(1, i32::MAX as i64) as u32;
-                (width, height)
-            }
-        };
+        // Read knob values first, clamped to a sane range.
+        let width_knob = int_knob(knobs, "format_width", DEFAULT_WIDTH).clamp(1, 8192) as u32;
+        let height_knob = int_knob(knobs, "format_height", DEFAULT_HEIGHT).clamp(1, 8192) as u32;
+
+        // When the format knobs are still at the cartridge's static default
+        // (1920x1080) and a project format is active, defer to the project
+        // format so every Constant in the graph shares the active resolution.
+        // If the user edited either knob to any other value, the knob values
+        // win — even when a project format is set.
+        let (width, height) =
+            if width_knob == DEFAULT_WIDTH as u32 && height_knob == DEFAULT_HEIGHT as u32 {
+                match ctx.project_format() {
+                    Some(fmt) => (fmt.width, fmt.height),
+                    None => (width_knob, height_knob),
+                }
+            } else {
+                (width_knob, height_knob)
+            };
 
         let format = Format::new("Constant", width, height, 1.0);
         let mut raster = Raster2D::for_format(format);
@@ -159,5 +164,43 @@ mod tests {
             node.serialize_to_tcl(),
             "Constant {\n color {0 0 0 1}\n format_width 1920\n format_height 1080\n}"
         );
+    }
+
+    #[test]
+    fn constant_uses_project_format_when_knobs_at_default() {
+        use tanova_kernel::ProjectFormat;
+
+        let mut ctx = tanova_kernel::EvalContext::new();
+        ctx.insert(ProjectFormat::new(256, 256));
+
+        let packet = ConstantNode::new()
+            .evaluate(&ctx, &[])
+            .expect("constant should evaluate");
+        let raster = packet.get::<Raster2D>().expect("raster");
+
+        assert_eq!(raster.bbox.width(), 256);
+        assert_eq!(raster.bbox.height(), 256);
+    }
+
+    #[test]
+    fn constant_uses_edited_knobs_over_project_format() {
+        use tanova_kernel::{KnobValue, ProjectFormat};
+
+        let mut ctx = tanova_kernel::EvalContext::new();
+        ctx.insert(ProjectFormat::new(256, 256));
+
+        let mut knobs = tanova_kernel::KnobTable::new();
+        knobs.insert("color", KnobValue::Color([1.0, 0.0, 0.0, 1.0]));
+        knobs.insert("format_width", KnobValue::Int(128));
+        knobs.insert("format_height", KnobValue::Int(64));
+        ctx.insert(knobs);
+
+        let packet = ConstantNode::new()
+            .evaluate(&ctx, &[])
+            .expect("constant should evaluate");
+        let raster = packet.get::<Raster2D>().expect("raster");
+
+        assert_eq!(raster.bbox.width(), 128);
+        assert_eq!(raster.bbox.height(), 64);
     }
 }

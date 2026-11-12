@@ -83,18 +83,6 @@ impl NodeTrait for TransformNode {
         let rotate = float_knob(knobs, "rotate", DEFAULT_ROTATE);
         let scale = float_knob(knobs, "scale", DEFAULT_SCALE);
 
-        if scale.abs() < 1e-6 {
-            return Err(NodeError::InvalidKnob {
-                knob: "scale".to_string(),
-                reason: "scale must not be zero; the affine matrix would be singular".to_string(),
-            });
-        }
-
-        let matrix = transform_matrix(translate, center, rotate, scale);
-        let inverse = matrix.inverse().ok_or_else(|| NodeError::InvalidKnob {
-            knob: "scale".to_string(),
-            reason: "the affine matrix is singular".to_string(),
-        })?;
         // Output always covers the full project format canvas so every
         // destination pixel (x, y) in 0..format_w, 0..format_h is sampled via
         // inverse mapping. Out-of-bounds source pixels read as transparent
@@ -103,6 +91,36 @@ impl NodeTrait for TransformNode {
             Some(fmt) => BBox::new(0, 0, fmt.width as i32, fmt.height as i32),
             None => input.format.to_bbox(),
         };
+
+        // A scale near zero would make the affine matrix singular. Instead of
+        // rejecting it, emit a fully transparent raster so downstream Merge2
+        // compositing never breaks.
+        if scale.abs() < 1e-4 {
+            let mut output = Raster2D::new(input.format.clone(), output_bbox, input.edge_mode);
+            let mut red = ChannelPlane::new();
+            let mut green = ChannelPlane::new();
+            let mut blue = ChannelPlane::new();
+            let mut alpha = ChannelPlane::new();
+            for tile in output_bbox.tile_coords() {
+                insert_uniform(&mut red, tile, 0.0);
+                insert_uniform(&mut green, tile, 0.0);
+                insert_uniform(&mut blue, tile, 0.0);
+                insert_uniform(&mut alpha, tile, 0.0);
+            }
+            output.insert_channel(Channel::RgbaRed, red);
+            output.insert_channel(Channel::RgbaGreen, green);
+            output.insert_channel(Channel::RgbaBlue, blue);
+            output.insert_channel(Channel::RgbaAlpha, alpha);
+            let mut packet = Packet::new();
+            packet.insert(output);
+            return Ok(packet);
+        }
+
+        let matrix = transform_matrix(translate, center, rotate, scale);
+        let inverse = matrix.inverse().ok_or_else(|| NodeError::InvalidKnob {
+            knob: "scale".to_string(),
+            reason: "the affine matrix is singular".to_string(),
+        })?;
 
         let governor = ctx.governor();
         let gpu = ctx.gpu();
@@ -391,19 +409,24 @@ mod tests {
     }
 
     #[test]
-    fn zero_scale_is_rejected() {
+    fn tiny_scale_emits_transparent_raster() {
         let mut packet = Packet::new();
         packet.insert(solid_raster(8, 8, [1.0, 1.0, 1.0, 1.0]));
-        let error = TransformNode::new()
+        let output = TransformNode::new()
             .evaluate(
                 &context(DEFAULT_TRANSLATE, 0.0, 0.0, DEFAULT_CENTER),
                 &[packet],
             )
-            .expect_err("singular scale must fail");
-        assert!(matches!(
-            error,
-            NodeError::InvalidKnob { ref knob, .. } if knob == "scale"
-        ));
+            .expect("tiny scale should produce transparent raster, not error");
+        let raster = output.get::<Raster2D>().expect("raster");
+        assert_eq!(raster.bbox, BBox::new(0, 0, 8, 8));
+        let pixel = raster.sample_rgba(4, 4);
+        for channel in 0..4 {
+            assert!(
+                (pixel[channel] - 0.0).abs() < 1e-5,
+                "channel {channel} was {pixel:?}"
+            );
+        }
     }
 
     #[test]

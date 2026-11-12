@@ -290,6 +290,17 @@ impl GraphMirror {
                     node.knobs.insert(knob.clone(), value.clone());
                 }
             }
+            UndoableCommand::MoveNode { id, to_x, to_y, .. } => {
+                if let Some(node) = self.nodes.iter_mut().find(|n| n.id == *id) {
+                    node.x = *to_x;
+                    node.y = *to_y;
+                }
+            }
+            UndoableCommand::Batch(cmds) => {
+                for cmd in cmds {
+                    self.apply_command(cmd);
+                }
+            }
         }
     }
 }
@@ -373,6 +384,12 @@ pub struct NodeCanvasState {
     /// fires even when egui's focus pass has already eaten the key event.
     pub was_tab_down: bool,
     drag_node: Option<NodeId>,
+    /// Canvas positions of selected nodes when a group drag began.
+    drag_start_positions: HashMap<NodeId, Pos2>,
+    /// Monotonic high-water mark for node id allocation. Never decreases, so
+    /// deleting the highest node and spawning a new one never reuses a deleted
+    /// `NodeId` that might still be on the `UndoStack`.
+    next_node_id: u64,
     box_dragging: bool,
     panning: bool,
     context_menu_pos: Option<Pos2>,
@@ -395,6 +412,8 @@ impl Default for NodeCanvasState {
             tab_search: None,
             was_tab_down: false,
             drag_node: None,
+            drag_start_positions: HashMap::new(),
+            next_node_id: 1,
             box_dragging: false,
             panning: false,
             context_menu_pos: None,
@@ -552,6 +571,40 @@ impl NodeCanvas {
 
         state.layout_nodes(graph);
 
+        // Prune UI state for nodes that no longer exist in the mirror.
+        state.selected_nodes.retain(|id| graph.node(*id).is_some());
+        if state
+            .primary_selected
+            .is_some_and(|id| graph.node(id).is_none())
+        {
+            state.primary_selected = state.selected_nodes.iter().min().copied();
+        }
+        if state.active_wire_drag.is_some() {
+            let drag_references_node = match state.active_wire_drag.as_ref() {
+                Some(WireDrag::FromOutput { from_node, .. }) => graph.node(*from_node).is_some(),
+                Some(WireDrag::FromInput { to_node, .. }) => graph.node(*to_node).is_some(),
+                Some(WireDrag::Detaching {
+                    from_node,
+                    orig_to_node,
+                    ..
+                }) => graph.node(*from_node).is_some() && graph.node(*orig_to_node).is_some(),
+                None => false,
+            };
+            if !drag_references_node {
+                state.active_wire_drag = None;
+            }
+        }
+
+        // Advance the monotonic node-id high-water mark so deleted ids are
+        // never reused while they might still be on the undo stack.
+        let max_id = graph
+            .nodes()
+            .iter()
+            .map(|node| node.id.0)
+            .max()
+            .unwrap_or(0);
+        state.next_node_id = state.next_node_id.max(max_id + 1);
+
         // Physical `Tab` opens (or toggles) the quick search. `consume_key`
         // alone is not enough: egui's focus pass may have already eaten the
         // event, so the rising edge of `keys_down` is the reliable signal.
@@ -601,7 +654,7 @@ impl NodeCanvas {
                 CASCADE_X,
                 CASCADE_Y + graph.node_count() as f32 * CASCADE_STEP,
             );
-            messages.push(add_node_message(graph, kind, position));
+            messages.push(add_node_message(state, kind, position));
         }
 
         // Escape aborts a wire drag with zero kernel traffic.
@@ -644,8 +697,15 @@ impl NodeCanvas {
                     apply_node_click(state, node, shift);
                     if state.selected_nodes.contains(&node) {
                         state.drag_node = Some(node);
+                        // Record start positions for all selected nodes so we
+                        // can emit MoveNode commands on release.
+                        state.drag_start_positions.clear();
+                        for id in &state.selected_nodes {
+                            if let Some(pos) = state.node_position(*id) {
+                                state.drag_start_positions.insert(*id, pos);
+                            }
+                        }
                     }
-                } else {
                     // Empty background: start a world-space box selection.
                     if !shift {
                         state.selected_nodes.clear();
@@ -690,40 +750,48 @@ impl NodeCanvas {
                     let source_node = hit_output_port(state, graph, pointer, rect)
                         .or_else(|| hit_node(state, graph, pointer, rect));
 
-                    let mut commands = resolve_wire_release(drag, target_input, source_node);
+                    let mut command = resolve_wire_release(drag, target_input, source_node);
 
-                    // Dropping onto an occupied input replaces its wire. Emit
-                    // the disconnect first so `Ctrl+Z` restores the previous
+                    // Dropping onto an occupied input replaces its wire. Prepend
+                    // a DisconnectEdge so `Ctrl+Z` restores the previous
                     // connection instead of leaving the port empty.
                     if let Some(UndoableCommand::ConnectEdge {
                         from_node,
                         from_port,
                         to_node,
                         to_port,
-                    }) = commands.last().cloned()
+                    }) = &command
                     {
-                        if let Some(existing) = graph.incoming_edge(to_node, to_port) {
-                            if existing.from_node != from_node || existing.from_port != from_port {
-                                let index = commands.len() - 1;
-                                commands.insert(
-                                    index,
+                        if let Some(existing) = graph.incoming_edge(*to_node, *to_port) {
+                            if existing.from_node != *from_node || existing.from_port != *from_port
+                            {
+                                command = UndoableCommand::from_vec(vec![
                                     UndoableCommand::DisconnectEdge {
                                         from_node: existing.from_node,
                                         from_port: existing.from_port,
                                         to_node: existing.to_node,
                                         to_port: existing.to_port,
                                     },
-                                );
+                                    command.clone().unwrap(),
+                                ]);
                             }
                         }
                     }
 
-                    for command in commands {
-                        let viewer_connect = match &command {
+                    if let Some(cmd) = command {
+                        let viewer_connect = match &cmd {
                             UndoableCommand::ConnectEdge { to_node, .. } => Some(*to_node),
+                            UndoableCommand::Batch(cmds) => {
+                                // Find the last ConnectEdge in the batch for
+                                // viewer binding.
+                                cmds.iter().rev().find_map(|c| match c {
+                                    UndoableCommand::ConnectEdge { to_node, .. } => Some(*to_node),
+                                    _ => None,
+                                })
+                            }
                             _ => None,
                         };
-                        messages.push(KernelMessage::Execute(command));
+                        messages.push(KernelMessage::Execute(cmd));
 
                         // Nuke workflow: wiring a physical Viewer also makes
                         // the viewer panel look through it immediately.
@@ -759,6 +827,35 @@ impl NodeCanvas {
                         state.primary_selected = hits.first().copied();
                     }
                 }
+            }
+
+            // Emit MoveNode commands for any group drag that just ended.
+            if !state.drag_start_positions.is_empty() {
+                let mut moves: Vec<UndoableCommand> = Vec::new();
+                for id in &state.selected_nodes {
+                    if let (Some(&start), Some(pos)) =
+                        (state.drag_start_positions.get(id), state.node_position(*id))
+                    {
+                        if (pos - start).length_sq() > 1e-6 {
+                            moves.push(UndoableCommand::MoveNode {
+                                id: *id,
+                                from_x: start.x,
+                                from_y: start.y,
+                                to_x: pos.x,
+                                to_y: pos.y,
+                            });
+                        }
+                    }
+                }
+                // Sort by NodeId for deterministic ordering.
+                moves.sort_by_key(|cmd| match cmd {
+                    UndoableCommand::MoveNode { id, .. } => *id,
+                    _ => NodeId(0),
+                });
+                if let Some(batch) = UndoableCommand::from_vec(moves) {
+                    messages.push(KernelMessage::Execute(batch));
+                }
+                state.drag_start_positions.clear();
             }
 
             state.drag_node = None;
@@ -826,13 +923,17 @@ impl NodeCanvas {
 
             match action {
                 Some(NodeMenuAction::DisconnectInputs(id)) => {
+                    let mut disconnects: Vec<UndoableCommand> = Vec::new();
                     for edge in graph.incoming_edges(id) {
-                        messages.push(KernelMessage::Execute(UndoableCommand::DisconnectEdge {
+                        disconnects.push(UndoableCommand::DisconnectEdge {
                             from_node: edge.from_node,
                             from_port: edge.from_port,
                             to_node: edge.to_node,
                             to_port: edge.to_port,
-                        }));
+                        });
+                    }
+                    if let Some(batch) = UndoableCommand::from_vec(disconnects) {
+                        messages.push(KernelMessage::Execute(batch));
                     }
                     state.node_menu_open = false;
                     state.node_menu_pos = None;
@@ -882,7 +983,7 @@ impl NodeCanvas {
 
             if let Some(kind) = chosen {
                 let position = state.screen_to_world(rect, anchor);
-                messages.push(add_node_message(graph, kind, position));
+                messages.push(add_node_message(state, kind, position));
                 state.context_menu_open = false;
                 state.context_menu_pos = None;
             } else {
@@ -912,12 +1013,16 @@ impl NodeCanvas {
             && state.active_wire_drag.is_none()
             && state.box_selection.is_none()
         {
+            let mut removals: Vec<UndoableCommand> = Vec::new();
             let mut ids: Vec<NodeId> = state.selected_nodes.iter().copied().collect();
             ids.sort();
             for id in ids {
                 if let Some(command) = graph.removal_command(id) {
-                    messages.push(KernelMessage::Execute(command));
+                    removals.push(command);
                 }
+            }
+            if let Some(batch) = UndoableCommand::from_vec(removals) {
+                messages.push(KernelMessage::Execute(batch));
             }
             state.selected_nodes.clear();
             state.primary_selected = None;
@@ -1082,7 +1187,7 @@ pub fn nuke_workflow_binding_message(
 fn draw_tab_search(
     ui: &mut Ui,
     state: &mut NodeCanvasState,
-    graph: &GraphMirror,
+    _graph: &GraphMirror,
     workflow: ViewerWorkflow,
 ) -> Option<KernelMessage> {
     state.tab_search.as_ref()?;
@@ -1143,7 +1248,7 @@ fn draw_tab_search(
 
     if let Some(kind) = spawn {
         state.tab_search = None;
-        return Some(add_node_message(graph, kind, search.world_pos));
+        return Some(add_node_message(state, kind, search.world_pos));
     }
     if close {
         state.tab_search = None;
@@ -1170,9 +1275,10 @@ fn viewer_message(graph: &GraphMirror, workflow: ViewerWorkflow, node: NodeId) -
     }
 }
 
-fn add_node_message(graph: &GraphMirror, kind: &str, position: Pos2) -> KernelMessage {
+/// Builds an `AddNode` command using the canvas's monotonic node-id allocator.
+fn add_node_message(state: &NodeCanvasState, kind: &str, position: Pos2) -> KernelMessage {
     KernelMessage::Execute(UndoableCommand::AddNode {
-        id: graph.next_node_id(),
+        id: NodeId(state.next_node_id),
         kind: kind.to_string(),
         x: position.x,
         y: position.y,
@@ -1212,36 +1318,39 @@ fn cancel_wire_drag(state: &mut NodeCanvasState) -> Vec<KernelMessage> {
 /// `target_input` is the input port under the cursor (or the body of a node
 /// that accepts inputs, defaulted to port 0); `source_node` is the node whose
 /// output dot or body is under the cursor.
+///
+/// Returns a single [`UndoableCommand`], possibly a [`Batch`], so the whole
+/// wire swap is undoable in one step.
 fn resolve_wire_release(
     drag: WireDrag,
     target_input: Option<(NodeId, PortId)>,
     source_node: Option<NodeId>,
-) -> Vec<UndoableCommand> {
+) -> Option<UndoableCommand> {
     match drag {
         WireDrag::FromOutput {
             from_node,
             from_port,
         } => match target_input {
             Some((to_node, to_port)) if to_node != from_node => {
-                vec![UndoableCommand::ConnectEdge {
+                UndoableCommand::from_vec(vec![UndoableCommand::ConnectEdge {
                     from_node,
                     from_port,
                     to_node,
                     to_port,
-                }]
+                }])
             }
-            _ => Vec::new(),
+            _ => None,
         },
         WireDrag::FromInput { to_node, to_port } => match source_node {
             Some(from_node) if from_node != to_node => {
-                vec![UndoableCommand::ConnectEdge {
+                UndoableCommand::from_vec(vec![UndoableCommand::ConnectEdge {
                     from_node,
                     from_port: PortId(0),
                     to_node,
                     to_port,
-                }]
+                }])
             }
-            _ => Vec::new(),
+            _ => None,
         },
         WireDrag::Detaching {
             from_node,
@@ -1261,9 +1370,9 @@ fn resolve_wire_release(
                     if new_to_node == orig_to_node && new_to_port == orig_to_port {
                         // Dropped back where it started: the committed edge is
                         // still valid, so this is a no-op.
-                        Vec::new()
+                        None
                     } else {
-                        vec![
+                        UndoableCommand::from_vec(vec![
                             disconnect,
                             UndoableCommand::ConnectEdge {
                                 from_node,
@@ -1271,11 +1380,11 @@ fn resolve_wire_release(
                                 to_node: new_to_node,
                                 to_port: new_to_port,
                             },
-                        ]
+                        ])
                     }
                 }
                 // Empty canvas, the source itself, or an invalid target.
-                _ => vec![disconnect],
+                _ => UndoableCommand::from_vec(vec![disconnect]),
             }
         }
     }
@@ -1896,12 +2005,12 @@ mod tests {
 
         assert_eq!(
             resolve_wire_release(drag, None, None),
-            vec![UndoableCommand::DisconnectEdge {
+            Some(UndoableCommand::DisconnectEdge {
                 from_node: NodeId(1),
                 from_port: PortId(0),
                 to_node: NodeId(2),
                 to_port: PortId(0),
-            }]
+            })
         );
     }
 
@@ -1916,7 +2025,7 @@ mod tests {
 
         assert_eq!(
             resolve_wire_release(drag, Some((NodeId(3), PortId(1))), Some(NodeId(1))),
-            vec![
+            Some(UndoableCommand::Batch(vec![
                 UndoableCommand::DisconnectEdge {
                     from_node: NodeId(1),
                     from_port: PortId(0),
@@ -1929,7 +2038,7 @@ mod tests {
                     to_node: NodeId(3),
                     to_port: PortId(1),
                 },
-            ]
+            ]))
         );
     }
 
@@ -1942,7 +2051,7 @@ mod tests {
             orig_to_port: PortId(0),
         };
 
-        assert!(resolve_wire_release(drag, Some((NodeId(2), PortId(0))), None).is_empty());
+        assert!(resolve_wire_release(drag, Some((NodeId(2), PortId(0))), None).is_none());
     }
 
     #[test]
@@ -1957,12 +2066,12 @@ mod tests {
         );
         assert_eq!(
             from_output,
-            vec![UndoableCommand::ConnectEdge {
+            Some(UndoableCommand::ConnectEdge {
                 from_node: NodeId(1),
                 from_port: PortId(0),
                 to_node: NodeId(2),
                 to_port: PortId(1),
-            }]
+            })
         );
 
         let from_input = resolve_wire_release(
@@ -1975,12 +2084,12 @@ mod tests {
         );
         assert_eq!(
             from_input,
-            vec![UndoableCommand::ConnectEdge {
+            Some(UndoableCommand::ConnectEdge {
                 from_node: NodeId(1),
                 from_port: PortId(0),
                 to_node: NodeId(2),
                 to_port: PortId(1),
-            }]
+            })
         );
 
         // Self-connections are rejected in both directions.
@@ -1993,7 +2102,7 @@ mod tests {
                 Some((NodeId(2), PortId(0))),
                 None,
             )
-            .is_empty()
+            .is_none()
         );
         assert!(
             resolve_wire_release(
@@ -2004,7 +2113,7 @@ mod tests {
                 None,
                 Some(NodeId(2)),
             )
-            .is_empty()
+            .is_none()
         );
     }
 
@@ -2094,12 +2203,11 @@ mod tests {
         let anchor = Pos2::new(310.0, 330.0);
         let world = state.screen_to_world(viewport, anchor);
 
-        let graph = GraphMirror::default();
         let kind = matching_kinds(ViewerWorkflow::Nuke, "gr")
             .first()
             .copied()
             .expect("a match");
-        match add_node_message(&graph, kind, world) {
+        match add_node_message(&state, kind, world) {
             KernelMessage::Execute(UndoableCommand::AddNode { kind, x, y, id, .. }) => {
                 assert_eq!(kind, "Grade");
                 assert_eq!(id, NodeId(1));
