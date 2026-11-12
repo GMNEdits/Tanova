@@ -13,7 +13,7 @@ use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 use crate::dag::Dag;
 use crate::governor::{MemoryGovernor, RenderEpoch};
 use crate::knobs::KnobValue;
-use crate::types::{EvalContext, NodeError, Packet};
+use crate::types::{EvalContext, NodeError, Packet, Time};
 
 /// Identifies a node instance in the graph.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -144,6 +144,10 @@ pub enum KernelMessage {
     SetViewerNode(Option<NodeId>),
     /// Evaluate the active viewer target even if nothing else changed.
     RequestRender,
+    /// A background worker produced new data; re-render without a graph edit.
+    TriggerRender,
+    /// Change the frame time used by time-dependent cartridges.
+    SetTime(f64),
     /// Ask the kernel thread to exit.
     Shutdown,
 }
@@ -306,6 +310,11 @@ impl KernelHandle {
         self.messages.send(message)
     }
 
+    /// Clones the message sender so background workers can wake the kernel.
+    pub fn sender(&self) -> Sender<KernelMessage> {
+        self.messages.clone()
+    }
+
     /// Receives kernel events on the UI thread.
     pub fn events(&self) -> &Receiver<KernelEvent> {
         &self.events
@@ -420,6 +429,18 @@ fn kernel_loop(
                 KernelMessage::RequestRender => {
                     render_dirty = true;
                 }
+                KernelMessage::TriggerRender => {
+                    // External data (for example a disk frame) changed outside
+                    // the graph. The op hash cannot see that, so drop cached
+                    // packets before re-evaluating.
+                    dag.cache_mut().clear();
+                    render_dirty = true;
+                }
+                KernelMessage::SetTime(frame) => {
+                    base_ctx.insert(Time(frame));
+                    let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+                    render_dirty = true;
+                }
                 KernelMessage::Shutdown => shutdown = true,
             }
         }
@@ -478,6 +499,7 @@ fn kernel_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use crate::knobs::KnobTable;
@@ -511,6 +533,155 @@ mod tests {
             default_knobs: constant_knobs,
             factory: constant_factory,
         }
+    }
+
+    struct TimeProbe;
+
+    impl crate::types::NodeTrait for TimeProbe {
+        fn evaluate(&self, ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
+            let mut packet = Packet::new();
+            packet.insert(Time(ctx.time().unwrap_or(-1.0)));
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            "TimeProbe {}".to_string()
+        }
+    }
+
+    fn time_probe_knobs() -> KnobTable {
+        KnobTable::new()
+    }
+
+    fn time_probe_factory() -> Arc<dyn crate::types::NodeTrait> {
+        Arc::new(TimeProbe)
+    }
+
+    static EXTERNAL_EVALS: AtomicUsize = AtomicUsize::new(0);
+
+    struct ExternalProbe;
+
+    impl crate::types::NodeTrait for ExternalProbe {
+        fn evaluate(&self, _ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
+            let value = EXTERNAL_EVALS.fetch_add(1, Ordering::SeqCst);
+            let mut packet = Packet::new();
+            packet.insert(value as u32);
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            "ExternalProbe {}".to_string()
+        }
+    }
+
+    fn external_probe_factory() -> Arc<dyn crate::types::NodeTrait> {
+        Arc::new(ExternalProbe)
+    }
+
+    inventory::submit! {
+        NodeCartridgeDescriptor {
+            kind: "ExternalProbe",
+            default_knobs: time_probe_knobs,
+            factory: external_probe_factory,
+        }
+    }
+
+    fn next_event(kernel: &KernelHandle) -> KernelEvent {
+        kernel
+            .events()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("kernel thread should emit an event")
+    }
+
+    inventory::submit! {
+        NodeCartridgeDescriptor {
+            kind: "TimeProbe",
+            default_knobs: time_probe_knobs,
+            factory: time_probe_factory,
+        }
+    }
+
+    #[test]
+    fn set_time_updates_the_render_context() {
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let node = NodeId(9);
+
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: node,
+                kind: "TimeProbe".to_string(),
+            }))
+            .expect("add TimeProbe");
+        assert!(matches!(
+            next_event(&kernel),
+            KernelEvent::Applied(UndoableCommand::AddNode { .. })
+        ));
+
+        kernel.send(KernelMessage::SetTime(42.0)).expect("set time");
+        assert!(matches!(next_event(&kernel), KernelEvent::EpochChanged(_)));
+
+        kernel
+            .send(KernelMessage::SetViewerNode(Some(node)))
+            .expect("bind viewer");
+
+        let frame = kernel
+            .frames()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the viewer should render with the new time");
+        let time = frame.packet.get::<Time>().expect("probe emits Time");
+        assert_eq!(time.0, 42.0);
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn trigger_render_invalidates_external_data_cache() {
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let node = NodeId(11);
+        EXTERNAL_EVALS.store(0, Ordering::SeqCst);
+
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: node,
+                kind: "ExternalProbe".to_string(),
+            }))
+            .expect("add ExternalProbe");
+        assert!(matches!(
+            next_event(&kernel),
+            KernelEvent::Applied(UndoableCommand::AddNode { .. })
+        ));
+
+        kernel
+            .send(KernelMessage::SetViewerNode(Some(node)))
+            .expect("bind viewer");
+
+        let first = kernel
+            .frames()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first frame");
+        assert_eq!(first.packet.get::<u32>(), Some(&0));
+
+        // A plain render request is served from the op-hash cache.
+        kernel
+            .send(KernelMessage::RequestRender)
+            .expect("request render");
+        let cached = kernel
+            .frames()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cached frame");
+        assert_eq!(cached.packet.get::<u32>(), Some(&0));
+
+        // External data changed, so TriggerRender must drop the cache.
+        kernel
+            .send(KernelMessage::TriggerRender)
+            .expect("trigger render");
+        let refreshed = kernel
+            .frames()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("refreshed frame");
+        assert_eq!(refreshed.packet.get::<u32>(), Some(&1));
+
+        kernel.shutdown();
     }
 
     fn set_knob(name: &str, value: f32, previous: f32) -> UndoableCommand {

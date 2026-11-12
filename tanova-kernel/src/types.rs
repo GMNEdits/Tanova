@@ -22,7 +22,7 @@ use crate::knobs::KnobTable;
 /// an `Arc` so a clone does not copy pixels.
 pub type TypeMap = anymap::Map<dyn anymap::any::CloneAny + Send + Sync>;
 
-/// Render state carried top-down: the frame time in seconds.
+/// Render state carried top-down: the current timeline frame.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Time(pub f64);
 

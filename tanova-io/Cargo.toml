@@ -8,4 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+crossbeam-channel.workspace = true
+exr.workspace = true
+tanova-kernel.workspace = true
+tanova-render.workspace = true
 thiserror.workspace = true

@@ -29,6 +29,7 @@ thiserror = "2"
 
 # Hardware / rendering.
 bytemuck = "1"
+exr = "1.74"
 pollster = "0.4"
 wgpu = "30.0"
 

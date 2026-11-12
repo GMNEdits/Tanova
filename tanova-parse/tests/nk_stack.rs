@@ -289,3 +289,46 @@ Transform {
     );
     assert_eq!(node.knobs.get("rotate"), Some(&KnobValue::Float(45.0)));
 }
+
+#[test]
+fn read_knobs_parse_and_round_trip() {
+    tanova_nodes::ensure_linked();
+    let script = r#"
+Read {
+ inputs 0
+ name Read1
+ file "/tmp/plate.%04d.exr"
+ first 10
+ last 20
+ missing_frames "black"
+}
+"#;
+
+    let mut dag = Dag::new();
+    let parsed = load_nk_into_dag(script, &mut dag).expect("Read should load");
+    let id = parsed.names["Read1"];
+    let node = dag.node(id).expect("Read node");
+    assert_eq!(
+        node.knobs.get("file"),
+        Some(&KnobValue::Text("/tmp/plate.%04d.exr".to_string()))
+    );
+    assert_eq!(node.knobs.get("first"), Some(&KnobValue::Int(10)));
+    assert_eq!(node.knobs.get("last"), Some(&KnobValue::Int(20)));
+    assert_eq!(
+        node.knobs.get("missing_frames"),
+        Some(&KnobValue::Text("black".to_string()))
+    );
+
+    let exported = dag.export_to_tcl();
+    assert!(exported.contains("Read {"));
+
+    let mut round = Dag::new();
+    let reparsed = load_nk_into_dag(&exported, &mut round).expect("export must reparse");
+    let round_node = round
+        .node(reparsed.names["Read1"])
+        .expect("round-tripped Read node");
+    assert_eq!(
+        round_node.knobs.get("file"),
+        Some(&KnobValue::Text("/tmp/plate.%04d.exr".to_string()))
+    );
+}

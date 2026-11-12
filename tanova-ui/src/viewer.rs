@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use egui::{
-    Align2, Color32, ColorImage, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle,
-    TextureOptions, Ui, Vec2,
+    Align, Align2, Color32, ColorImage, FontId, Layout, Pos2, Rect, Sense, Stroke, StrokeKind,
+    TextureHandle, TextureOptions, Ui, Vec2,
 };
 use tanova_kernel::{FrameNotification, KernelMessage, KnobValue, NodeId, Packet, UndoableCommand};
 use tanova_render::{BBox, Raster2D};
@@ -29,6 +29,9 @@ const MIN_ZOOM: f32 = 0.02;
 const MAX_ZOOM: f32 = 64.0;
 const JACK_RADIUS: f32 = 7.0;
 const JACK_HIT_RADIUS: f32 = 12.0;
+
+/// Height reserved at the bottom of the viewer for the timeline strip.
+pub const TIMELINE_HEIGHT: f32 = 32.0;
 
 /// Visual-only viewer state plus the last frame the kernel delivered.
 pub struct ViewerPanel {
@@ -128,8 +131,16 @@ impl ViewerPanel {
         let mut messages = Vec::new();
         self.show_toolbar(ui);
 
-        let size = ui.available_size();
-        let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+        // Leave room for the timeline strip the app draws below the image.
+        //
+        // `available_size` already excludes the spacing after the toolbar, so
+        // subtract the timeline plus the spacing that will follow the image.
+        // Without this the content is one `item_spacing` taller than the panel
+        // every frame, which makes a resizable panel grow without bound.
+        let available = ui.available_size();
+        let reserved = TIMELINE_HEIGHT + ui.spacing().item_spacing.y;
+        let image_size = Vec2::new(available.x, (available.y - reserved).max(1.0));
+        let (rect, response) = ui.allocate_exact_size(image_size, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0, VIEWER_BG);
         draw_checkerboard(&painter, rect);
@@ -191,6 +202,52 @@ impl ViewerPanel {
                 ui, &painter, &response, image_rect, format, graph, selected,
             ),
         );
+        messages
+    }
+
+    /// Draws the timeline strip below the image.
+    ///
+    /// The app owns the actual `TimelineState` and passes its fields so the
+    /// viewer crate stays independent of the application shell.
+    pub fn show_timeline(
+        &mut self,
+        ui: &mut Ui,
+        start: i64,
+        end: i64,
+        current: &mut f64,
+        playing: &mut bool,
+    ) -> Vec<KernelMessage> {
+        let mut messages = Vec::new();
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), TIMELINE_HEIGHT),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                if ui.button(if *playing { "Pause" } else { "Play" }).clicked() {
+                    *playing = !*playing;
+                }
+
+                let mut frame = current.round() as i64;
+                let slider = ui.add(
+                    egui::Slider::new(&mut frame, start..=end)
+                        .text("frame")
+                        .integer(),
+                );
+                if slider.changed() {
+                    *current = frame as f64;
+                    messages.push(KernelMessage::SetTime(*current));
+                }
+
+                ui.separator();
+                ui.label(format!("{:.0} / {}", current.round(), end));
+            },
+        );
+
         messages
     }
 

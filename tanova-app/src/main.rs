@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use tanova_io::DiskCache;
 use tanova_kernel::{
     EvalContext, FrameNotification, KernelEvent, KernelHandle, KernelMessage, KnobValue, NodeId,
     Packet, PortId, UndoableCommand, registered_cartridge_kinds,
@@ -40,6 +41,33 @@ pub struct GpuContext {
     pub device: Arc<wgpu::Device>,
     /// The submission queue paired with `device`.
     pub queue: Arc<wgpu::Queue>,
+}
+
+/// Timeline state owned by the UI thread.
+///
+/// `current` is fractional so scrubbing stays smooth, but frame paths resolve
+/// with `round()` before they hit disk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimelineState {
+    /// First frame of the play range.
+    pub start: i64,
+    /// Last frame of the play range.
+    pub end: i64,
+    /// Current frame (may be fractional while scrubbing).
+    pub current: f64,
+    /// Whether playback advances `current` automatically.
+    pub playing: bool,
+}
+
+impl Default for TimelineState {
+    fn default() -> Self {
+        Self {
+            start: 1,
+            end: 100,
+            current: 1.0,
+            playing: false,
+        }
+    }
 }
 
 /// Requests a high-performance adapter and opens a device on it.
@@ -89,8 +117,9 @@ fn run_desktop() -> Result<(), AppError> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Tanova")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([720.0, 480.0]),
+            .with_inner_size([1280.0, 720.0])
+            .with_min_inner_size([720.0, 480.0])
+            .with_active(true),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
@@ -208,6 +237,7 @@ struct TanovaApp {
     graph: GraphMirror,
     canvas: NodeCanvasState,
     viewer: ViewerPanel,
+    timeline: TimelineState,
     cartridge_kinds: Vec<&'static str>,
     epoch: u64,
     last_frame: Option<FrameNotification>,
@@ -222,6 +252,7 @@ impl TanovaApp {
             graph: GraphMirror::default(),
             canvas: NodeCanvasState::default(),
             viewer: ViewerPanel::new(),
+            timeline: TimelineState::default(),
             cartridge_kinds: registered_cartridge_kinds(),
             epoch: 0,
             last_frame: None,
@@ -239,6 +270,9 @@ impl TanovaApp {
             self.gpu.device.clone(),
             self.gpu.queue.clone(),
         ));
+        // One shared loader for every Read cartridge; the worker wakes the
+        // kernel with TriggerRender when a frame becomes available.
+        context.insert(DiskCache::new(self.kernel.sender()));
 
         let seed = [
             KernelMessage::SetBaseContext(context),
@@ -347,6 +381,25 @@ impl TanovaApp {
         }
     }
 
+    /// Advances playback and asks the kernel for the new frame.
+    fn advance_timeline(&mut self) {
+        if !self.timeline.playing {
+            return;
+        }
+
+        self.timeline.current += 1.0;
+        if self.timeline.current > self.timeline.end as f64 {
+            self.timeline.current = self.timeline.start as f64;
+        }
+
+        if let Err(error) = self
+            .kernel
+            .send(KernelMessage::SetTime(self.timeline.current))
+        {
+            self.failure = Some(format!("kernel send failed: {error}"));
+        }
+    }
+
     fn shutdown(self) {
         self.kernel.shutdown();
     }
@@ -355,6 +408,7 @@ impl TanovaApp {
 impl eframe::App for TanovaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
+        self.advance_timeline();
 
         egui::Panel::top("tanova_status").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -381,19 +435,28 @@ impl eframe::App for TanovaApp {
         });
 
         // Nuke layout: Viewer on top, Properties on the right, graph below.
+        // The panels are declared before the central panel so the canvas only
+        // ever receives the space that is left over.
         egui::Panel::top("tanova_viewer")
             .resizable(true)
-            .default_size(380.0)
-            .min_size(160.0)
+            .default_size(400.0)
+            .min_size(200.0)
             .show(ui, |ui| {
-                let messages = self.viewer.show(ui, &self.graph, self.canvas.selected);
+                let mut messages = self.viewer.show(ui, &self.graph, self.canvas.selected);
+                messages.extend(self.viewer.show_timeline(
+                    ui,
+                    self.timeline.start,
+                    self.timeline.end,
+                    &mut self.timeline.current,
+                    &mut self.timeline.playing,
+                ));
                 self.dispatch(messages);
             });
 
         egui::Panel::right("tanova_properties")
             .resizable(true)
-            .default_size(320.0)
-            .min_size(180.0)
+            .default_size(300.0)
+            .min_size(250.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let messages = PropertiesPanel::show(

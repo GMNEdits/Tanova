@@ -44,7 +44,15 @@ fn single_tile_raster(color: [f32; 4]) -> Raster2D {
 fn registry_links_every_core_cartridge() {
     ensure_linked();
     let kinds = registered_cartridge_kinds();
-    for expected in ["Blur", "Constant", "Dummy", "Grade", "Merge2", "Transform"] {
+    for expected in [
+        "Blur",
+        "Constant",
+        "Dummy",
+        "Grade",
+        "Merge2",
+        "Read",
+        "Transform",
+    ] {
         assert!(
             kinds.contains(&expected),
             "cartridge {expected} was not linked; got {kinds:?}"
