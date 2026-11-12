@@ -8,6 +8,7 @@ pub mod constant;
 pub mod dummy;
 pub mod grade;
 pub mod merge;
+pub mod transform;
 pub mod util;
 
 pub use blur::BlurNode;
@@ -15,6 +16,7 @@ pub use constant::{ConstantNode, DEFAULT_COLOR};
 pub use dummy::{DEFAULT_MESSAGE, DummyNode, DummyPayload};
 pub use grade::{GradeNode, grade_op};
 pub use merge::Merge2Node;
+pub use transform::TransformNode;
 
 /// Forces this crate, and therefore its `inventory` constructors, to be linked.
 ///

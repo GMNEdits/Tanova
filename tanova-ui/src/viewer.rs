@@ -10,8 +10,10 @@ use egui::{
     Align2, Color32, ColorImage, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle,
     TextureOptions, Ui, Vec2,
 };
-use tanova_kernel::{FrameNotification, NodeId, Packet};
+use tanova_kernel::{FrameNotification, KernelMessage, KnobValue, NodeId, Packet, UndoableCommand};
 use tanova_render::{BBox, Raster2D};
+
+use crate::canvas::GraphMirror;
 
 const VIEWER_BG: Color32 = Color32::from_rgb(14, 14, 17);
 const CHECKER_DARK: Color32 = Color32::from_rgb(26, 26, 30);
@@ -20,9 +22,13 @@ const FORMAT_LINE: Color32 = Color32::from_rgb(150, 150, 165);
 const BBOX_LINE: Color32 = Color32::from_rgb(110, 200, 255);
 const HUD_BG: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 190);
 const VIEWER: Color32 = Color32::from_rgb(255, 190, 40);
+const JACK: Color32 = Color32::from_rgb(255, 214, 92);
+const JACK_HOVER: Color32 = Color32::from_rgb(255, 238, 170);
 
 const MIN_ZOOM: f32 = 0.02;
 const MAX_ZOOM: f32 = 64.0;
+const JACK_RADIUS: f32 = 7.0;
+const JACK_HIT_RADIUS: f32 = 12.0;
 
 /// Visual-only viewer state plus the last frame the kernel delivered.
 pub struct ViewerPanel {
@@ -38,6 +44,14 @@ pub struct ViewerPanel {
     frame: Option<Arc<Packet>>,
     texture: Option<TextureHandle>,
     dirty: bool,
+    /// True while the primary button drags the selected Transform jack.
+    dragging_handle: bool,
+    /// Pointer position when the jack drag began.
+    drag_start_pointer: Option<Pos2>,
+    /// `translate` captured when the jack drag began.
+    drag_base_translate: Option<[f32; 4]>,
+    /// Local drag preview so the jack never waits on the kernel round-trip.
+    drag_preview_translate: Option<[f32; 4]>,
 }
 
 impl Default for ViewerPanel {
@@ -51,6 +65,10 @@ impl Default for ViewerPanel {
             frame: None,
             texture: None,
             dirty: true,
+            dragging_handle: false,
+            drag_start_pointer: None,
+            drag_base_translate: None,
+            drag_preview_translate: None,
         }
     }
 }
@@ -97,7 +115,17 @@ impl ViewerPanel {
 
     /// Draws the viewer and uploads the texture when the frame or display
     /// settings changed.
-    pub fn show(&mut self, ui: &mut Ui) {
+    ///
+    /// Returns every kernel message the overlay interaction requested. The
+    /// transform jack reads its position from `graph` every frame, so it tracks
+    /// knob edits without waiting for a new image from the kernel.
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        graph: &GraphMirror,
+        selected: Option<NodeId>,
+    ) -> Vec<KernelMessage> {
+        let mut messages = Vec::new();
         self.show_toolbar(ui);
 
         let size = ui.available_size();
@@ -110,6 +138,7 @@ impl ViewerPanel {
 
         let frame = self.frame.clone();
         let Some(raster) = frame.as_ref().and_then(|packet| packet.get::<Raster2D>()) else {
+            self.reset_jack_drag();
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -120,7 +149,7 @@ impl ViewerPanel {
                 FontId::proportional(13.0),
                 Color32::from_rgb(130, 130, 140),
             );
-            return;
+            return messages;
         };
 
         if self.dirty || self.texture.is_none() {
@@ -157,6 +186,12 @@ impl ViewerPanel {
         }
 
         self.draw_hud(ui, &painter, rect, image_rect, format, raster);
+        messages.extend(
+            self.draw_transform_overlay(
+                ui, &painter, &response, image_rect, format, graph, selected,
+            ),
+        );
+        messages
     }
 
     fn show_toolbar(&mut self, ui: &mut Ui) {
@@ -246,6 +281,124 @@ impl ViewerPanel {
         Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom))
     }
 
+    /// Maps one Bottom-Left world point into the displayed image rect.
+    fn world_to_screen_point(&self, image_rect: Rect, format: BBox, x: f32, y: f32) -> Pos2 {
+        let width = format.width().max(1) as f32;
+        let height = format.height().max(1) as f32;
+        let scale_x = image_rect.width() / width;
+        let scale_y = image_rect.height() / height;
+
+        Pos2::new(
+            image_rect.left() + (x - format.min_x as f32) * scale_x,
+            image_rect.bottom() - (y - format.min_y as f32) * scale_y,
+        )
+    }
+
+    /// Converts a screen-space drag delta back into world units.
+    fn screen_delta_to_world(&self, image_rect: Rect, format: BBox, delta: Vec2) -> Vec2 {
+        let width = format.width().max(1) as f32;
+        let height = format.height().max(1) as f32;
+        let scale_x = (image_rect.width() / width).max(1e-6);
+        let scale_y = (image_rect.height() / height).max(1e-6);
+        Vec2::new(delta.x / scale_x, -delta.y / scale_y)
+    }
+
+    /// Draws the selected Transform node's jack and turns primary drags into
+    /// `SetKnob` commands for the `translate` knob.
+    ///
+    /// The jack position is `center + translate` (the transform's pivot after
+    /// the affine map) and is recomputed from `GraphMirror` on every frame.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_transform_overlay(
+        &mut self,
+        ui: &Ui,
+        painter: &egui::Painter,
+        response: &egui::Response,
+        image_rect: Rect,
+        format: BBox,
+        graph: &GraphMirror,
+        selected: Option<NodeId>,
+    ) -> Vec<KernelMessage> {
+        let Some((node_id, graph_translate, center)) = selected_transform(graph, selected) else {
+            self.reset_jack_drag();
+            return Vec::new();
+        };
+
+        let pointer = ui.input(|input| input.pointer.hover_pos());
+        let primary_pressed = ui.input(|input| input.pointer.primary_pressed());
+        let primary_down = ui.input(|input| input.pointer.primary_down());
+        let primary_released = ui.input(|input| input.pointer.primary_released());
+
+        let mut translate = graph_translate;
+        let mut handle_world = (center[0] + translate[0], center[1] + translate[1]);
+        let mut handle =
+            self.world_to_screen_point(image_rect, format, handle_world.0, handle_world.1);
+
+        if primary_pressed && response.hovered() {
+            if let Some(pointer) = pointer {
+                if pointer.distance(handle) <= JACK_HIT_RADIUS {
+                    self.dragging_handle = true;
+                    self.drag_start_pointer = Some(pointer);
+                    self.drag_base_translate = Some(graph_translate);
+                    self.drag_preview_translate = Some(graph_translate);
+                }
+            }
+        }
+
+        let mut messages = Vec::new();
+        if self.dragging_handle && primary_down {
+            if let (Some(start), Some(base), Some(pointer)) =
+                (self.drag_start_pointer, self.drag_base_translate, pointer)
+            {
+                let world_delta = self.screen_delta_to_world(image_rect, format, pointer - start);
+                let next = [
+                    base[0] + world_delta.x,
+                    base[1] + world_delta.y,
+                    base[2],
+                    base[3],
+                ];
+                if self.drag_preview_translate != Some(next) {
+                    messages.push(KernelMessage::Execute(UndoableCommand::SetKnob {
+                        node: node_id,
+                        knob: "translate".to_string(),
+                        value: KnobValue::Color(next),
+                        previous: KnobValue::Color(graph_translate),
+                    }));
+                    self.drag_preview_translate = Some(next);
+                }
+                translate = next;
+                handle_world = (center[0] + translate[0], center[1] + translate[1]);
+                handle =
+                    self.world_to_screen_point(image_rect, format, handle_world.0, handle_world.1);
+            }
+        }
+
+        if primary_released || !primary_down {
+            self.reset_jack_drag();
+        }
+
+        let hovered = pointer.is_some_and(|pointer| pointer.distance(handle) <= JACK_HIT_RADIUS);
+        let color = if self.dragging_handle || hovered {
+            JACK_HOVER
+        } else {
+            JACK
+        };
+        draw_jack(painter, handle, color);
+
+        // The pivot is a lighter dot so the user can see center vs. translate.
+        let pivot = self.world_to_screen_point(image_rect, format, center[0], center[1]);
+        painter.circle_filled(pivot, 2.5, Color32::from_rgb(150, 220, 255));
+
+        messages
+    }
+
+    fn reset_jack_drag(&mut self) {
+        self.dragging_handle = false;
+        self.drag_start_pointer = None;
+        self.drag_base_translate = None;
+        self.drag_preview_translate = None;
+    }
+
     fn upload(&mut self, ctx: &egui::Context, raster: &Raster2D) {
         let width = raster.format.width.max(1) as usize;
         let height = raster.format.height.max(1) as usize;
@@ -301,6 +454,56 @@ impl ViewerPanel {
     }
 }
 
+/// Reads the selected node's Transform knobs, if it is a `Transform`.
+fn selected_transform(
+    graph: &GraphMirror,
+    selected: Option<NodeId>,
+) -> Option<(NodeId, [f32; 4], [f32; 4])> {
+    let id = selected?;
+    let node = graph.node(id)?;
+    if node.kind != "Transform" {
+        return None;
+    }
+
+    let translate = match node.knobs.get("translate") {
+        Some(KnobValue::Color(color)) => *color,
+        _ => [0.0, 0.0, 0.0, 1.0],
+    };
+    let center = match node.knobs.get("center") {
+        Some(KnobValue::Color(color)) => *color,
+        _ => [0.0, 0.0, 0.0, 1.0],
+    };
+    Some((id, translate, center))
+}
+
+/// Draws a Nuke-style transform jack: a ring, a crosshair, and a label.
+fn draw_jack(painter: &egui::Painter, position: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.5, color);
+    painter.circle_stroke(position, JACK_RADIUS, stroke);
+    painter.line_segment(
+        [
+            position - Vec2::new(14.0, 0.0),
+            position + Vec2::new(14.0, 0.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            position - Vec2::new(0.0, 14.0),
+            position + Vec2::new(0.0, 14.0),
+        ],
+        stroke,
+    );
+    painter.circle_filled(position, 2.0, color);
+    painter.text(
+        position + Vec2::new(12.0, -12.0),
+        Align2::LEFT_BOTTOM,
+        "Transform",
+        FontId::proportional(10.0),
+        color,
+    );
+}
+
 fn draw_checkerboard(painter: &egui::Painter, rect: Rect) {
     let step = 16.0;
     let mut row = 0;
@@ -336,4 +539,38 @@ fn draw_dashed_rect(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
         rect.left_top(),
     ];
     painter.extend(egui::Shape::dashed_line(&corners, stroke, 5.0, 4.0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_points_map_bottom_left_to_screen() {
+        let viewer = ViewerPanel::new();
+        let image_rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(200.0, 100.0));
+        let format = BBox::new(0, 0, 100, 50);
+
+        assert_eq!(
+            viewer.world_to_screen_point(image_rect, format, 0.0, 0.0),
+            Pos2::new(0.0, 100.0),
+            "world origin is the bottom-left of the image"
+        );
+        assert_eq!(
+            viewer.world_to_screen_point(image_rect, format, 50.0, 25.0),
+            Pos2::new(100.0, 50.0),
+            "the format center maps to the image center"
+        );
+    }
+
+    #[test]
+    fn screen_deltas_invert_the_pan_and_zoom_scale() {
+        let viewer = ViewerPanel::new();
+        let image_rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(200.0, 100.0));
+        let format = BBox::new(0, 0, 100, 50);
+
+        let world = viewer.screen_delta_to_world(image_rect, format, Vec2::new(10.0, -10.0));
+        assert!((world.x - 5.0).abs() < 1e-6, "world x was {}", world.x);
+        assert!((world.y - 5.0).abs() < 1e-6, "world y was {}", world.y);
+    }
 }

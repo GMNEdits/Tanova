@@ -386,7 +386,8 @@ impl eframe::App for TanovaApp {
             .default_size(380.0)
             .min_size(160.0)
             .show(ui, |ui| {
-                self.viewer.show(ui);
+                let messages = self.viewer.show(ui, &self.graph, self.canvas.selected);
+                self.dispatch(messages);
             });
 
         egui::Panel::right("tanova_properties")

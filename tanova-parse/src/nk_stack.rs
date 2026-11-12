@@ -435,16 +435,8 @@ fn parse_knob_value(
             if numbers.len() == 1 {
                 let value = numbers[0] as f32;
                 Ok(KnobValue::Color([value, value, value, value]))
-            } else if numbers.len() >= 3 {
-                let alpha = numbers.get(3).map_or(color[3], |value| *value as f32);
-                Ok(KnobValue::Color([
-                    numbers[0] as f32,
-                    numbers[1] as f32,
-                    numbers[2] as f32,
-                    alpha,
-                ]))
             } else {
-                Ok(KnobValue::Color(*color))
+                Ok(color_from_numbers(&numbers, color[3]))
             }
         }
         Some(KnobValue::Bool(_)) => Ok(KnobValue::Bool(parse_bool(raw))),
@@ -484,13 +476,14 @@ fn color_from_numbers(numbers: &[f64], default_alpha: f32) -> KnobValue {
             let value = *value as f32;
             KnobValue::Color([value, value, value, value])
         }
+        // Two numbers are a 2D vector stored in a Color knob (`Floatx2`).
+        [x, y] => KnobValue::Color([*x as f32, *y as f32, 0.0, default_alpha]),
         [red, green, blue] => {
             KnobValue::Color([*red as f32, *green as f32, *blue as f32, default_alpha])
         }
         [red, green, blue, alpha, ..] => {
             KnobValue::Color([*red as f32, *green as f32, *blue as f32, *alpha as f32])
         }
-        _ => KnobValue::Color([0.0, 0.0, 0.0, default_alpha]),
     }
 }
 

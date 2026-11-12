@@ -4,6 +4,8 @@
 //! math is Euclidean, so a pixel at `x = -1` belongs to tile `-1` at local
 //! coordinate `255`, never tile `0` at `-1`.
 
+use crate::matrix::Mat3x3;
+
 /// Edge length of one render tile, in pixels.
 pub const TILE_SIZE: u32 = 256;
 
@@ -199,6 +201,39 @@ impl BBox {
             min_y: self.min_y.saturating_sub(radius),
             max_x: self.max_x.saturating_add(radius),
             max_y: self.max_y.saturating_add(radius),
+        }
+    }
+
+    /// Transforms this rectangle by an affine matrix and returns the smallest
+    /// axis-aligned rectangle that covers the transformed corners.
+    ///
+    /// Bounds are rounded outward (`floor` for the minimum, `ceil` for the
+    /// maximum) so a rotated image is never cropped.
+    pub fn transform(&self, matrix: &Mat3x3) -> Self {
+        let corners = [
+            (self.min_x as f32, self.min_y as f32),
+            (self.max_x as f32, self.min_y as f32),
+            (self.min_x as f32, self.max_y as f32),
+            (self.max_x as f32, self.max_y as f32),
+        ];
+
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for (x, y) in corners {
+            let (tx, ty) = matrix.transform_point(x, y);
+            min_x = min_x.min(tx);
+            min_y = min_y.min(ty);
+            max_x = max_x.max(tx);
+            max_y = max_y.max(ty);
+        }
+
+        Self {
+            min_x: min_x.floor() as i32,
+            min_y: min_y.floor() as i32,
+            max_x: max_x.ceil() as i32,
+            max_y: max_y.ceil() as i32,
         }
     }
 
@@ -416,5 +451,22 @@ mod tests {
         assert_eq!(format.height, 1080);
         assert_eq!(format.pixel_aspect, 1.0);
         assert_eq!(format.to_bbox(), BBox::new(0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn rotating_a_bbox_expands_to_cover_the_diamond() {
+        let bbox = BBox::new(0, 0, 100, 100);
+        let rotated = bbox.transform(&Mat3x3::rotate(std::f32::consts::FRAC_PI_4));
+
+        assert_eq!(rotated, BBox::new(-71, 0, 71, 142));
+
+        // Every transformed corner of the source rectangle must stay inside the
+        // expanded bounds, so the rotation cannot crop the image.
+        let matrix = Mat3x3::rotate(std::f32::consts::FRAC_PI_4);
+        for (x, y) in [(0.0, 0.0), (100.0, 0.0), (0.0, 100.0), (100.0, 100.0)] {
+            let (tx, ty) = matrix.transform_point(x, y);
+            assert!(tx >= rotated.min_x as f32 && tx <= rotated.max_x as f32);
+            assert!(ty >= rotated.min_y as f32 && ty <= rotated.max_y as f32);
+        }
     }
 }

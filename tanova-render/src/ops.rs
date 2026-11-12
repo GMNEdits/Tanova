@@ -9,7 +9,8 @@ use std::sync::Arc;
 use tanova_kernel::{MemoryGovernor, NodeError};
 
 use crate::coords::{BBox, EdgeMode, TILE_PIXELS, TILE_SIZE, TileCoord};
-use crate::shader::{BlurParams, GpuComputeEngine, GradeParams, MergeParams};
+use crate::matrix::Mat3x3;
+use crate::shader::{BlurParams, GpuComputeEngine, GradeParams, MergeParams, TransformParams};
 use crate::tile::{Channel, ChannelPlane, Raster2D, TileBuffer};
 
 /// `Grade` parameters in Nuke's knob order.
@@ -398,6 +399,71 @@ pub fn blur_padded_tile(
             .into_iter()
             .flatten()
             .collect()),
+    }
+}
+
+/// Inverse-samples one gathered RGBA region with bilinear filtering on the CPU.
+///
+/// `matrix` maps one output tile's local `(x, y)` into the gathered region's
+/// local coordinates, exactly like the `transform.wgsl` uniform. Samples
+/// outside the region return transparent black.
+pub fn transform_gathered_rgba(
+    gathered: &[f32],
+    width: u32,
+    height: u32,
+    matrix: &Mat3x3,
+) -> Vec<f32> {
+    let width_f = width as f32;
+    let height_f = height as f32;
+    let stride = width as usize;
+    let max_x = width as i32 - 1;
+    let max_y = height as i32 - 1;
+    let mut output = Vec::with_capacity(TILE_PIXELS * 4);
+
+    for y in 0..TILE_SIZE {
+        for x in 0..TILE_SIZE {
+            let (u, v) = matrix.transform_point(x as f32, y as f32);
+            if u < 0.0 || v < 0.0 || u > width_f - 1.0 || v > height_f - 1.0 {
+                output.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
+                continue;
+            }
+
+            let x0 = u.floor() as i32;
+            let y0 = v.floor() as i32;
+            let fx = u - x0 as f32;
+            let fy = v - y0 as f32;
+            let x1 = (x0 + 1).min(max_x);
+            let y1 = (y0 + 1).min(max_y);
+
+            let index = |ix: i32, iy: i32| (iy as usize * stride + ix as usize) * 4;
+            let c00 = index(x0, y0);
+            let c10 = index(x1, y0);
+            let c01 = index(x0, y1);
+            let c11 = index(x1, y1);
+
+            for channel in 0..4 {
+                let top = gathered[c00 + channel] * (1.0 - fx) + gathered[c10 + channel] * fx;
+                let bottom = gathered[c01 + channel] * (1.0 - fx) + gathered[c11 + channel] * fx;
+                output.push(top * (1.0 - fy) + bottom * fy);
+            }
+        }
+    }
+    output
+}
+
+/// Runs inverse-sampled bilinear transform over one gathered region.
+pub fn transform_gathered_tile(
+    gathered: &[f32],
+    width: u32,
+    height: u32,
+    matrix: &Mat3x3,
+    gpu: Option<&GpuComputeEngine>,
+) -> Result<Vec<f32>, NodeError> {
+    match gpu {
+        Some(engine) => {
+            engine.transform_tile(gathered, &TransformParams::new(matrix, width, height))
+        }
+        None => Ok(transform_gathered_rgba(gathered, width, height, matrix)),
     }
 }
 

@@ -260,3 +260,32 @@ Viewer {
     assert_eq!(parsed.viewer_target, parsed.names.get("Constant1").copied());
     assert_eq!(parsed.stack_top, None, "Viewer must not be pushed");
 }
+
+#[test]
+fn two_number_color_knobs_parse_as_floatx2() {
+    tanova_nodes::ensure_linked();
+    let parsed = parse_nk_script(
+        r#"
+Transform {
+ inputs 1
+ name Transform1
+ translate {10 -5}
+ center {3 4}
+ rotate 45
+ scale 2
+}
+"#,
+    )
+    .expect("script should parse");
+
+    let node = parsed.nodes.first().expect("transform node");
+    assert_eq!(
+        node.knobs.get("translate"),
+        Some(&KnobValue::Color([10.0, -5.0, 0.0, 1.0]))
+    );
+    assert_eq!(
+        node.knobs.get("center"),
+        Some(&KnobValue::Color([3.0, 4.0, 0.0, 1.0]))
+    );
+    assert_eq!(node.knobs.get("rotate"), Some(&KnobValue::Float(45.0)));
+}

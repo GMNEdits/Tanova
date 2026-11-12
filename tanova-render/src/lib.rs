@@ -8,6 +8,7 @@
 //! in [`Raster2D::to_top_left_rgba8`].
 
 pub mod coords;
+pub mod matrix;
 pub mod ops;
 pub mod shader;
 pub mod tile;
@@ -16,12 +17,14 @@ pub use coords::{
     BBox, EdgeMode, Format, RegionOfInterest, TILE_PIXELS, TILE_SIZE, TileCoord, TileRange,
     world_to_tile,
 };
+pub use matrix::Mat3x3;
 pub use ops::{
     GradeOp, MergeOp, MergeRequest, blur_padded_rgba, blur_padded_tile, grade_raster,
-    is_rgba_channel, mask_value, merge_pixel, merge_raster, rgba_at,
+    is_rgba_channel, mask_value, merge_pixel, merge_raster, rgba_at, transform_gathered_rgba,
+    transform_gathered_tile,
 };
 pub use shader::{
     BlurParams, DISPATCH_SIZE, EvalContextGpu, GpuComputeEngine, GradeParams, MergeParams,
-    WORKGROUP_SIZE,
+    TransformParams, WORKGROUP_SIZE,
 };
 pub use tile::{Channel, ChannelPlane, Raster2D, TILE_BYTES, TileBuffer, extract_padded_tile};

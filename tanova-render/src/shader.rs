@@ -15,6 +15,7 @@ use tanova_kernel::{EvalContext, NodeError};
 use wgpu::util::DeviceExt;
 
 use crate::coords::{TILE_PIXELS, TILE_SIZE};
+use crate::matrix::Mat3x3;
 use crate::ops::{GradeOp, MergeOp};
 
 /// Threads per workgroup axis. A 256-pixel tile needs `256 / 16 = 16` groups.
@@ -131,6 +132,36 @@ impl BlurParams {
     }
 }
 
+/// `Transform` uniforms: inverse affine rows plus gathered input dimensions.
+///
+/// The inverse matrix maps one output tile's local pixel coordinates into the
+/// gathered input region's local coordinates. Three `vec4` rows keep the struct
+/// at 64 bytes with WGSL's 16-byte uniform alignment.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct TransformParams {
+    /// First row of the inverse matrix, padded to `vec4`.
+    pub inv_row0: [f32; 4],
+    /// Second row of the inverse matrix, padded to `vec4`.
+    pub inv_row1: [f32; 4],
+    /// Third row of the inverse matrix, padded to `vec4`.
+    pub inv_row2: [f32; 4],
+    /// `[gathered_width, gathered_height, 0, 0]`.
+    pub input_size: [u32; 4],
+}
+
+impl TransformParams {
+    /// Packs the inverse matrix and gathered region size into GPU uniforms.
+    pub fn new(matrix: &Mat3x3, width: u32, height: u32) -> Self {
+        Self {
+            inv_row0: matrix.row(0),
+            inv_row1: matrix.row(1),
+            inv_row2: matrix.row(2),
+            input_size: [width, height, 0, 0],
+        }
+    }
+}
+
 /// One compiled compute pass: its bind-group layout and pipeline.
 struct ComputePass {
     layout: wgpu::BindGroupLayout,
@@ -145,6 +176,7 @@ struct EngineInner {
     grade: ComputePass,
     merge: ComputePass,
     blur: ComputePass,
+    transform: ComputePass,
 }
 
 /// A cached `wgpu` compute engine for `Grade` and `Merge2`.
@@ -209,6 +241,20 @@ impl GpuComputeEngine {
                 storage_read_write(),
             ],
         );
+        let transform = build_pass(
+            &device,
+            "tanova-transform",
+            TRANSFORM_WGSL,
+            &[
+                storage_read(),
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                storage_read_write(),
+            ],
+        );
 
         Self {
             inner: Arc::new(EngineInner {
@@ -217,6 +263,7 @@ impl GpuComputeEngine {
                 grade,
                 merge,
                 blur,
+                transform,
             }),
         }
     }
@@ -349,6 +396,45 @@ impl GpuComputeEngine {
         });
 
         self.run(&self.inner.blur, &bind_group, &output, TILE_RGBA_BYTES)
+    }
+
+    /// Runs inverse-sampled bilinear `Transform` over one gathered input tile.
+    ///
+    /// `gathered` is `width * height` interleaved RGBA pixels covering the
+    /// inverse-mapped footprint of one output tile. `params` maps output-local
+    /// coordinates into that gathered region. The output is one dense 256x256
+    /// interleaved RGBA tile; samples outside the gathered region read as zero.
+    pub fn transform_tile(
+        &self,
+        gathered: &[f32],
+        params: &TransformParams,
+    ) -> Result<Vec<f32>, NodeError> {
+        let width = params.input_size[0] as usize;
+        let height = params.input_size[1] as usize;
+        let expected = width * height * 4;
+        if gathered.len() != expected {
+            return Err(NodeError::Other(format!(
+                "transform input needs {expected} floats, got {}",
+                gathered.len()
+            )));
+        }
+
+        let device = &self.inner.device;
+        let input = create_buffer(device, "tanova-transform-input", gathered, true);
+        let uniform = create_uniform_buffer(device, "tanova-transform-params", &[*params]);
+        let output = create_output_buffer(device, TILE_RGBA_BYTES);
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tanova-transform-bind-group"),
+            layout: &self.inner.transform.layout,
+            entries: &[
+                binding(0, &input),
+                binding(1, &uniform),
+                binding(2, &output),
+            ],
+        });
+
+        self.run(&self.inner.transform, &bind_group, &output, TILE_RGBA_BYTES)
     }
 
     /// Records one dispatch, waits for it, and reads the output back.
@@ -691,6 +777,68 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+const TRANSFORM_WGSL: &str = r#"
+struct TransformParams {
+    inv_row0: vec4<f32>,
+    inv_row1: vec4<f32>,
+    inv_row2: vec4<f32>,
+    input_size: vec4<u32>,
+};
+
+// Gathered input footprints can exceed the 64 KiB uniform limit, so pixels live
+// in storage buffers.
+@group(0) @binding(0) var<storage, read> input_pixels: array<vec4<f32>>;
+@group(0) @binding(1) var<uniform> params: TransformParams;
+@group(0) @binding(2) var<storage, read_write> output_pixels: array<vec4<f32>>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= 256u || id.y >= 256u) {
+        return;
+    }
+    let index = id.y * 256u + id.x;
+
+    // Inverse sampling: map the output pixel back into the gathered input.
+    let local = vec3<f32>(f32(id.x), f32(id.y), 1.0);
+    let w = dot(params.inv_row2.xyz, local);
+    if (abs(w) < 1e-12) {
+        output_pixels[index] = vec4<f32>(0.0);
+        return;
+    }
+    let uv = vec2<f32>(
+        dot(params.inv_row0.xyz, local),
+        dot(params.inv_row1.xyz, local),
+    ) / w;
+
+    let width = f32(params.input_size.x);
+    let height = f32(params.input_size.y);
+
+    // Outside the gathered footprint is transparent black. The +2 px gather
+    // margin keeps tile interiors away from this branch.
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > width - 1.0 || uv.y > height - 1.0) {
+        output_pixels[index] = vec4<f32>(0.0);
+        return;
+    }
+
+    let x0 = i32(floor(uv.x));
+    let y0 = i32(floor(uv.y));
+    let fx = uv.x - f32(x0);
+    let fy = uv.y - f32(y0);
+    let stride = i32(params.input_size.x);
+    let x1 = min(x0 + 1, i32(params.input_size.x) - 1);
+    let y1 = min(y0 + 1, i32(params.input_size.y) - 1);
+
+    let c00 = input_pixels[y0 * stride + x0];
+    let c10 = input_pixels[y0 * stride + x1];
+    let c01 = input_pixels[y1 * stride + x0];
+    let c11 = input_pixels[y1 * stride + x1];
+
+    let top = mix(c00, c10, fx);
+    let bottom = mix(c01, c11, fx);
+    output_pixels[index] = mix(top, bottom, fy);
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,6 +886,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<GradeParams>(), 144);
         assert_eq!(std::mem::size_of::<MergeParams>(), 32);
         assert_eq!(std::mem::size_of::<BlurParams>(), 16);
+        assert_eq!(std::mem::size_of::<TransformParams>(), 64);
         assert_eq!(std::mem::align_of::<GradeParams>(), 4);
     }
 
@@ -811,6 +960,53 @@ mod tests {
 
         assert_eq!(gpu.len(), TILE_RGBA_VALUES);
         for (index, (actual, expected)) in gpu.chunks_exact(4).zip(cpu.iter()).enumerate() {
+            for channel in 0..4 {
+                assert!(
+                    (actual[channel] - expected[channel]).abs() <= 1e-4,
+                    "pixel {index} channel {channel}: gpu {} vs cpu {}",
+                    actual[channel],
+                    expected[channel]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_transform_matches_cpu_bilinear_fallback() {
+        let Some(engine) = test_engine() else {
+            eprintln!("no GPU adapter available; skipping Transform parity test");
+            return;
+        };
+
+        let width = 600u32;
+        let height = 600u32;
+        let mut gathered = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let fx = x as f32;
+                let fy = y as f32;
+                gathered.extend_from_slice(&[
+                    (fx * 0.021).sin() * 0.5 + 0.5,
+                    (fy * 0.017).cos() * 0.5 + 0.5,
+                    ((fx + fy) * 0.009).fract(),
+                    (fx * 0.005 + fy * 0.011).fract(),
+                ]);
+            }
+        }
+
+        // Map output-local pixels into the gathered region with a scale,
+        // rotation, and translation so every branch of the sampler runs.
+        let matrix = Mat3x3::translate(260.0, 240.0)
+            .mul(&Mat3x3::rotate(0.3))
+            .mul(&Mat3x3::scale(0.8, 0.9));
+        let gpu = engine
+            .transform_tile(&gathered, &TransformParams::new(&matrix, width, height))
+            .expect("transform dispatch");
+        let cpu = crate::ops::transform_gathered_rgba(&gathered, width, height, &matrix);
+
+        assert_eq!(gpu.len(), TILE_RGBA_VALUES);
+        for (index, (actual, expected)) in gpu.chunks_exact(4).zip(cpu.chunks_exact(4)).enumerate()
+        {
             for channel in 0..4 {
                 assert!(
                     (actual[channel] - expected[channel]).abs() <= 1e-4,
