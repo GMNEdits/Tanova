@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 
@@ -440,6 +441,7 @@ fn kernel_loop(
 
         let current_epoch = epoch.bump();
         let context = base_ctx.clone();
+        let last_render = Instant::now();
         match dag.evaluate_pull(target, &context, &governor, &epoch, current_epoch) {
             Ok(packet) => {
                 let _ = frames.send(FrameNotification {
@@ -459,6 +461,17 @@ fn kernel_loop(
                 // during interactive editing; the next change retries.
             }
         }
+
+        // GPU queue contention: on integrated GPUs the render holds the device
+        // queue while downloading pixels, starving the UI thread. Yielding for
+        // one 60 FPS frame releases the queue so egui can redraw between
+        // renders.
+        let render_time = last_render.elapsed();
+        debug_assert!(
+            render_time < Duration::from_secs(30),
+            "single frame render took {render_time:?}"
+        );
+        thread::sleep(Duration::from_millis(16));
     }
 }
 
