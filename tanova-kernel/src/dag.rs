@@ -502,10 +502,13 @@ impl Dag {
             .collect();
         edges.sort_by_key(|edge| (edge.to_port, edge.from_node, edge.from_port));
 
-        let mut inputs = Vec::with_capacity(edges.len());
+        // Inputs are indexed by port, not by edge order: Nuke's B/A/mask ports
+        // must keep their slots even when an intermediate port is unconnected.
+        let max_port = edges.iter().map(|edge| edge.to_port.0).max();
+        let mut inputs = vec![Packet::new(); max_port.map_or(0, |port| port as usize + 1)];
         for edge in &edges {
             let packet = self.pull(edge.from_node, ctx, governor, epoch, target_epoch, visiting)?;
-            inputs.push((*packet).clone());
+            inputs[edge.to_port.0 as usize] = (*packet).clone();
         }
 
         let evaluated = {
@@ -721,6 +724,38 @@ mod tests {
 
         fn serialize_to_tcl(&self) -> String {
             "GovernorProbe {}".to_string()
+        }
+    }
+
+    struct TagNode(u32);
+
+    impl NodeTrait for TagNode {
+        fn evaluate(&self, _ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
+            let mut packet = Packet::new();
+            packet.insert(self.0);
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            format!("TagNode {{ tag {} }}", self.0)
+        }
+    }
+
+    struct PortProbe;
+
+    impl NodeTrait for PortProbe {
+        fn evaluate(&self, _ctx: &EvalContext, inputs: &[Packet]) -> Result<Packet, NodeError> {
+            let report: Vec<(bool, Option<u32>)> = inputs
+                .iter()
+                .map(|packet| (packet.is_empty(), packet.get::<u32>().copied()))
+                .collect();
+            let mut packet = Packet::new();
+            packet.insert(report);
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            "PortProbe {}".to_string()
         }
     }
 
@@ -949,5 +984,41 @@ mod tests {
             Some(&4096),
             "the cartridge must see the kernel's governor through EvalContext"
         );
+    }
+
+    #[test]
+    fn sparse_ports_keep_nuke_input_indices() {
+        let mut dag = Dag::new();
+        dag.add_node_with_implementation(NodeId(1), "TagB", Arc::new(TagNode(11)))
+            .unwrap();
+        dag.add_node_with_implementation(NodeId(3), "TagA", Arc::new(TagNode(33)))
+            .unwrap();
+        dag.add_node_with_implementation(NodeId(2), "PortProbe", Arc::new(PortProbe))
+            .unwrap();
+
+        // B (0) and mask (2) are connected; A (1) is intentionally empty.
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .unwrap();
+        dag.connect_edge(Edge::new(NodeId(3), PortId(0), NodeId(2), PortId(2)))
+            .unwrap();
+
+        let packet = dag
+            .evaluate_pull(
+                NodeId(2),
+                &EvalContext::new(),
+                &MemoryGovernor::new(usize::MAX),
+                &RenderEpoch::new(),
+                0,
+            )
+            .expect("probe should evaluate");
+
+        let report = packet
+            .get::<Vec<(bool, Option<u32>)>>()
+            .expect("probe report");
+
+        assert_eq!(report.len(), 3, "inputs are indexed by port, not edge");
+        assert_eq!(report[0], (false, Some(11)));
+        assert_eq!(report[1], (true, None), "port 1 must be an empty slot");
+        assert_eq!(report[2], (false, Some(33)));
     }
 }

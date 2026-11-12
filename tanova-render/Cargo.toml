@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 tanova-kernel.workspace = true
-bytemuck.workspace = true
+bytemuck = { workspace = true, features = ["derive"] }
 indexmap.workspace = true
 pollster.workspace = true
 wgpu.workspace = true

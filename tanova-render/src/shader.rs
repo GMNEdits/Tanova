@@ -1,0 +1,714 @@
+//! Cached `wgpu` compute engine for the core VFX cartridges.
+//!
+//! Pipelines are compiled exactly once, when [`GpuComputeEngine::new`] runs, and
+//! then reused for every tile. Dense 256x256 tiles are uploaded, processed by a
+//! `16x16` workgroup kernel, and read back into planar `f32` data.
+//!
+//! The engine knows nothing about the DAG. Cartridges find it through
+//! [`EvalContextGpu::gpu`] (or `ctx.get::<GpuComputeEngine>()`) and fall back to
+//! the identical Rust math in [`crate::ops`] when no GPU is available.
+
+use std::sync::Arc;
+
+use bytemuck::{Pod, Zeroable};
+use tanova_kernel::{EvalContext, NodeError};
+use wgpu::util::DeviceExt;
+
+use crate::coords::{TILE_PIXELS, TILE_SIZE};
+use crate::ops::{GradeOp, MergeOp};
+
+/// Threads per workgroup axis. A 256-pixel tile needs `256 / 16 = 16` groups.
+pub const WORKGROUP_SIZE: u32 = 16;
+
+/// Workgroups per axis for one 256x256 tile.
+pub const DISPATCH_SIZE: u32 = TILE_SIZE / WORKGROUP_SIZE;
+
+/// RGBA floats in one dense tile.
+pub const TILE_RGBA_VALUES: usize = TILE_PIXELS * 4;
+
+/// Bytes in one dense RGBA tile.
+pub const TILE_RGBA_BYTES: u64 = TILE_RGBA_VALUES as u64 * std::mem::size_of::<f32>() as u64;
+
+/// Bytes in one dense single-channel tile.
+pub const TILE_MASK_BYTES: u64 = TILE_PIXELS as u64 * std::mem::size_of::<f32>() as u64;
+
+/// `Grade` uniforms, laid out as nine 16-byte-aligned `vec4` values.
+///
+/// WGSL's uniform layout rules require each field to start on a 16-byte
+/// boundary, so every member is a `vec4` and the struct size is a multiple of
+/// 16. The Rust struct uses the same layout.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct GradeParams {
+    /// Input black point, per RGB channel.
+    pub blackpoint: [f32; 4],
+    /// Input white point, per RGB channel.
+    pub whitepoint: [f32; 4],
+    /// Output lift, per RGB channel.
+    pub lift: [f32; 4],
+    /// Output gain, per RGB channel.
+    pub gain: [f32; 4],
+    /// Overall multiply, per RGB channel.
+    pub multiply: [f32; 4],
+    /// Post-slope offset, per RGB channel.
+    pub offset: [f32; 4],
+    /// Inverse gamma, per RGB channel.
+    pub gamma: [f32; 4],
+    /// Flags: `[unpremult, black_clamp, white_clamp, 0]`.
+    pub flags: [u32; 4],
+    /// Blend: `[mix, 0, 0, 0]`.
+    pub mix: [f32; 4],
+}
+
+impl GradeParams {
+    /// Packs a [`GradeOp`] into GPU-ready uniforms.
+    pub fn new(op: &GradeOp) -> Self {
+        Self {
+            blackpoint: op.blackpoint,
+            whitepoint: op.whitepoint,
+            lift: op.lift,
+            gain: op.gain,
+            multiply: op.multiply,
+            offset: op.offset,
+            gamma: op.gamma,
+            flags: [
+                u32::from(op.unpremult),
+                u32::from(op.black_clamp),
+                u32::from(op.white_clamp),
+                0,
+            ],
+            mix: [op.mix, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// `Merge2` uniforms: an operation code and a blend amount.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct MergeParams {
+    /// `[operation_code, 0, 0, 0]`, matching [`MergeOp::code`].
+    pub operation: [u32; 4],
+    /// `[mix, 0, 0, 0]`.
+    pub mix: [f32; 4],
+}
+
+impl MergeParams {
+    /// Packs a [`MergeOp`] and its blend amount into GPU-ready uniforms.
+    pub fn new(operation: MergeOp, mix: f32) -> Self {
+        Self {
+            operation: [operation.code(), 0, 0, 0],
+            mix: [mix, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// One compiled compute pass: its bind-group layout and pipeline.
+struct ComputePass {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
+
+/// Shared, immutable GPU state. `Arc` makes the engine cheap to clone and safe
+/// to share between the UI and render threads.
+struct EngineInner {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    grade: ComputePass,
+    merge: ComputePass,
+}
+
+/// A cached `wgpu` compute engine for `Grade` and `Merge2`.
+#[derive(Clone)]
+pub struct GpuComputeEngine {
+    inner: Arc<EngineInner>,
+}
+
+impl std::fmt::Debug for GpuComputeEngine {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GpuComputeEngine")
+            .finish_non_exhaustive()
+    }
+}
+
+impl GpuComputeEngine {
+    /// Compiles both kernels once and caches their pipelines.
+    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
+        let grade = build_pass(
+            &device,
+            "tanova-grade",
+            GRADE_WGSL,
+            &[
+                storage_read(),
+                storage_read(),
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                storage_read_write(),
+            ],
+        );
+        let merge = build_pass(
+            &device,
+            "tanova-merge2",
+            MERGE_WGSL,
+            &[
+                storage_read(),
+                storage_read(),
+                storage_read(),
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                storage_read_write(),
+            ],
+        );
+
+        Self {
+            inner: Arc::new(EngineInner {
+                device,
+                queue,
+                grade,
+                merge,
+            }),
+        }
+    }
+
+    /// Borrows the engine carried by an evaluation context, if any.
+    pub fn from_context(ctx: &EvalContext) -> Option<&Self> {
+        ctx.get::<Self>()
+    }
+
+    /// The device this engine dispatches on.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.inner.device
+    }
+
+    /// Runs `Grade` over one dense RGBA tile plus its mask tile.
+    pub fn grade_tile(
+        &self,
+        input_rgba: &[f32],
+        mask: &[f32],
+        params: &GradeParams,
+    ) -> Result<Vec<f32>, NodeError> {
+        if input_rgba.len() != TILE_RGBA_VALUES {
+            return Err(NodeError::Other(format!(
+                "grade input needs {TILE_RGBA_VALUES} floats, got {}",
+                input_rgba.len()
+            )));
+        }
+        if mask.len() != TILE_PIXELS {
+            return Err(NodeError::Other(format!(
+                "grade mask needs {TILE_PIXELS} floats, got {}",
+                mask.len()
+            )));
+        }
+
+        let device = &self.inner.device;
+        let input = create_buffer(device, "tanova-grade-input", input_rgba, true);
+        let mask_buffer = create_buffer(device, "tanova-grade-mask", mask, true);
+        let uniform = create_uniform_buffer(device, "tanova-grade-params", &[*params]);
+        let output = create_output_buffer(device, TILE_RGBA_BYTES);
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tanova-grade-bind-group"),
+            layout: &self.inner.grade.layout,
+            entries: &[
+                binding(0, &input),
+                binding(1, &mask_buffer),
+                binding(2, &uniform),
+                binding(3, &output),
+            ],
+        });
+
+        self.run(&self.inner.grade, &bind_group, &output, TILE_RGBA_BYTES)
+    }
+
+    /// Runs `Merge2` over one dense background tile, foreground tile, and mask.
+    pub fn merge_tile(
+        &self,
+        background: &[f32],
+        foreground: &[f32],
+        mask: &[f32],
+        params: &MergeParams,
+    ) -> Result<Vec<f32>, NodeError> {
+        for (name, values) in [("background", background), ("foreground", foreground)] {
+            if values.len() != TILE_RGBA_VALUES {
+                return Err(NodeError::Other(format!(
+                    "merge {name} needs {TILE_RGBA_VALUES} floats, got {}",
+                    values.len()
+                )));
+            }
+        }
+        if mask.len() != TILE_PIXELS {
+            return Err(NodeError::Other(format!(
+                "merge mask needs {TILE_PIXELS} floats, got {}",
+                mask.len()
+            )));
+        }
+
+        let device = &self.inner.device;
+        let background_buffer = create_buffer(device, "tanova-merge-b", background, true);
+        let foreground_buffer = create_buffer(device, "tanova-merge-a", foreground, true);
+        let mask_buffer = create_buffer(device, "tanova-merge-mask", mask, true);
+        let uniform = create_uniform_buffer(device, "tanova-merge-params", &[*params]);
+        let output = create_output_buffer(device, TILE_RGBA_BYTES);
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tanova-merge-bind-group"),
+            layout: &self.inner.merge.layout,
+            entries: &[
+                binding(0, &background_buffer),
+                binding(1, &foreground_buffer),
+                binding(2, &mask_buffer),
+                binding(3, &uniform),
+                binding(4, &output),
+            ],
+        });
+
+        self.run(&self.inner.merge, &bind_group, &output, TILE_RGBA_BYTES)
+    }
+
+    /// Records one dispatch, waits for it, and reads the output back.
+    fn run(
+        &self,
+        pass: &ComputePass,
+        bind_group: &wgpu::BindGroup,
+        output: &wgpu::Buffer,
+        output_bytes: u64,
+    ) -> Result<Vec<f32>, NodeError> {
+        let device = &self.inner.device;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tanova-readback"),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tanova-compute-encoder"),
+        });
+        {
+            let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("tanova-compute-pass"),
+                timestamp_writes: None,
+            });
+            compute.set_pipeline(&pass.pipeline);
+            compute.set_bind_group(0, bind_group, &[]);
+            compute.dispatch_workgroups(DISPATCH_SIZE, DISPATCH_SIZE, 1);
+        }
+        encoder.copy_buffer_to_buffer(output, 0, &readback, 0, output_bytes);
+        self.inner.queue.submit(Some(encoder.finish()));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| NodeError::Other(format!("wgpu poll failed: {error}")))?;
+        receiver
+            .recv()
+            .map_err(|error| NodeError::Other(format!("wgpu map callback lost: {error}")))?
+            .map_err(|error| NodeError::Other(format!("wgpu buffer map failed: {error}")))?;
+
+        let pixels = {
+            let view = readback
+                .slice(..)
+                .get_mapped_range()
+                .map_err(|error| NodeError::Other(format!("wgpu mapped range failed: {error}")))?;
+            bytemuck::cast_slice::<u8, f32>(&view[..]).to_vec()
+        };
+        readback.unmap();
+        Ok(pixels)
+    }
+}
+
+/// Convenience accessor so cartridges can ask for the engine without naming
+/// any kernel internals.
+pub trait EvalContextGpu {
+    /// The cached GPU compute engine, if one was injected.
+    fn gpu(&self) -> Option<&GpuComputeEngine>;
+}
+
+impl EvalContextGpu for EvalContext {
+    fn gpu(&self) -> Option<&GpuComputeEngine> {
+        GpuComputeEngine::from_context(self)
+    }
+}
+
+fn storage_read() -> wgpu::BindingType {
+    wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only: true },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    }
+}
+
+fn storage_read_write() -> wgpu::BindingType {
+    wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only: false },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    }
+}
+
+fn build_pass(
+    device: &wgpu::Device,
+    label: &str,
+    source: &str,
+    bindings: &[wgpu::BindingType],
+) -> ComputePass {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+
+    let entries: Vec<wgpu::BindGroupLayoutEntry> = bindings
+        .iter()
+        .enumerate()
+        .map(|(index, ty)| wgpu::BindGroupLayoutEntry {
+            binding: index as u32,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: *ty,
+            count: None,
+        })
+        .collect();
+
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &entries,
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+
+    ComputePass { layout, pipeline }
+}
+
+fn create_buffer<T: Pod>(
+    device: &wgpu::Device,
+    label: &str,
+    data: &[T],
+    read_only: bool,
+) -> wgpu::Buffer {
+    let usage = if read_only {
+        wgpu::BufferUsages::STORAGE
+    } else {
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
+    };
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(data),
+        usage,
+    })
+}
+
+fn create_uniform_buffer<T: Pod>(device: &wgpu::Device, label: &str, data: &[T]) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(data),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    })
+}
+
+fn create_output_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("tanova-compute-output"),
+        size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+fn binding<'a>(index: u32, buffer: &'a wgpu::Buffer) -> wgpu::BindGroupEntry<'a> {
+    wgpu::BindGroupEntry {
+        binding: index,
+        resource: buffer.as_entire_binding(),
+    }
+}
+
+const GRADE_WGSL: &str = r#"
+struct GradeParams {
+    blackpoint: vec4<f32>,
+    whitepoint: vec4<f32>,
+    lift: vec4<f32>,
+    gain: vec4<f32>,
+    multiply: vec4<f32>,
+    offset: vec4<f32>,
+    gamma: vec4<f32>,
+    flags: vec4<u32>,
+    mix: vec4<f32>,
+};
+
+@group(0) @binding(0) var<storage, read> input_pixels: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> mask_values: array<f32>;
+@group(0) @binding(2) var<uniform> params: GradeParams;
+@group(0) @binding(3) var<storage, read_write> output_pixels: array<vec4<f32>>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= 256u || id.y >= 256u) {
+        return;
+    }
+    let index = id.y * 256u + id.x;
+    let rgba = input_pixels[index];
+    let alpha = rgba.a;
+    let unpremultiply = params.flags.x != 0u && alpha > 1e-5;
+
+    var work_rgb = rgba.rgb;
+    if (unpremultiply) {
+        work_rgb = rgba.rgb / alpha;
+    }
+
+    var graded = vec3<f32>(0.0);
+    for (var channel = 0u; channel < 3u; channel = channel + 1u) {
+        let black = params.blackpoint[channel];
+        let white = params.whitepoint[channel];
+        var denom = white - black;
+        if (abs(denom) < 1e-6) {
+            denom = 1e-6;
+        }
+        let slope = params.multiply[channel] * (params.gain[channel] - params.lift[channel]) / denom;
+        let intercept = params.offset[channel] + params.lift[channel] - black * slope;
+        var value = slope * work_rgb[channel] + intercept;
+
+        if (params.flags.y != 0u) {
+            value = max(value, 0.0);
+        }
+        if (params.flags.z != 0u) {
+            value = min(value, 1.0);
+        }
+
+        let gamma = params.gamma[channel];
+        if (value > 0.0 && gamma > 1e-6 && abs(gamma - 1.0) > 1e-6) {
+            value = pow(value, 1.0 / gamma);
+        }
+        graded[channel] = value;
+    }
+
+    let effective_mix = clamp(params.mix.x * mask_values[index], 0.0, 1.0);
+    var out_rgb = work_rgb + (graded - work_rgb) * effective_mix;
+    if (unpremultiply) {
+        out_rgb = out_rgb * alpha;
+    }
+    output_pixels[index] = vec4<f32>(out_rgb, alpha);
+}
+"#;
+
+const MERGE_WGSL: &str = r#"
+struct MergeParams {
+    operation: vec4<u32>,
+    mix: vec4<f32>,
+};
+
+@group(0) @binding(0) var<storage, read> background_pixels: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> foreground_pixels: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> mask_values: array<f32>;
+@group(0) @binding(3) var<uniform> params: MergeParams;
+@group(0) @binding(4) var<storage, read_write> output_pixels: array<vec4<f32>>;
+
+fn apply(op: u32, a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+    switch op {
+        case 1u: {
+            return a * (1.0 - b.a) + b;
+        }
+        case 2u: {
+            return a + b;
+        }
+        case 3u: {
+            return b - a;
+        }
+        case 4u: {
+            return a - b;
+        }
+        case 5u: {
+            return a * b;
+        }
+        case 6u: {
+            return b * (1.0 - a.a);
+        }
+        case 7u: {
+            return b * a.a;
+        }
+        default: {
+            return a + b * (1.0 - a.a);
+        }
+    }
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= 256u || id.y >= 256u) {
+        return;
+    }
+    let index = id.y * 256u + id.x;
+    let a = foreground_pixels[index];
+    let b = background_pixels[index];
+    let result = apply(params.operation.x, a, b);
+    let effective_mix = clamp(params.mix.x * mask_values[index], 0.0, 1.0);
+    output_pixels[index] = b + (result - b) * effective_mix;
+}
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::merge_pixel;
+
+    fn test_engine() -> Option<GpuComputeEngine> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+            apply_limit_buckets: false,
+        }))
+        .ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("tanova-test-device"),
+            ..Default::default()
+        }))
+        .ok()?;
+        Some(GpuComputeEngine::new(Arc::new(device), Arc::new(queue)))
+    }
+
+    fn ramp_rgba() -> Vec<f32> {
+        (0..TILE_PIXELS)
+            .flat_map(|index| {
+                let value = (index as f32 / TILE_PIXELS as f32).clamp(0.0, 1.0);
+                [
+                    value,
+                    (value * 0.5).fract(),
+                    1.0 - value,
+                    0.25 + 0.75 * value,
+                ]
+            })
+            .collect()
+    }
+
+    fn ramp_mask() -> Vec<f32> {
+        (0..TILE_PIXELS)
+            .map(|index| (index as f32 / TILE_PIXELS as f32).clamp(0.0, 1.0))
+            .collect()
+    }
+
+    #[test]
+    fn uniform_structs_match_wgsl_alignment() {
+        assert_eq!(std::mem::size_of::<GradeParams>(), 144);
+        assert_eq!(std::mem::size_of::<MergeParams>(), 32);
+        assert_eq!(std::mem::align_of::<GradeParams>(), 4);
+    }
+
+    #[test]
+    fn gpu_grade_matches_cpu_fallback() {
+        let Some(engine) = test_engine() else {
+            eprintln!("no GPU adapter available; skipping Grade parity test");
+            return;
+        };
+
+        let op = GradeOp {
+            blackpoint: [0.05, 0.02, 0.0, 0.0],
+            whitepoint: [0.95, 0.9, 1.0, 1.0],
+            lift: [0.01, 0.0, 0.02, 0.0],
+            gain: [1.1, 0.9, 1.0, 1.0],
+            multiply: [1.0, 1.05, 0.95, 1.0],
+            offset: [0.0, 0.01, -0.01, 0.0],
+            gamma: [2.2, 1.8, 1.0, 1.0],
+            unpremult: true,
+            black_clamp: true,
+            white_clamp: false,
+            mix: 0.85,
+        };
+        let input = ramp_rgba();
+        let mask = ramp_mask();
+        let gpu = engine
+            .grade_tile(&input, &mask, &GradeParams::new(&op))
+            .expect("grade dispatch");
+
+        for (index, (actual, source)) in gpu.chunks_exact(4).zip(input.chunks_exact(4)).enumerate()
+        {
+            let expected =
+                op.apply_pixel([source[0], source[1], source[2], source[3]], mask[index]);
+            for channel in 0..4 {
+                assert!(
+                    (actual[channel] - expected[channel]).abs() <= 1e-5,
+                    "pixel {index} channel {channel}: gpu {} vs cpu {}",
+                    actual[channel],
+                    expected[channel]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_merge_matches_cpu_fallback() {
+        let Some(engine) = test_engine() else {
+            eprintln!("no GPU adapter available; skipping Merge2 parity test");
+            return;
+        };
+
+        let background = ramp_rgba();
+        let foreground: Vec<f32> = ramp_rgba()
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if index % 4 == 3 {
+                    (value * 0.5).clamp(0.0, 1.0)
+                } else {
+                    (value * 0.75).clamp(0.0, 1.0)
+                }
+            })
+            .collect();
+        let mask = ramp_mask();
+
+        for operation in MergeOp::ALL {
+            let gpu = engine
+                .merge_tile(
+                    &background,
+                    &foreground,
+                    &mask,
+                    &MergeParams::new(operation, 0.9),
+                )
+                .expect("merge dispatch");
+
+            for (index, ((actual, b), a)) in gpu
+                .chunks_exact(4)
+                .zip(background.chunks_exact(4))
+                .zip(foreground.chunks_exact(4))
+                .enumerate()
+            {
+                let expected = merge_pixel(
+                    operation,
+                    [b[0], b[1], b[2], b[3]],
+                    [a[0], a[1], a[2], a[3]],
+                    mask[index],
+                    0.9,
+                );
+                // `expected` is a single pixel; compare below.
+                for channel in 0..4 {
+                    assert!(
+                        (actual[channel] - expected[channel]).abs() <= 1e-5,
+                        "{operation:?} pixel {index} channel {channel}: gpu {} vs cpu {}",
+                        actual[channel],
+                        expected[channel]
+                    );
+                }
+            }
+        }
+    }
+}

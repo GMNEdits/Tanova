@@ -9,4 +9,5 @@ repository.workspace = true
 
 [dependencies]
 tanova-kernel.workspace = true
+tanova-render.workspace = true
 inventory.workspace = true

@@ -22,11 +22,14 @@ Create a custom `egui::Painter` widget drawing two rectangles with a Top-to-Bott
 # TANOVA ROADMAP - PHASE 2: THE RENDER CORE
 *AI DIRECTIVE: Execute one milestone at a time. Do not skip or combine milestones.*
 
-**Milestone 7: Nuke Spatial Types, Governed Planar Tiles & Apron Stitching (tanova-kernel & tanova-render)**
+**Milestone 7: Nuke Spatial Types, Governed Planar Tiles & Apron Stitching (`tanova-kernel` & `tanova-render`)**
 Inject the shared `MemoryGovernor` into `EvalContext` so cartridges can reserve bytes during evaluation. In `tanova-render`, implement Bottom-Left `(0,0)` spatial types (`TileCoord`, `TileRange`, `BBox`, `Format`, `RegionOfInterest`, `EdgeMode`) with Euclidean negative-coordinate tile math; a governed `TileBuffer` with collapsed uniform and dense representations; `ChannelPlane` / `Raster2D` planes with zero-copy channel pass-through and the canonical Bottom-Left to Top-Left `RGBA8` display conversion; and `extract_padded_tile` apron stitching that samples neighbouring tiles without grid seams.
 
-**Milestone 8: The wgpu Render Bridge & Viewer Texture Channel (tanova-render & tanova-app)**
-Upload `Raster2D` planes into GPU textures, run tiled shader passes over aproned tiles, and stream `Arc<wgpu::TextureView>` frames from the kernel thread to the viewer panel without CPU copies.
+**Milestone 8: GPU Compute Shader Engine & Core VFX Cartridges (`Constant`, `Grade`, `Merge2`)**
+Align sparse input ports so port indices always match the Nuke `B` / `A` / `mask` order. Build a cached `wgpu` compute engine that compiles `Grade` and `Merge2` pipelines once, injects it through `EvalContext`, and runs 16-byte-aligned WGSL kernels over dense tiles with an identical CPU fallback and a zero-allocation uniform-tile fast path. Implement the three core cartridges (`Constant`, `Grade`, `Merge2`) with exact Nuke math, AOV preservation, and self-registration.
 
-**Milestone 9: The TCL Stack Machine & Headless CLI (tanova-parse, tanova-io & tanova-cli)**
+**Milestone 9: The Live Nuke Viewer, Off-Screen Texture Bridge & Properties Bin (`tanova-ui` & `tanova-app`)**
+Stream `Arc<wgpu::TextureView>` frames from the kernel thread to an egui viewer panel without CPU copies, and add a properties bin that edits the selected node's knobs through the message bus.
+
+**Milestone 10: The `.nk` TCL Stack-Machine Parser & Headless Render CLI (`tanova-parse` & `tanova-cli`)**
 Implement the `.nk` TCL stack-machine parser, round-trip graph serialization, and a headless `tanova-cli` render path that loads a script, evaluates the DAG, and writes a display-transformed image.
