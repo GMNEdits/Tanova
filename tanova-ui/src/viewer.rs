@@ -7,11 +7,11 @@
 use std::sync::Arc;
 
 use egui::{
-    Align, Align2, Color32, ColorImage, FontId, Layout, Pos2, Rect, Sense, Stroke, StrokeKind,
-    TextureHandle, TextureOptions, Ui, Vec2,
+    Align, Align2, Color32, ColorImage, FontId, Layout, PointerButton, Pos2, Rect, Sense, Shape,
+    Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
 };
 use tanova_kernel::{FrameNotification, KernelMessage, KnobValue, NodeId, Packet, UndoableCommand};
-use tanova_render::{BBox, Raster2D};
+use tanova_render::{BBox, Mat3x3, Raster2D};
 
 use crate::canvas::GraphMirror;
 
@@ -27,8 +27,35 @@ const JACK_HOVER: Color32 = Color32::from_rgb(255, 238, 170);
 
 const MIN_ZOOM: f32 = 0.02;
 const MAX_ZOOM: f32 = 64.0;
-const JACK_RADIUS: f32 = 7.0;
-const JACK_HIT_RADIUS: f32 = 12.0;
+const JACK_RADIUS: f32 = 8.0;
+const JACK_HIT_RADIUS: f32 = 18.0;
+const JACK_ARROW_LENGTH: f32 = 45.0;
+const JACK_SHAFT_HIT_RADIUS: f32 = 8.0;
+const JACK_X_COLOR: Color32 = Color32::from_rgb(232, 72, 72);
+const JACK_Y_COLOR: Color32 = Color32::from_rgb(84, 210, 96);
+
+/// Restricts a jack drag to one Nuke axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxisConstraint {
+    /// Only horizontal image-space movement.
+    X,
+    /// Only vertical image-space movement.
+    Y,
+}
+
+/// In-flight transform jack drag.
+///
+/// The accumulated translation lives here so the handle and bounding box keep
+/// moving even before the kernel round-trips a new `GraphMirror`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JackDragState {
+    /// Transform node being dragged.
+    pub node_id: NodeId,
+    /// Accumulated `[translate_x, translate_y]` in image pixels.
+    pub current_translate: [f32; 2],
+    /// `None` for free 2D movement, otherwise a single axis.
+    pub axis_constraint: Option<AxisConstraint>,
+}
 
 /// Height reserved at the bottom of the viewer for the timeline strip.
 pub const TIMELINE_HEIGHT: f32 = 32.0;
@@ -47,14 +74,8 @@ pub struct ViewerPanel {
     frame: Option<Arc<Packet>>,
     texture: Option<TextureHandle>,
     dirty: bool,
-    /// True while the primary button drags the selected Transform jack.
-    dragging_handle: bool,
-    /// Pointer position when the jack drag began.
-    drag_start_pointer: Option<Pos2>,
-    /// `translate` captured when the jack drag began.
-    drag_base_translate: Option<[f32; 4]>,
-    /// Local drag preview so the jack never waits on the kernel round-trip.
-    drag_preview_translate: Option<[f32; 4]>,
+    /// In-flight transform jack drag, if any.
+    jack_drag: Option<JackDragState>,
 }
 
 impl Default for ViewerPanel {
@@ -68,10 +89,7 @@ impl Default for ViewerPanel {
             frame: None,
             texture: None,
             dirty: true,
-            dragging_handle: false,
-            drag_start_pointer: None,
-            drag_base_translate: None,
-            drag_preview_translate: None,
+            jack_drag: None,
         }
     }
 }
@@ -96,17 +114,45 @@ impl ViewerPanel {
             return;
         }
         self.viewer_node = node;
-        self.frame = None;
+        self.clear_frame();
         self.dirty = true;
     }
 
     /// Accepts a frame from the kernel, ignoring frames for other targets.
+    ///
+    /// A cleared notification (empty packet) drops the stored image so the
+    /// viewer shows only the checkerboard instead of stale pixels.
     pub fn set_frame(&mut self, frame: &FrameNotification) {
-        if self.viewer_node != Some(frame.node) {
+        if frame.node != self.viewer_node {
+            return;
+        }
+        if frame.is_cleared() {
+            self.clear_frame();
             return;
         }
         self.frame = Some(Arc::clone(&frame.packet));
         self.dirty = true;
+    }
+
+    /// Drops the last image and its GPU texture.
+    ///
+    /// The transform jack is reset too: it must never hover over an empty
+    /// viewport, because there is no image space to map it into.
+    pub fn clear_frame(&mut self) {
+        let had_content = self.frame.is_some() || self.texture.is_some();
+        self.frame = None;
+        self.texture = None;
+        self.reset_jack_drag();
+        if had_content {
+            self.dirty = true;
+        }
+    }
+
+    /// `true` when a displayable image is loaded.
+    pub fn has_frame(&self) -> bool {
+        self.frame
+            .as_ref()
+            .is_some_and(|packet| packet.get::<Raster2D>().is_some())
     }
 
     /// The last delivered raster, if any.
@@ -191,8 +237,13 @@ impl ViewerPanel {
         );
 
         // Active data window (may differ from the format, e.g. after a crop).
-        let bbox_rect = self.world_to_screen(image_rect, format, raster.bbox);
-        if raster.bbox != format {
+        // A selected Transform draws its own forward-mapped box instead, so
+        // the two outlines never overlap.
+        let transform_selected = selected
+            .and_then(|id| graph.node(id))
+            .is_some_and(|node| node.kind == "Transform");
+        if !transform_selected && raster.bbox != format {
+            let bbox_rect = self.world_to_screen(image_rect, format, raster.bbox);
             draw_dashed_rect(&painter, bbox_rect, Stroke::new(1.0, BBOX_LINE));
         }
 
@@ -360,11 +411,11 @@ impl ViewerPanel {
         Vec2::new(delta.x / scale_x, -delta.y / scale_y)
     }
 
-    /// Draws the selected Transform node's jack and turns primary drags into
-    /// `SetKnob` commands for the `translate` knob.
+    /// Draws the selected Transform node's Nuke-style jack and turns primary
+    /// drags into `SetKnob` commands for the `translate` knob.
     ///
-    /// The jack position is `center + translate` (the transform's pivot after
-    /// the affine map) and is recomputed from `GraphMirror` on every frame.
+    /// While a drag is in flight the handle and the dashed box read
+    /// `jack_drag.current_translate`, so they never wait for `GraphMirror`.
     #[allow(clippy::too_many_arguments)]
     fn draw_transform_overlay(
         &mut self,
@@ -376,84 +427,150 @@ impl ViewerPanel {
         graph: &GraphMirror,
         selected: Option<NodeId>,
     ) -> Vec<KernelMessage> {
-        let Some((node_id, graph_translate, center)) = selected_transform(graph, selected) else {
+        let Some(knobs) = selected_transform(graph, selected) else {
             self.reset_jack_drag();
             return Vec::new();
         };
+        let node_id = knobs.node_id;
 
-        let pointer = ui.input(|input| input.pointer.hover_pos());
-        let primary_pressed = ui.input(|input| input.pointer.primary_pressed());
-        let primary_down = ui.input(|input| input.pointer.primary_down());
-        let primary_released = ui.input(|input| input.pointer.primary_released());
-
-        let mut translate = graph_translate;
-        let mut handle_world = (center[0] + translate[0], center[1] + translate[1]);
-        let mut handle =
-            self.world_to_screen_point(image_rect, format, handle_world.0, handle_world.1);
-
-        if primary_pressed && response.hovered() {
-            if let Some(pointer) = pointer {
-                if pointer.distance(handle) <= JACK_HIT_RADIUS {
-                    self.dragging_handle = true;
-                    self.drag_start_pointer = Some(pointer);
-                    self.drag_base_translate = Some(graph_translate);
-                    self.drag_preview_translate = Some(graph_translate);
+        // Begin a drag only when the press landed on the jack or one of its
+        // axis arrows.
+        if response.drag_started_by(PointerButton::Primary) {
+            if let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) {
+                let anchor = self.jack_anchor(image_rect, format, &knobs, self.jack_drag);
+                if let Some(constraint) = jack_hit(anchor, pointer) {
+                    self.jack_drag = Some(JackDragState {
+                        node_id,
+                        current_translate: [knobs.translate[0], knobs.translate[1]],
+                        axis_constraint: constraint,
+                    });
                 }
             }
         }
 
         let mut messages = Vec::new();
-        if self.dragging_handle && primary_down {
-            if let (Some(start), Some(base), Some(pointer)) =
-                (self.drag_start_pointer, self.drag_base_translate, pointer)
-            {
-                let world_delta = self.screen_delta_to_world(image_rect, format, pointer - start);
-                let next = [
-                    base[0] + world_delta.x,
-                    base[1] + world_delta.y,
-                    base[2],
-                    base[3],
-                ];
-                if self.drag_preview_translate != Some(next) {
-                    messages.push(KernelMessage::Execute(UndoableCommand::SetKnob {
-                        node: node_id,
-                        knob: "translate".to_string(),
-                        value: KnobValue::Color(next),
-                        previous: KnobValue::Color(graph_translate),
-                    }));
-                    self.drag_preview_translate = Some(next);
-                }
-                translate = next;
-                handle_world = (center[0] + translate[0], center[1] + translate[1]);
-                handle =
-                    self.world_to_screen_point(image_rect, format, handle_world.0, handle_world.1);
+
+        // Accumulate this frame's pointer delta on top of the in-flight value.
+        if response.dragged_by(PointerButton::Primary) {
+            let delta = response.drag_delta();
+            let world = self.screen_delta_to_world(image_rect, format, delta);
+            if let Some((before, after)) = self.accumulate_jack_drag(node_id, world) {
+                messages.push(KernelMessage::Execute(UndoableCommand::SetKnob {
+                    node: node_id,
+                    knob: "translate".to_string(),
+                    value: KnobValue::Color([
+                        after[0],
+                        after[1],
+                        knobs.translate[2],
+                        knobs.translate[3],
+                    ]),
+                    previous: KnobValue::Color([
+                        before[0],
+                        before[1],
+                        knobs.translate[2],
+                        knobs.translate[3],
+                    ]),
+                }));
             }
         }
 
-        if primary_released || !primary_down {
-            self.reset_jack_drag();
-        }
+        // The dashed box follows the forward matrix (scale 0.5 shrinks),
+        // using the in-flight translation while this node is dragged.
+        let translate = self.effective_translate(node_id, knobs.translate);
+        let forward = forward_transform_matrix(translate, knobs.center, knobs.rotate, knobs.scale);
+        let transformed = format.transform(&forward);
+        draw_dashed_rect(
+            painter,
+            self.world_to_screen(image_rect, format, transformed),
+            Stroke::new(1.0, BBOX_LINE),
+        );
 
-        let hovered = pointer.is_some_and(|pointer| pointer.distance(handle) <= JACK_HIT_RADIUS);
-        let color = if self.dragging_handle || hovered {
+        let anchor = self.jack_anchor(image_rect, format, &knobs, self.jack_drag);
+        let hovered = ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|pointer| jack_hit(anchor, pointer).is_some())
+        });
+        let color = if hovered || self.jack_drag.is_some_and(|drag| drag.node_id == node_id) {
             JACK_HOVER
         } else {
             JACK
         };
-        draw_jack(painter, handle, color);
+        draw_jack(painter, anchor, color);
 
-        // The pivot is a lighter dot so the user can see center vs. translate.
-        let pivot = self.world_to_screen_point(image_rect, format, center[0], center[1]);
-        painter.circle_filled(pivot, 2.5, Color32::from_rgb(150, 220, 255));
+        // Release ends the drag; this frame still draws the final value.
+        if ui.input(|input| input.pointer.primary_released()) {
+            self.reset_jack_drag();
+        }
 
         messages
     }
 
+    /// Image-space translate to draw: the in-flight drag value when it belongs
+    /// to `node_id`, otherwise the mirror's value.
+    fn effective_translate(&self, node_id: NodeId, graph_translate: [f32; 4]) -> [f32; 4] {
+        match self.jack_drag.filter(|drag| drag.node_id == node_id) {
+            Some(drag) => [
+                drag.current_translate[0],
+                drag.current_translate[1],
+                graph_translate[2],
+                graph_translate[3],
+            ],
+            None => graph_translate,
+        }
+    }
+
+    /// Screen position of the jack: `center + translate` in image pixels.
+    fn jack_anchor(
+        &self,
+        image_rect: Rect,
+        format: BBox,
+        knobs: &TransformKnobs,
+        drag: Option<JackDragState>,
+    ) -> Pos2 {
+        let translate = match drag.filter(|drag| drag.node_id == knobs.node_id) {
+            Some(drag) => drag.current_translate,
+            None => [knobs.translate[0], knobs.translate[1]],
+        };
+        self.world_to_screen_point(
+            image_rect,
+            format,
+            knobs.center[0] + translate[0],
+            knobs.center[1] + translate[1],
+        )
+    }
+
+    /// Adds one image-space delta to the active drag.
+    ///
+    /// Returns `(before, after)` so the caller can emit an exact undo step.
+    fn accumulate_jack_drag(
+        &mut self,
+        node_id: NodeId,
+        world_delta: Vec2,
+    ) -> Option<([f32; 2], [f32; 2])> {
+        let drag = self
+            .jack_drag
+            .as_mut()
+            .filter(|drag| drag.node_id == node_id)?;
+        let mut dx = world_delta.x;
+        let mut dy = world_delta.y;
+        match drag.axis_constraint {
+            Some(AxisConstraint::X) => dy = 0.0,
+            Some(AxisConstraint::Y) => dx = 0.0,
+            None => {}
+        }
+        if dx == 0.0 && dy == 0.0 {
+            return None;
+        }
+        let before = drag.current_translate;
+        drag.current_translate[0] += dx;
+        drag.current_translate[1] += dy;
+        Some((before, drag.current_translate))
+    }
+
     fn reset_jack_drag(&mut self) {
-        self.dragging_handle = false;
-        self.drag_start_pointer = None;
-        self.drag_base_translate = None;
-        self.drag_preview_translate = None;
+        self.jack_drag = None;
     }
 
     fn upload(&mut self, ctx: &egui::Context, raster: &Raster2D) {
@@ -511,11 +628,17 @@ impl ViewerPanel {
     }
 }
 
+/// Knobs the transform overlay needs from the selected node.
+struct TransformKnobs {
+    node_id: NodeId,
+    translate: [f32; 4],
+    center: [f32; 4],
+    rotate: f32,
+    scale: f32,
+}
+
 /// Reads the selected node's Transform knobs, if it is a `Transform`.
-fn selected_transform(
-    graph: &GraphMirror,
-    selected: Option<NodeId>,
-) -> Option<(NodeId, [f32; 4], [f32; 4])> {
+fn selected_transform(graph: &GraphMirror, selected: Option<NodeId>) -> Option<TransformKnobs> {
     let id = selected?;
     let node = graph.node(id)?;
     if node.kind != "Transform" {
@@ -530,11 +653,101 @@ fn selected_transform(
         Some(KnobValue::Color(color)) => *color,
         _ => [0.0, 0.0, 0.0, 1.0],
     };
-    Some((id, translate, center))
+    let rotate = match node.knobs.get("rotate") {
+        Some(KnobValue::Float(value)) => *value as f32,
+        _ => 0.0,
+    };
+    let scale = match node.knobs.get("scale") {
+        Some(KnobValue::Float(value)) => *value as f32,
+        _ => 1.0,
+    };
+    Some(TransformKnobs {
+        node_id: id,
+        translate,
+        center,
+        rotate,
+        scale,
+    })
 }
 
-/// Draws a Nuke-style transform jack: a ring, a crosshair, and a label.
+/// Forward matrix `T(translate) * T(center) * S(scale) * R(rotate) * T(-center)`.
+///
+/// Mirrors the cartridge's `transform_matrix`, so the overlay box shrinks when
+/// the render shrinks.
+fn forward_transform_matrix(
+    translate: [f32; 4],
+    center: [f32; 4],
+    rotate_degrees: f32,
+    scale: f32,
+) -> Mat3x3 {
+    Mat3x3::translate(translate[0], translate[1])
+        .mul(&Mat3x3::translate(center[0], center[1]))
+        .mul(&Mat3x3::scale(scale, scale))
+        .mul(&Mat3x3::rotate(rotate_degrees.to_radians()))
+        .mul(&Mat3x3::translate(-center[0], -center[1]))
+}
+
+/// Hit-tests the jack and its axis arrows.
+///
+/// `Some(None)` is a free 2D grab, `Some(Some(axis))` is an axis-locked grab,
+/// and `None` means the pointer missed the jack entirely.
+fn jack_hit(anchor: Pos2, pointer: Pos2) -> Option<Option<AxisConstraint>> {
+    if pointer.distance(anchor) <= JACK_HIT_RADIUS {
+        return Some(None);
+    }
+
+    let x_tip = anchor + Vec2::new(JACK_ARROW_LENGTH, 0.0);
+    if distance_to_segment(pointer, anchor, x_tip) <= JACK_SHAFT_HIT_RADIUS {
+        return Some(Some(AxisConstraint::X));
+    }
+
+    let y_tip = anchor - Vec2::new(0.0, JACK_ARROW_LENGTH);
+    if distance_to_segment(pointer, anchor, y_tip) <= JACK_SHAFT_HIT_RADIUS {
+        return Some(Some(AxisConstraint::Y));
+    }
+
+    None
+}
+
+fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
+    let segment = end - start;
+    let length_sq = segment.length_sq();
+    if length_sq <= f32::EPSILON {
+        return point.distance(start);
+    }
+    let t = ((point - start).dot(segment) / length_sq).clamp(0.0, 1.0);
+    point.distance(start + segment * t)
+}
+
+/// Draws a Nuke-style transform jack: red `+X`, green `+Y`, yellow pivot.
 fn draw_jack(painter: &egui::Painter, position: Pos2, color: Color32) {
+    // Nuke +X: red arrow to the right.
+    let x_tip = position + Vec2::new(JACK_ARROW_LENGTH, 0.0);
+    painter.line_segment([position, x_tip], Stroke::new(2.0, JACK_X_COLOR));
+    painter.add(Shape::convex_polygon(
+        vec![
+            x_tip,
+            x_tip - Vec2::new(8.0, 4.5),
+            x_tip - Vec2::new(8.0, -4.5),
+        ],
+        JACK_X_COLOR,
+        Stroke::NONE,
+    ));
+
+    // Nuke +Y: green arrow upward (screen -Y).
+    let y_tip = position - Vec2::new(0.0, JACK_ARROW_LENGTH);
+    painter.line_segment([position, y_tip], Stroke::new(2.0, JACK_Y_COLOR));
+    painter.add(Shape::convex_polygon(
+        vec![
+            y_tip,
+            y_tip + Vec2::new(-4.5, 8.0),
+            y_tip + Vec2::new(4.5, 8.0),
+        ],
+        JACK_Y_COLOR,
+        Stroke::NONE,
+    ));
+
+    // Yellow centre ring + crosshair.
     let stroke = Stroke::new(1.5, color);
     painter.circle_stroke(position, JACK_RADIUS, stroke);
     painter.line_segment(
@@ -601,6 +814,26 @@ fn draw_dashed_rect(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tanova_render::{EdgeMode, Format};
+
+    #[test]
+    fn fit_uses_the_format_not_the_data_window() {
+        let viewer = ViewerPanel::new();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let raster = Raster2D::new(
+            Format::new("fit", 256, 256, 1.0),
+            BBox::new(0, 0, 128, 128),
+            EdgeMode::BlackOutside,
+        );
+
+        let image_rect = viewer.image_rect(rect, &raster);
+        assert!(
+            (image_rect.width() - 576.0).abs() < 1e-3,
+            "Fit must use the 256x256 format, got {}",
+            image_rect.width()
+        );
+        assert!((image_rect.height() - 576.0).abs() < 1e-3);
+    }
 
     #[test]
     fn world_points_map_bottom_left_to_screen() {
@@ -629,5 +862,99 @@ mod tests {
         let world = viewer.screen_delta_to_world(image_rect, format, Vec2::new(10.0, -10.0));
         assert!((world.x - 5.0).abs() < 1e-6, "world x was {}", world.x);
         assert!((world.y - 5.0).abs() < 1e-6, "world y was {}", world.y);
+    }
+
+    #[test]
+    fn forward_bbox_shrinks_and_moves_with_scale_and_translate() {
+        let format = BBox::new(0, 0, 256, 256);
+
+        let shrunk = forward_transform_matrix([0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0], 0.0, 0.5);
+        assert_eq!(
+            format.transform(&shrunk),
+            BBox::new(0, 0, 128, 128),
+            "scale 0.5 must shrink the overlay, never grow it"
+        );
+
+        let moved =
+            forward_transform_matrix([64.0, 64.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0], 0.0, 0.5);
+        assert_eq!(format.transform(&moved), BBox::new(64, 64, 192, 192));
+    }
+
+    #[test]
+    fn jack_drag_accumulates_across_frames_and_inverts_screen_y() {
+        let mut viewer = ViewerPanel::new();
+        let image_rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(200.0, 100.0));
+        let format = BBox::new(0, 0, 100, 50);
+        let node = NodeId(7);
+        viewer.jack_drag = Some(JackDragState {
+            node_id: node,
+            current_translate: [0.0, 0.0],
+            axis_constraint: None,
+        });
+
+        // Screen +Y is down, Nuke +Y is up: an upward drag increases translate Y.
+        let first = viewer.screen_delta_to_world(image_rect, format, Vec2::new(0.0, -10.0));
+        let (before, after) = viewer
+            .accumulate_jack_drag(node, first)
+            .expect("first drag frame");
+        assert_eq!(before, [0.0, 0.0]);
+        assert!(
+            after[1] > 0.0,
+            "screen_dy < 0 must produce translate_y > 0, got {after:?}"
+        );
+        assert!((after[1] - 5.0).abs() < 1e-6, "world y was {}", after[1]);
+
+        // The next frame must build on the first, not reset to the mirror value.
+        let second = viewer.screen_delta_to_world(image_rect, format, Vec2::new(10.0, 0.0));
+        let (before, after) = viewer
+            .accumulate_jack_drag(node, second)
+            .expect("second drag frame");
+        assert!(
+            (before[1] - 5.0).abs() < 1e-6,
+            "second frame must start at the accumulated value, got {before:?}"
+        );
+        assert!((after[0] - 5.0).abs() < 1e-6, "world x was {}", after[0]);
+        assert!((after[1] - 5.0).abs() < 1e-6, "world y was {}", after[1]);
+    }
+
+    #[test]
+    fn jack_axis_constraints_zero_the_other_axis() {
+        let mut viewer = ViewerPanel::new();
+        let node = NodeId(7);
+
+        viewer.jack_drag = Some(JackDragState {
+            node_id: node,
+            current_translate: [1.0, 2.0],
+            axis_constraint: Some(AxisConstraint::X),
+        });
+        let (_, after) = viewer
+            .accumulate_jack_drag(node, Vec2::new(4.0, 9.0))
+            .expect("x drag");
+        assert_eq!(after, [5.0, 2.0]);
+
+        viewer.jack_drag = Some(JackDragState {
+            node_id: node,
+            current_translate: [1.0, 2.0],
+            axis_constraint: Some(AxisConstraint::Y),
+        });
+        let (_, after) = viewer
+            .accumulate_jack_drag(node, Vec2::new(4.0, 9.0))
+            .expect("y drag");
+        assert_eq!(after, [1.0, 11.0]);
+    }
+
+    #[test]
+    fn jack_hit_selects_free_2d_and_each_axis() {
+        let anchor = Pos2::new(100.0, 100.0);
+        assert_eq!(jack_hit(anchor, anchor), Some(None));
+        assert_eq!(
+            jack_hit(anchor, anchor + Vec2::new(30.0, 0.0)),
+            Some(Some(AxisConstraint::X))
+        );
+        assert_eq!(
+            jack_hit(anchor, anchor - Vec2::new(0.0, 30.0)),
+            Some(Some(AxisConstraint::Y))
+        );
+        assert_eq!(jack_hit(anchor, anchor + Vec2::new(80.0, 80.0)), None);
     }
 }

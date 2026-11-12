@@ -36,6 +36,8 @@ fn knob_table_follows_add_set_undo_and_redo() {
     graph.apply_event(&KernelEvent::Applied(UndoableCommand::AddNode {
         id: node,
         kind: "Constant".to_string(),
+        x: 0.0,
+        y: 0.0,
     }));
 
     let expected = (find_cartridge("Constant")

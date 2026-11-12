@@ -241,7 +241,7 @@ Blur {
 }
 
 #[test]
-fn viewer_block_records_its_input_as_the_render_target() {
+fn viewer_block_is_a_real_node_and_becomes_the_render_target() {
     tanova_nodes::ensure_linked();
     let parsed = parse_nk_script(
         r#"
@@ -257,8 +257,50 @@ Viewer {
     )
     .expect("script should parse");
 
-    assert_eq!(parsed.viewer_target, parsed.names.get("Constant1").copied());
-    assert_eq!(parsed.stack_top, None, "Viewer must not be pushed");
+    let viewer = parsed.names["Viewer1"];
+    assert_eq!(
+        parsed.viewer_target,
+        Some(viewer),
+        "the Viewer node itself is the render target"
+    );
+    assert_eq!(
+        parsed.stack_top,
+        Some(viewer),
+        "Viewer participates in the stack like a standard node"
+    );
+}
+
+#[test]
+fn viewer_is_added_to_the_dag_and_wired_to_its_input() {
+    tanova_nodes::ensure_linked();
+    let script = r#"
+Constant {
+ inputs 0
+ name Constant1
+ color {1 0 0 1}
+ format_width 2
+ format_height 2
+}
+Viewer {
+ inputs 1
+ name Viewer1
+}
+"#;
+
+    let mut dag = Dag::new();
+    let parsed = load_nk_into_dag(script, &mut dag).expect("Viewer should load");
+    let constant = parsed.names["Constant1"];
+    let viewer = parsed.names["Viewer1"];
+
+    assert!(dag.node(viewer).is_some(), "Viewer must be in the DAG");
+    let edge = dag
+        .edges()
+        .find(|edge| edge.to_node == viewer)
+        .expect("Viewer input wire");
+    assert_eq!(edge.from_node, constant);
+
+    let raster = render(&mut dag, viewer);
+    assert!((raster.sample_rgba(0, 0)[0] - 1.0).abs() < 1e-4);
 }
 
 #[test]

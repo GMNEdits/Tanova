@@ -4,21 +4,42 @@
 //! Every graph mutation is returned as a [`KernelMessage`] for the app to send
 //! to the background kernel; no DAG is touched on the UI thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use egui::{
-    Align2, Color32, CornerRadius, FontId, Painter, PointerButton, Pos2, Rect, Sense, Shape,
-    Stroke, StrokeKind, Ui, Vec2, epaint::CubicBezierShape,
+    Align2, Color32, CornerRadius, FontId, Key, Modifiers, Painter, PointerButton, Pos2, Rect,
+    Sense, Shape, Stroke, StrokeKind, Ui, Vec2, epaint::CubicBezierShape,
 };
 use tanova_kernel::{
-    KernelEvent, KernelMessage, KnobTable, NodeId, PortId, UndoableCommand, find_cartridge,
+    EdgeSnapshot, KernelEvent, KernelMessage, KnobTable, NodeId, PortId, UndoableCommand,
+    find_cartridge,
 };
+
+use crate::workflow::ViewerWorkflow;
 
 const NODE_W: f32 = 168.0;
 const NODE_H: f32 = 72.0;
 const HEADER_H: f32 = 24.0;
 const PORT_LEAD: f32 = 18.0;
 const GRID_SPACING: f32 = 24.0;
+const CASCADE_X: f32 = 40.0;
+const CASCADE_Y: f32 = 40.0;
+const CASCADE_STEP: f32 = NODE_H + 52.0;
+const MIN_ZOOM: f32 = 0.25;
+const MAX_ZOOM: f32 = 2.5;
+/// Vertical gap used when the Nuke workflow has to create a `Viewer` node.
+const VIEWER_OFFSET: f32 = 120.0;
+
+/// Node kinds offered by the canvas context menu.
+const CONTEXT_MENU_KINDS: &[&str] = &[
+    "Read",
+    "Constant",
+    "Grade",
+    "Transform",
+    "Blur",
+    "Merge2",
+    "Viewer",
+];
 
 const BG: Color32 = Color32::from_rgb(20, 20, 24);
 const GRID_MINOR: Color32 = Color32::from_rgb(32, 32, 38);
@@ -45,6 +66,10 @@ pub struct CanvasNode {
     pub crashed: Option<String>,
     /// UI-side copy of the node's knobs, updated from `KernelEvent`s.
     pub knobs: KnobTable,
+    /// Canvas-space X position carried by the `AddNode` command.
+    pub x: f32,
+    /// Canvas-space Y position carried by the `AddNode` command.
+    pub y: f32,
 }
 
 /// One connection as the UI knows it.
@@ -58,6 +83,13 @@ pub struct CanvasEdge {
     pub to_node: NodeId,
     /// Downstream input port.
     pub to_port: PortId,
+}
+
+impl CanvasEdge {
+    /// Converts to a kernel edge snapshot.
+    pub fn snapshot(self) -> EdgeSnapshot {
+        EdgeSnapshot::new(self.from_node, self.from_port, self.to_node, self.to_port)
+    }
 }
 
 /// UI-side mirror of the kernel graph, built purely from [`KernelEvent`]s.
@@ -105,6 +137,43 @@ impl GraphMirror {
         )
     }
 
+    /// Every edge feeding `id`, in connection order.
+    pub fn incoming_edges(&self, id: NodeId) -> Vec<CanvasEdge> {
+        self.edges
+            .iter()
+            .copied()
+            .filter(|edge| edge.to_node == id)
+            .collect()
+    }
+
+    /// The edge feeding one specific input port, if any.
+    pub fn incoming_edge(&self, to_node: NodeId, to_port: PortId) -> Option<CanvasEdge> {
+        self.edges
+            .iter()
+            .copied()
+            .find(|edge| edge.to_node == to_node && edge.to_port == to_port)
+    }
+
+    /// Builds a full-state `RemoveNode` from the mirrored node and its wires.
+    pub fn removal_command(&self, id: NodeId) -> Option<UndoableCommand> {
+        let node = self.node(id)?;
+        let edges = self
+            .edges
+            .iter()
+            .filter(|edge| edge.from_node == id || edge.to_node == id)
+            .map(|edge| edge.snapshot())
+            .collect();
+
+        Some(UndoableCommand::RemoveNode {
+            id,
+            kind: node.kind.clone(),
+            x: node.x,
+            y: node.y,
+            knobs: Box::new(node.knobs.clone()),
+            edges,
+        })
+    }
+
     /// Folds a kernel event into the mirror.
     pub fn apply_event(&mut self, event: &KernelEvent) {
         match event {
@@ -121,14 +190,16 @@ impl GraphMirror {
                     node.crashed = Some(message.clone());
                 }
             }
-            KernelEvent::CommandFailed { .. } | KernelEvent::EpochChanged(_) => {}
+            KernelEvent::CommandFailed { .. }
+            | KernelEvent::EpochChanged(_)
+            | KernelEvent::ViewerChanged(_) => {}
         }
     }
 
     /// Applies the effective change of one command.
     pub fn apply_command(&mut self, command: &UndoableCommand) {
         match command {
-            UndoableCommand::AddNode { id, kind } => {
+            UndoableCommand::AddNode { id, kind, x, y } => {
                 if !self.nodes.iter().any(|node| node.id == *id) {
                     let knobs = find_cartridge(kind)
                         .map(|descriptor| (descriptor.default_knobs)())
@@ -138,6 +209,8 @@ impl GraphMirror {
                         kind: kind.clone(),
                         crashed: None,
                         knobs,
+                        x: *x,
+                        y: *y,
                     });
                 }
             }
@@ -145,6 +218,36 @@ impl GraphMirror {
                 self.nodes.retain(|node| node.id != *id);
                 self.edges
                     .retain(|edge| edge.from_node != *id && edge.to_node != *id);
+            }
+            UndoableCommand::RestoreNode {
+                id,
+                kind,
+                x,
+                y,
+                knobs,
+                edges,
+            } => {
+                if !self.nodes.iter().any(|node| node.id == *id) {
+                    self.nodes.push(CanvasNode {
+                        id: *id,
+                        kind: kind.clone(),
+                        crashed: None,
+                        knobs: knobs.as_ref().clone(),
+                        x: *x,
+                        y: *y,
+                    });
+                }
+                for edge in edges {
+                    let edge = CanvasEdge {
+                        from_node: edge.from_node,
+                        from_port: edge.from_port,
+                        to_node: edge.to_node,
+                        to_port: edge.to_port,
+                    };
+                    if !self.edges.contains(&edge) {
+                        self.edges.push(edge);
+                    }
+                }
             }
             UndoableCommand::ConnectEdge {
                 from_node,
@@ -191,13 +294,57 @@ impl GraphMirror {
     }
 }
 
-/// An in-progress wire drag from one node's output port.
+/// Which direction a live wire drag is travelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireDrag {
+    /// Dragging a new wire out of a node's bottom output dot toward an input.
+    FromOutput {
+        /// Upstream node the wire starts at.
+        from_node: NodeId,
+        /// Upstream output port (always [`PortId(0)`](PortId)).
+        from_port: PortId,
+    },
+    /// Dragging a new wire out of an empty top input port toward a source.
+    FromInput {
+        /// Downstream node whose port is being filled.
+        to_node: NodeId,
+        /// Downstream input port being filled.
+        to_port: PortId,
+    },
+    /// Ripping an existing wire off its downstream port.
+    ///
+    /// The committed edge is left untouched until release, so `Escape` can
+    /// cancel with zero side effects.
+    Detaching {
+        /// Upstream node the live wire stays anchored to.
+        from_node: NodeId,
+        /// Upstream output port.
+        from_port: PortId,
+        /// Downstream node the wire is currently attached to.
+        orig_to_node: NodeId,
+        /// Downstream input port the wire is currently attached to.
+        orig_to_port: PortId,
+    },
+}
+
+/// A node-menu action chosen from the popup.
 #[derive(Debug, Clone, Copy)]
-pub struct WireDrag {
-    /// Node the wire started from.
-    pub from_node: NodeId,
-    /// Output port the wire started from.
-    pub from_port: PortId,
+enum NodeMenuAction {
+    DisconnectInputs(NodeId),
+    Delete(NodeId),
+}
+
+/// State of the floating Nuke-style `Tab` quick-search popup.
+#[derive(Debug, Clone)]
+pub struct TabSearchState {
+    /// Screen position where the popup is anchored.
+    pub screen_pos: Pos2,
+    /// Canvas position where a spawned node lands.
+    pub world_pos: Pos2,
+    /// Current case-insensitive substring query.
+    pub query: String,
+    /// `true` on the frame the popup opened; requests keyboard focus once.
+    pub just_opened: bool,
 }
 
 /// Visual-only canvas state.
@@ -209,41 +356,120 @@ pub struct NodeCanvasState {
     pub zoom: f32,
     /// Canvas-space top-left position of every node.
     pub positions: HashMap<NodeId, Pos2>,
-    /// Currently selected node.
-    pub selected: Option<NodeId>,
-    /// Active output-to-input wire drag.
-    pub wire_drag: Option<WireDrag>,
+    /// Every selected node. A `HashSet` for O(1) toggles; order never matters
+    /// because all iteration that needs order sorts first.
+    pub selected_nodes: HashSet<NodeId>,
+    /// The deterministic single active node (properties, transform jack, `1`).
+    pub primary_selected: Option<NodeId>,
+    /// In-progress wire drag.
+    pub active_wire_drag: Option<WireDrag>,
+    /// In-progress box selection, stored as `(start_screen, current_screen)`.
+    pub box_selection: Option<(Pos2, Pos2)>,
+    /// Open `Tab` quick-search popup, if any.
+    pub tab_search: Option<TabSearchState>,
+    /// Whether the physical `Tab` key was held down last frame.
+    ///
+    /// `InputState::keys_down` survives `consume_key`, so the rising edge still
+    /// fires even when egui's focus pass has already eaten the key event.
+    pub was_tab_down: bool,
     drag_node: Option<NodeId>,
+    box_dragging: bool,
     panning: bool,
+    context_menu_pos: Option<Pos2>,
+    context_menu_open: bool,
+    node_menu_pos: Option<Pos2>,
+    node_menu_node: Option<NodeId>,
+    node_menu_open: bool,
 }
 
 impl Default for NodeCanvasState {
     fn default() -> Self {
         Self {
-            pan: Vec2::new(80.0, 48.0),
+            pan: Vec2::ZERO,
             zoom: 1.0,
             positions: HashMap::new(),
-            selected: None,
-            wire_drag: None,
+            selected_nodes: HashSet::new(),
+            primary_selected: None,
+            active_wire_drag: None,
+            box_selection: None,
+            tab_search: None,
+            was_tab_down: false,
             drag_node: None,
+            box_dragging: false,
             panning: false,
+            context_menu_pos: None,
+            context_menu_open: false,
+            node_menu_pos: None,
+            node_menu_node: None,
+            node_menu_open: false,
         }
     }
 }
 
 impl NodeCanvasState {
-    /// Assigns vertical B-pipe positions to nodes that do not have one yet.
+    /// Maps a screen-space point into canvas space.
+    pub fn screen_to_world(&self, viewport: Rect, pos: Pos2) -> Pos2 {
+        Pos2::new(
+            (pos.x - viewport.min.x - self.pan.x) / self.zoom,
+            (pos.y - viewport.min.y - self.pan.y) / self.zoom,
+        )
+    }
+
+    /// Maps a canvas-space point back into screen space.
+    pub fn world_to_screen(&self, viewport: Rect, pos: Pos2) -> Pos2 {
+        Pos2::new(
+            viewport.min.x + self.pan.x + pos.x * self.zoom,
+            viewport.min.y + self.pan.y + pos.y * self.zoom,
+        )
+    }
+
+    /// Seeds a position for every mirrored node from its `AddNode` coordinates.
     pub fn layout_nodes(&mut self, graph: &GraphMirror) {
-        for (index, node) in graph.nodes().iter().enumerate() {
+        for node in graph.nodes() {
             self.positions
                 .entry(node.id)
-                .or_insert_with(|| Pos2::new(0.0, index as f32 * (NODE_H + 52.0)));
+                .or_insert_with(|| Pos2::new(node.x, node.y));
         }
+    }
+
+    /// `true` while the `Tab` quick-search popup owns the keyboard.
+    pub fn is_search_open(&self) -> bool {
+        self.tab_search.is_some()
     }
 
     /// Canvas-space position of a node.
     pub fn node_position(&self, id: NodeId) -> Option<Pos2> {
         self.positions.get(&id).copied()
+    }
+
+    /// Collects every node intersecting a screen-space box, sorted by id.
+    ///
+    /// The box corners are converted into canvas space *before* the test, so
+    /// panning and zooming can never desynchronise the selection.
+    pub fn nodes_in_screen_box(
+        &self,
+        graph: &GraphMirror,
+        viewport: Rect,
+        start: Pos2,
+        current: Pos2,
+    ) -> Vec<NodeId> {
+        let selection = Rect::from_two_pos(
+            self.screen_to_world(viewport, start),
+            self.screen_to_world(viewport, current),
+        );
+
+        let mut hits: Vec<NodeId> = graph
+            .nodes()
+            .iter()
+            .filter(|node| {
+                self.positions.get(&node.id).is_some_and(|position| {
+                    Rect::from_min_size(*position, Vec2::new(NODE_W, NODE_H)).intersects(selection)
+                })
+            })
+            .map(|node| node.id)
+            .collect();
+        hits.sort();
+        hits
     }
 }
 
@@ -256,21 +482,21 @@ impl NodeCanvas {
         ui: &mut Ui,
         state: &mut NodeCanvasState,
         graph: &GraphMirror,
-        cartridge_kinds: &[&'static str],
         viewer: Option<NodeId>,
+        workflow: ViewerWorkflow,
     ) -> Vec<KernelMessage> {
         let mut messages = Vec::new();
+        let mut toolbar_add: Option<&'static str> = None;
 
         ui.horizontal(|ui| {
-            ui.label("Add:");
-            for kind in cartridge_kinds {
-                if ui.button(*kind).clicked() {
-                    messages.push(KernelMessage::Execute(UndoableCommand::AddNode {
-                        id: graph.next_node_id(),
-                        kind: (*kind).to_string(),
-                    }));
+            ui.menu_button("+ Add Node", |ui| {
+                for kind in spawnable_kinds(workflow) {
+                    if ui.button(kind).clicked() {
+                        toolbar_add = Some(kind);
+                        ui.close();
+                    }
                 }
-            }
+            });
             ui.separator();
             if ui.button("Undo").clicked() {
                 messages.push(KernelMessage::Undo);
@@ -278,13 +504,10 @@ impl NodeCanvas {
             if ui.button("Redo").clicked() {
                 messages.push(KernelMessage::Redo);
             }
-            if ui.button("Bump Epoch").clicked() {
-                messages.push(KernelMessage::BumpEpoch);
-            }
             ui.separator();
             if ui.button("View (1)").clicked() {
-                if let Some(selected) = state.selected {
-                    messages.push(KernelMessage::SetViewerNode(Some(selected)));
+                if let Some(selected) = state.primary_selected {
+                    messages.push(viewer_message(graph, workflow, selected));
                 }
             }
             if let Some(viewer) = viewer {
@@ -292,8 +515,12 @@ impl NodeCanvas {
             }
             ui.separator();
             ui.label(format!("zoom {:.0}%", state.zoom * 100.0));
-            if let Some(selected) = state.selected {
-                ui.label(format!("selected #{}", selected.0));
+            if !state.selected_nodes.is_empty() {
+                ui.label(format!(
+                    "{} selected (#{})",
+                    state.selected_nodes.len(),
+                    state.primary_selected.map_or(0, |id| id.0)
+                ));
             }
         });
         ui.separator();
@@ -302,17 +529,65 @@ impl NodeCanvas {
         if rect.width() < 8.0 || rect.height() < 8.0 {
             return messages;
         }
-        let response = ui.allocate_rect(rect, Sense::click_and_drag());
+        // Deliberately not `Sense::FOCUSABLE`: the canvas must never hold the
+        // keyboard, otherwise `memory.focused()` would stay set and every
+        // Delete/`1` press would look like the artist is typing in a field.
+        let response = ui.allocate_rect(rect, Sense::CLICK | Sense::DRAG);
         let painter = ui.painter_at(rect);
 
-        let pointer_pos = ui.input(|input| input.pointer.interact_pos());
+        let pointer_pos = ui.ctx().input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .or_else(|| input.pointer.latest_pos())
+        });
         let pointer_delta = ui.input(|input| input.pointer.delta());
         let primary_pressed = ui.input(|input| input.pointer.primary_pressed());
         let primary_down = ui.input(|input| input.pointer.primary_down());
         let primary_released = ui.input(|input| input.pointer.primary_released());
         let middle_down = ui.input(|input| input.pointer.button_down(PointerButton::Middle));
-        let secondary_down = ui.input(|input| input.pointer.button_down(PointerButton::Secondary));
         let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+        let shift = ui.input(|input| input.modifiers.shift);
+        let escape_pressed = ui.input(|input| input.key_pressed(Key::Escape));
+
+        state.layout_nodes(graph);
+
+        // Physical `Tab` opens (or toggles) the quick search. `consume_key`
+        // alone is not enough: egui's focus pass may have already eaten the
+        // event, so the rising edge of `keys_down` is the reliable signal.
+        let tab_event = ui
+            .ctx()
+            .input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab));
+        let tab_down = ui.ctx().input(|input| input.key_down(Key::Tab));
+        let tab_just_pressed = tab_event || (tab_down && !state.was_tab_down);
+        state.was_tab_down = tab_down;
+
+        let over_canvas = pointer_pos.is_none_or(|pointer| rect.contains(pointer));
+        if tab_just_pressed && state.active_wire_drag.is_none() {
+            if state.tab_search.is_some() {
+                state.tab_search = None;
+            } else if over_canvas {
+                // A toolbar button may hold focus; the popup needs the
+                // keyboard, so hand it over before opening.
+                ui.ctx().memory_mut(|memory| {
+                    if let Some(id) = memory.focused() {
+                        memory.surrender_focus(id);
+                    }
+                });
+                let raw_anchor = pointer_pos.unwrap_or_else(|| rect.center());
+                let anchor = Pos2::new(
+                    raw_anchor.x.clamp(rect.left(), rect.right()),
+                    raw_anchor.y.clamp(rect.top(), rect.bottom()),
+                );
+                state.tab_search = Some(TabSearchState {
+                    screen_pos: anchor,
+                    world_pos: state.screen_to_world(rect, raw_anchor),
+                    query: String::new(),
+                    just_opened: true,
+                });
+            }
+        }
+        let search_open = state.is_search_open();
 
         if response.hovered() && scroll.abs() > 0.0 {
             if let Some(pointer) = pointer_pos {
@@ -320,56 +595,176 @@ impl NodeCanvas {
             }
         }
 
-        state.layout_nodes(graph);
+        // Toolbar "Add" buttons cascade down the canvas.
+        if let Some(kind) = toolbar_add {
+            let position = Pos2::new(
+                CASCADE_X,
+                CASCADE_Y + graph.node_count() as f32 * CASCADE_STEP,
+            );
+            messages.push(add_node_message(graph, kind, position));
+        }
+
+        // Escape aborts a wire drag with zero kernel traffic.
+        if escape_pressed && state.active_wire_drag.is_some() {
+            messages.extend(cancel_wire_drag(state));
+        }
 
         if primary_pressed && response.hovered() {
+            // Any click on the canvas dismisses open menus. Clicks inside a
+            // popup never reach this response, so menu items still work.
+            state.context_menu_open = false;
+            state.context_menu_pos = None;
+            state.node_menu_open = false;
+            state.node_menu_pos = None;
+            state.node_menu_node = None;
+
+            // Clicking the graph also ends knob editing, so `Delete` removes
+            // the selection instead of a character in the last focused field.
+            ui.memory_mut(|memory| memory.stop_text_input());
+
             if let Some(pointer) = pointer_pos {
-                if let Some(node) = hit_node(state, graph, pointer, rect) {
-                    state.selected = Some(node);
-                    let node_rect = node_screen_rect(state, node, rect);
-                    if pointer.distance(output_port(node_rect, state.zoom))
-                        <= port_hit_radius(state.zoom)
-                    {
-                        state.wire_drag = Some(WireDrag {
-                            from_node: node,
-                            from_port: PortId(0),
-                        });
-                    } else {
+                if let Some((to_node, to_port)) = hit_input_port(state, graph, pointer, rect) {
+                    // Grabbing a connected port rips the wire off, but the
+                    // committed edge is only removed on release.
+                    state.active_wire_drag = match graph.incoming_edge(to_node, to_port) {
+                        Some(edge) => Some(WireDrag::Detaching {
+                            from_node: edge.from_node,
+                            from_port: edge.from_port,
+                            orig_to_node: to_node,
+                            orig_to_port: to_port,
+                        }),
+                        None => Some(WireDrag::FromInput { to_node, to_port }),
+                    };
+                } else if let Some(from_node) = hit_output_port(state, graph, pointer, rect) {
+                    state.active_wire_drag = Some(WireDrag::FromOutput {
+                        from_node,
+                        from_port: PortId(0),
+                    });
+                } else if let Some(node) = hit_node(state, graph, pointer, rect) {
+                    apply_node_click(state, node, shift);
+                    if state.selected_nodes.contains(&node) {
                         state.drag_node = Some(node);
                     }
                 } else {
-                    state.selected = None;
+                    // Empty background: start a world-space box selection.
+                    if !shift {
+                        state.selected_nodes.clear();
+                        state.primary_selected = None;
+                    }
+                    state.box_selection = Some((pointer, pointer));
+                    state.box_dragging = true;
+                    state.drag_node = None;
                 }
             }
         }
 
         if primary_down {
-            if let Some(node) = state.drag_node {
-                if let Some(position) = state.positions.get_mut(&node) {
-                    *position += pointer_delta / state.zoom;
+            if state.box_dragging {
+                if let Some(pointer) = pointer_pos {
+                    if let Some((start, _)) = state.box_selection {
+                        state.box_selection = Some((start, pointer));
+                    }
+                }
+            } else if let Some(anchor) = state.drag_node {
+                if state.selected_nodes.contains(&anchor) {
+                    // Group drag: every selected node moves together in world
+                    // units, so the motion matches the cursor at any zoom.
+                    let delta = pointer_delta / state.zoom.max(MIN_ZOOM);
+                    for id in &state.selected_nodes {
+                        if let Some(position) = state.positions.get_mut(id) {
+                            *position += delta;
+                        }
+                    }
                 }
             }
         }
 
         if primary_released {
-            if let Some(drag) = state.wire_drag.take() {
+            if let Some(drag) = state.active_wire_drag.take() {
                 if let Some(pointer) = pointer_pos {
-                    if let Some((to_node, to_port)) = hit_input_port(state, graph, pointer, rect) {
-                        if to_node != drag.from_node {
-                            messages.push(KernelMessage::Execute(UndoableCommand::ConnectEdge {
-                                from_node: drag.from_node,
-                                from_port: drag.from_port,
-                                to_node,
-                                to_port,
-                            }));
+                    let target_input = hit_input_port(state, graph, pointer, rect).or_else(|| {
+                        hit_node(state, graph, pointer, rect)
+                            .filter(|id| node_accepts_inputs(graph, *id))
+                            .map(|id| (id, PortId(0)))
+                    });
+                    let source_node = hit_output_port(state, graph, pointer, rect)
+                        .or_else(|| hit_node(state, graph, pointer, rect));
+
+                    let mut commands = resolve_wire_release(drag, target_input, source_node);
+
+                    // Dropping onto an occupied input replaces its wire. Emit
+                    // the disconnect first so `Ctrl+Z` restores the previous
+                    // connection instead of leaving the port empty.
+                    if let Some(UndoableCommand::ConnectEdge {
+                        from_node,
+                        from_port,
+                        to_node,
+                        to_port,
+                    }) = commands.last().cloned()
+                    {
+                        if let Some(existing) = graph.incoming_edge(to_node, to_port) {
+                            if existing.from_node != from_node || existing.from_port != from_port {
+                                let index = commands.len() - 1;
+                                commands.insert(
+                                    index,
+                                    UndoableCommand::DisconnectEdge {
+                                        from_node: existing.from_node,
+                                        from_port: existing.from_port,
+                                        to_node: existing.to_node,
+                                        to_port: existing.to_port,
+                                    },
+                                );
+                            }
+                        }
+                    }
+
+                    for command in commands {
+                        let viewer_connect = match &command {
+                            UndoableCommand::ConnectEdge { to_node, .. } => Some(*to_node),
+                            _ => None,
+                        };
+                        messages.push(KernelMessage::Execute(command));
+
+                        // Nuke workflow: wiring a physical Viewer also makes
+                        // the viewer panel look through it immediately.
+                        if workflow.exposes_physical_viewer() {
+                            if let Some(to_node) = viewer_connect {
+                                if graph
+                                    .node(to_node)
+                                    .is_some_and(|node| node.kind == "Viewer")
+                                {
+                                    messages.push(KernelMessage::SetViewerNode(Some(to_node)));
+                                }
+                            }
                         }
                     }
                 }
             }
+
+            if state.box_dragging {
+                state.box_dragging = false;
+                if let Some((start, current)) = state.box_selection.take() {
+                    let hits = state.nodes_in_screen_box(graph, rect, start, current);
+                    if shift {
+                        for id in &hits {
+                            state.selected_nodes.insert(*id);
+                        }
+                        if let Some(first) = hits.first() {
+                            state.primary_selected = Some(*first);
+                        } else if state.primary_selected.is_none() {
+                            state.primary_selected = state.selected_nodes.iter().min().copied();
+                        }
+                    } else {
+                        state.selected_nodes = hits.iter().copied().collect();
+                        state.primary_selected = hits.first().copied();
+                    }
+                }
+            }
+
             state.drag_node = None;
         }
 
-        if middle_down || secondary_down {
+        if middle_down {
             if response.hovered() || state.panning {
                 state.panning = true;
                 state.pan += pointer_delta;
@@ -378,28 +773,187 @@ impl NodeCanvas {
             state.panning = false;
         }
 
-        // Nuke binds `1` to "view this node".
-        if ui.input(|input| input.key_pressed(egui::Key::Num1))
-            && !ui.ctx().egui_wants_keyboard_input()
-        {
-            if let Some(selected) = state.selected {
-                messages.push(KernelMessage::SetViewerNode(Some(selected)));
+        // Right-click: cancel a live wire with no side effects, otherwise open
+        // the node menu (over a body) or the spawn menu (over background).
+        if response.secondary_clicked() {
+            if state.active_wire_drag.is_some() {
+                messages.extend(cancel_wire_drag(state));
+            } else if let Some(pointer) = pointer_pos {
+                if let Some(node) = hit_node(state, graph, pointer, rect) {
+                    if !state.selected_nodes.contains(&node) {
+                        state.selected_nodes.clear();
+                        state.selected_nodes.insert(node);
+                    }
+                    state.primary_selected = Some(node);
+                    state.context_menu_open = false;
+                    state.context_menu_pos = None;
+                    state.node_menu_node = Some(node);
+                    state.node_menu_pos = Some(pointer);
+                    state.node_menu_open = true;
+                } else {
+                    state.node_menu_open = false;
+                    state.node_menu_pos = None;
+                    state.node_menu_node = None;
+                    state.context_menu_pos = Some(pointer);
+                    state.context_menu_open = true;
+                }
             }
+        }
+
+        // Node-specific menu.
+        if let Some(anchor) = state.node_menu_pos {
+            let node_id = state.node_menu_node;
+            let mut open = state.node_menu_open;
+            let mut action: Option<NodeMenuAction> = None;
+
+            egui::Popup::context_menu(&response)
+                .at_position(anchor)
+                .open_bool(&mut open)
+                .show(|ui| {
+                    if let Some(node_id) = node_id {
+                        ui.label(format!("Node #{}", node_id.0));
+                        ui.separator();
+                        if ui.button("Disconnect Inputs").clicked() {
+                            action = Some(NodeMenuAction::DisconnectInputs(node_id));
+                            ui.close();
+                        }
+                        if ui.button("Delete Node").clicked() {
+                            action = Some(NodeMenuAction::Delete(node_id));
+                            ui.close();
+                        }
+                    }
+                });
+
+            match action {
+                Some(NodeMenuAction::DisconnectInputs(id)) => {
+                    for edge in graph.incoming_edges(id) {
+                        messages.push(KernelMessage::Execute(UndoableCommand::DisconnectEdge {
+                            from_node: edge.from_node,
+                            from_port: edge.from_port,
+                            to_node: edge.to_node,
+                            to_port: edge.to_port,
+                        }));
+                    }
+                    state.node_menu_open = false;
+                    state.node_menu_pos = None;
+                    state.node_menu_node = None;
+                }
+                Some(NodeMenuAction::Delete(id)) => {
+                    if let Some(command) = graph.removal_command(id) {
+                        messages.push(KernelMessage::Execute(command));
+                    }
+                    state.selected_nodes.remove(&id);
+                    if state.primary_selected == Some(id) {
+                        state.primary_selected = state.selected_nodes.iter().min().copied();
+                    }
+                    state.node_menu_open = false;
+                    state.node_menu_pos = None;
+                    state.node_menu_node = None;
+                }
+                None => {
+                    state.node_menu_open = open;
+                    if !open {
+                        state.node_menu_pos = None;
+                        state.node_menu_node = None;
+                    }
+                }
+            }
+        }
+
+        // Background spawn menu. Fusion hides the physical Viewer so the two
+        // paradigms never compete in the same menu.
+        if let Some(anchor) = state.context_menu_pos {
+            let mut open = state.context_menu_open;
+            let mut chosen: Option<&'static str> = None;
+
+            egui::Popup::context_menu(&response)
+                .at_position(anchor)
+                .open_bool(&mut open)
+                .show(|ui| {
+                    ui.label("Add node");
+                    ui.separator();
+                    for kind in spawnable_kinds(workflow) {
+                        if ui.button(kind).clicked() {
+                            chosen = Some(kind);
+                            ui.close();
+                        }
+                    }
+                });
+
+            if let Some(kind) = chosen {
+                let position = state.screen_to_world(rect, anchor);
+                messages.push(add_node_message(graph, kind, position));
+                state.context_menu_open = false;
+                state.context_menu_pos = None;
+            } else {
+                state.context_menu_open = open;
+                if !open {
+                    state.context_menu_pos = None;
+                }
+            }
+        }
+
+        // Focus-safe shortcuts: never act while a text field or a numeric drag
+        // value owns the keyboard.
+        let keyboard_busy = keyboard_is_busy(ui);
+
+        // Nuke binds `1` to "view this node".
+        if ui.input(|input| input.key_pressed(Key::Num1)) && !keyboard_busy && !search_open {
+            if let Some(selected) = state.primary_selected {
+                messages.push(viewer_message(graph, workflow, selected));
+            }
+        }
+
+        let delete_pressed =
+            ui.input(|input| input.key_pressed(Key::Delete) || input.key_pressed(Key::Backspace));
+        if delete_pressed
+            && !keyboard_busy
+            && !search_open
+            && state.active_wire_drag.is_none()
+            && state.box_selection.is_none()
+        {
+            let mut ids: Vec<NodeId> = state.selected_nodes.iter().copied().collect();
+            ids.sort();
+            for id in ids {
+                if let Some(command) = graph.removal_command(id) {
+                    messages.push(KernelMessage::Execute(command));
+                }
+            }
+            state.selected_nodes.clear();
+            state.primary_selected = None;
         }
 
         draw_grid(&painter, rect, state.pan, state.zoom);
 
+        // A detaching wire hides its committed edge until release.
+        let detached = match state.active_wire_drag {
+            Some(WireDrag::Detaching {
+                orig_to_node,
+                orig_to_port,
+                ..
+            }) => Some((orig_to_node, orig_to_port)),
+            _ => None,
+        };
+
         for edge in graph.edges() {
-            let (Some(from_position), Some(to_position)) = (
+            if detached == Some((edge.to_node, edge.to_port)) {
+                continue;
+            }
+            let (Some(from_position), Some(to_position), Some(to_node)) = (
                 state.node_position(edge.from_node),
                 state.node_position(edge.to_node),
+                graph.node(edge.to_node),
             ) else {
                 continue;
             };
-            let from = output_port(node_screen_rect_at(state, from_position, rect), state.zoom);
-            let to = input_port(node_screen_rect_at(state, to_position, rect));
-            let label = pipe_label(edge.to_port);
-            draw_wire(&painter, from, to, state.zoom, WIRE, Some(&label));
+            let from_rect = node_screen_rect_at(state, from_position, rect);
+            let to_rect = node_screen_rect_at(state, to_position, rect);
+            let from = output_port(from_rect, state.zoom);
+            let port_count = input_port_count(&to_node.kind);
+            let to = input_port(to_rect, edge.to_port, port_count);
+            let label = input_port_label(&to_node.kind, port_count, edge.to_port.0 as usize);
+            let label = if label.is_empty() { None } else { Some(label) };
+            draw_wire(&painter, from, to, state.zoom, WIRE, label);
         }
 
         for node in graph.nodes() {
@@ -407,29 +961,59 @@ impl NodeCanvas {
                 continue;
             };
             let node_rect = node_screen_rect_at(state, position, rect);
+            let active_port = match state.active_wire_drag {
+                Some(WireDrag::FromInput { to_node, to_port }) if to_node == node.id => {
+                    Some(to_port)
+                }
+                Some(WireDrag::Detaching {
+                    orig_to_node,
+                    orig_to_port,
+                    ..
+                }) if orig_to_node == node.id => Some(orig_to_port),
+                _ => None,
+            };
+            let is_viewer = viewer == Some(node.id)
+                && (workflow != ViewerWorkflow::Nuke || node.kind == "Viewer");
             draw_node(
                 &painter,
                 node_rect,
                 node,
-                state.selected == Some(node.id),
-                viewer == Some(node.id),
+                state.selected_nodes.contains(&node.id),
+                is_viewer,
                 state.zoom,
+                active_port,
             );
         }
 
-        if let Some(drag) = state.wire_drag {
-            if let Some(pointer) = pointer_pos {
-                if let Some(position) = state.node_position(drag.from_node) {
-                    let from = output_port(node_screen_rect_at(state, position, rect), state.zoom);
-                    draw_wire(&painter, from, pointer, state.zoom, WIRE_ACTIVE, None);
-                }
+        if let Some(pointer) = pointer_pos {
+            if let Some((from, to)) = live_wire_points(state, graph, rect, pointer) {
+                draw_wire(&painter, from, to, state.zoom, WIRE_ACTIVE, None);
             }
+        }
+
+        if let Some((start, current)) = state.box_selection {
+            let selection = Rect::from_two_pos(start, current);
+            painter.rect_filled(
+                selection,
+                0,
+                Color32::from_rgba_unmultiplied(90, 190, 255, 28),
+            );
+            painter.rect_stroke(
+                selection,
+                0,
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 200, 255, 170)),
+                StrokeKind::Inside,
+            );
+        }
+
+        if let Some(message) = draw_tab_search(ui, state, graph, workflow) {
+            messages.push(message);
         }
 
         painter.text(
             rect.left_bottom() + Vec2::new(12.0, -10.0),
             Align2::LEFT_BOTTOM,
-            "MMB/RMB drag: pan  •  Wheel: zoom  •  Drag output to input: connect",
+            "Tab: search  •  MMB: pan  •  Wheel: zoom  •  Shift: multi-select  •  Drag wire: connect/rip  •  RMB: menu  •  Del: remove",
             FontId::proportional(11.0),
             Color32::from_gray(110),
         );
@@ -438,16 +1022,312 @@ impl NodeCanvas {
     }
 }
 
+/// True when a text field or any focused widget owns the keyboard.
+///
+/// Deletion and the `1` hotkey must be inert while the artist is typing in a
+/// knob field, otherwise `Backspace` would silently delete the selection.
+fn keyboard_is_busy(ui: &Ui) -> bool {
+    let ctx = ui.ctx();
+    ctx.egui_wants_keyboard_input()
+        || ctx.text_edit_focused()
+        || ui.memory(|memory| memory.focused().is_some())
+}
+
+/// User-facing node kinds for the active workflow.
+///
+/// `Dummy` stays registered for cartridge tests but is never offered to an
+/// artist. The physical `Viewer` only exists in the Nuke workflow.
+pub fn spawnable_kinds(workflow: ViewerWorkflow) -> Vec<&'static str> {
+    CONTEXT_MENU_KINDS
+        .iter()
+        .copied()
+        .filter(|kind| *kind != "Dummy")
+        .filter(|kind| *kind != "Viewer" || workflow.exposes_physical_viewer())
+        .collect()
+}
+
+/// Case-insensitive substring filter over [`spawnable_kinds`].
+pub fn matching_kinds(workflow: ViewerWorkflow, query: &str) -> Vec<&'static str> {
+    let needle = query.trim().to_ascii_lowercase();
+    spawnable_kinds(workflow)
+        .into_iter()
+        .filter(|kind| needle.is_empty() || kind.to_ascii_lowercase().contains(&needle))
+        .collect()
+}
+
+/// Message that enforces the Nuke binding rule after a workflow switch.
+///
+/// Entering Nuke mode may only bind a physical `Viewer`. If the current target
+/// is a plain node the binding moves to an existing `Viewer`, or clears when
+/// the graph has none so the viewer goes blank.
+pub fn nuke_workflow_binding_message(
+    graph: &GraphMirror,
+    current: Option<NodeId>,
+) -> KernelMessage {
+    if current
+        .and_then(|id| graph.node(id))
+        .is_some_and(|node| node.kind == "Viewer")
+    {
+        return KernelMessage::SetViewerNode(current);
+    }
+    let viewer = graph
+        .nodes()
+        .iter()
+        .find(|node| node.kind == "Viewer")
+        .map(|node| node.id);
+    KernelMessage::SetViewerNode(viewer)
+}
+
+/// Draws the `Tab` quick-search popup and returns a spawn command if chosen.
+fn draw_tab_search(
+    ui: &mut Ui,
+    state: &mut NodeCanvasState,
+    graph: &GraphMirror,
+    workflow: ViewerWorkflow,
+) -> Option<KernelMessage> {
+    state.tab_search.as_ref()?;
+    if ui.input(|input| input.key_pressed(Key::Escape)) {
+        state.tab_search = None;
+        return None;
+    }
+
+    let mut search = state.tab_search.take()?;
+    let just_opened = search.just_opened;
+    search.just_opened = false;
+    // A stray tab/newline must never leak into the query string.
+    search.query.retain(|c| c != '\t' && c != '\n' && c != '\r');
+
+    let mut spawn: Option<&'static str> = None;
+
+    let area = egui::Area::new(egui::Id::unique("tanova_tab_search"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(search.screen_pos)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(200.0);
+                let text = ui.add(
+                    egui::TextEdit::singleline(&mut search.query)
+                        .hint_text("Search nodes…")
+                        .desired_width(190.0),
+                );
+                // Enter spawns the first match; otherwise keep the keyboard
+                // inside the popup even after a Tab press or a canvas click.
+                if ui.input(|input| input.key_pressed(Key::Enter)) {
+                    spawn = matching_kinds(workflow, &search.query).first().copied();
+                } else if !text.has_focus() {
+                    text.request_focus();
+                }
+                ui.separator();
+                let matches = matching_kinds(workflow, &search.query);
+                if matches.is_empty() {
+                    ui.weak("No matching node");
+                } else {
+                    for kind in matches {
+                        if ui.button(kind).clicked() {
+                            spawn = Some(kind);
+                        }
+                    }
+                }
+            });
+        });
+
+    // Clicking outside dismisses the popup, but never the click that opened it.
+    let mut close = false;
+    if !just_opened && ui.input(|input| input.pointer.any_pressed()) {
+        if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
+            if !area.response.rect.contains(pointer) {
+                close = true;
+            }
+        }
+    }
+
+    if let Some(kind) = spawn {
+        state.tab_search = None;
+        return Some(add_node_message(graph, kind, search.world_pos));
+    }
+    if close {
+        state.tab_search = None;
+    } else {
+        state.tab_search = Some(search);
+    }
+    None
+}
+
+/// Builds the viewer message for the active workflow.
+fn viewer_message(graph: &GraphMirror, workflow: ViewerWorkflow, node: NodeId) -> KernelMessage {
+    match workflow {
+        ViewerWorkflow::Fusion => KernelMessage::SetViewerNode(Some(node)),
+        ViewerWorkflow::Nuke => {
+            let (x, y) = graph
+                .node(node)
+                .map(|node| (node.x, node.y))
+                .unwrap_or((0.0, 0.0));
+            KernelMessage::RouteNukeViewer {
+                target_node: node,
+                fallback_pos: (x, y + VIEWER_OFFSET),
+            }
+        }
+    }
+}
+
+fn add_node_message(graph: &GraphMirror, kind: &str, position: Pos2) -> KernelMessage {
+    KernelMessage::Execute(UndoableCommand::AddNode {
+        id: graph.next_node_id(),
+        kind: kind.to_string(),
+        x: position.x,
+        y: position.y,
+    })
+}
+
+/// Applies one click to the deterministic multi-selection.
+fn apply_node_click(state: &mut NodeCanvasState, id: NodeId, shift: bool) {
+    if shift {
+        if state.selected_nodes.remove(&id) {
+            if state.primary_selected == Some(id) {
+                state.primary_selected = state.selected_nodes.iter().min().copied();
+            }
+        } else {
+            state.selected_nodes.insert(id);
+            state.primary_selected = Some(id);
+        }
+    } else {
+        state.primary_selected = Some(id);
+        // Clicking inside an existing multi-selection keeps it intact so the
+        // following drag moves the whole group.
+        if !state.selected_nodes.contains(&id) {
+            state.selected_nodes.clear();
+            state.selected_nodes.insert(id);
+        }
+    }
+}
+
+/// Cancels a live wire drag. Returns no messages by construction.
+fn cancel_wire_drag(state: &mut NodeCanvasState) -> Vec<KernelMessage> {
+    state.active_wire_drag = None;
+    Vec::new()
+}
+
+/// Resolves a wire release into kernel commands.
+///
+/// `target_input` is the input port under the cursor (or the body of a node
+/// that accepts inputs, defaulted to port 0); `source_node` is the node whose
+/// output dot or body is under the cursor.
+fn resolve_wire_release(
+    drag: WireDrag,
+    target_input: Option<(NodeId, PortId)>,
+    source_node: Option<NodeId>,
+) -> Vec<UndoableCommand> {
+    match drag {
+        WireDrag::FromOutput {
+            from_node,
+            from_port,
+        } => match target_input {
+            Some((to_node, to_port)) if to_node != from_node => {
+                vec![UndoableCommand::ConnectEdge {
+                    from_node,
+                    from_port,
+                    to_node,
+                    to_port,
+                }]
+            }
+            _ => Vec::new(),
+        },
+        WireDrag::FromInput { to_node, to_port } => match source_node {
+            Some(from_node) if from_node != to_node => {
+                vec![UndoableCommand::ConnectEdge {
+                    from_node,
+                    from_port: PortId(0),
+                    to_node,
+                    to_port,
+                }]
+            }
+            _ => Vec::new(),
+        },
+        WireDrag::Detaching {
+            from_node,
+            from_port,
+            orig_to_node,
+            orig_to_port,
+        } => {
+            let disconnect = UndoableCommand::DisconnectEdge {
+                from_node,
+                from_port,
+                to_node: orig_to_node,
+                to_port: orig_to_port,
+            };
+
+            match target_input {
+                Some((new_to_node, new_to_port)) if new_to_node != from_node => {
+                    if new_to_node == orig_to_node && new_to_port == orig_to_port {
+                        // Dropped back where it started: the committed edge is
+                        // still valid, so this is a no-op.
+                        Vec::new()
+                    } else {
+                        vec![
+                            disconnect,
+                            UndoableCommand::ConnectEdge {
+                                from_node,
+                                from_port,
+                                to_node: new_to_node,
+                                to_port: new_to_port,
+                            },
+                        ]
+                    }
+                }
+                // Empty canvas, the source itself, or an invalid target.
+                _ => vec![disconnect],
+            }
+        }
+    }
+}
+
+/// Screen-space endpoints of the live wire, if a drag is active.
+fn live_wire_points(
+    state: &NodeCanvasState,
+    graph: &GraphMirror,
+    rect: Rect,
+    pointer: Pos2,
+) -> Option<(Pos2, Pos2)> {
+    match state.active_wire_drag? {
+        WireDrag::FromOutput { from_node, .. } => {
+            let position = state.node_position(from_node)?;
+            Some((
+                output_port(node_screen_rect_at(state, position, rect), state.zoom),
+                pointer,
+            ))
+        }
+        WireDrag::FromInput { to_node, to_port } => {
+            let position = state.node_position(to_node)?;
+            let node = graph.node(to_node)?;
+            Some((
+                pointer,
+                input_port(
+                    node_screen_rect_at(state, position, rect),
+                    to_port,
+                    input_port_count(&node.kind),
+                ),
+            ))
+        }
+        WireDrag::Detaching { from_node, .. } => {
+            let position = state.node_position(from_node)?;
+            Some((
+                output_port(node_screen_rect_at(state, position, rect), state.zoom),
+                pointer,
+            ))
+        }
+    }
+}
+
 fn zoom_around(state: &mut NodeCanvasState, rect: Rect, pointer: Pos2, scroll: f32) {
     let old_zoom = state.zoom;
-    let new_zoom = (old_zoom * (scroll * 0.0015).exp()).clamp(0.25, 2.5);
+    let new_zoom = (old_zoom * (scroll * 0.0015).exp()).clamp(MIN_ZOOM, MAX_ZOOM);
     if (new_zoom - old_zoom).abs() <= f32::EPSILON {
         return;
     }
 
-    let canvas_point = (pointer - rect.min - state.pan) / old_zoom;
+    let world = state.screen_to_world(rect, pointer);
     state.zoom = new_zoom;
-    state.pan = pointer - rect.min - canvas_point * new_zoom;
+    state.pan = pointer - rect.min - world.to_vec2() * new_zoom;
 }
 
 fn node_screen_rect(state: &NodeCanvasState, id: NodeId, rect: Rect) -> Rect {
@@ -457,12 +1337,43 @@ fn node_screen_rect(state: &NodeCanvasState, id: NodeId, rect: Rect) -> Rect {
 }
 
 fn node_screen_rect_at(state: &NodeCanvasState, position: Pos2, rect: Rect) -> Rect {
-    let min = rect.min + state.pan + position.to_vec2() * state.zoom;
+    let min = state.world_to_screen(rect, position);
     Rect::from_min_size(min, Vec2::new(NODE_W, NODE_H) * state.zoom)
 }
 
-fn input_port(rect: Rect) -> Pos2 {
-    rect.center_top()
+/// Number of input ports a cartridge exposes to the canvas.
+fn input_port_count(kind: &str) -> usize {
+    match kind {
+        "Constant" | "Read" => 0,
+        "Merge2" => 3,
+        "Grade" => 2,
+        _ => 1,
+    }
+}
+
+fn node_accepts_inputs(graph: &GraphMirror, id: NodeId) -> bool {
+    graph
+        .node(id)
+        .is_some_and(|node| input_port_count(&node.kind) > 0)
+}
+
+/// Position of input `port` on the top edge of `rect`.
+fn input_port(rect: Rect, port: PortId, count: usize) -> Pos2 {
+    if count == 0 {
+        return rect.center_top();
+    }
+    let slot = (port.0 as usize).min(count - 1);
+    let step = rect.width() / (count as f32 + 1.0);
+    Pos2::new(rect.left() + step * (slot as f32 + 1.0), rect.top())
+}
+
+/// Anchor for an input port label, clear of the port stem.
+///
+/// The stem rises [`PORT_LEAD`] pixels above the node's top edge, so the label
+/// sits `3 * zoom` pixels above its tip. `Align2::CENTER_BOTTOM` then keeps
+/// every glyph above the stem at any zoom level.
+fn port_label_position(position: Pos2, zoom: f32) -> Pos2 {
+    position - Vec2::new(0.0, (PORT_LEAD + 3.0) * zoom)
 }
 
 fn output_port(rect: Rect, zoom: f32) -> Pos2 {
@@ -494,19 +1405,58 @@ fn hit_input_port(
     rect: Rect,
 ) -> Option<(NodeId, PortId)> {
     let radius = port_hit_radius(state.zoom);
+    for node in graph.nodes().iter().rev() {
+        let node_rect = node_screen_rect(state, node.id, rect);
+        let count = input_port_count(&node.kind);
+        for port in 0..count {
+            let position = input_port(node_rect, PortId(port as u16), count);
+            if pointer.distance(position) <= radius {
+                return Some((node.id, PortId(port as u16)));
+            }
+        }
+    }
+    None
+}
+
+fn hit_output_port(
+    state: &NodeCanvasState,
+    graph: &GraphMirror,
+    pointer: Pos2,
+    rect: Rect,
+) -> Option<NodeId> {
+    let radius = port_hit_radius(state.zoom);
     graph
         .nodes()
         .iter()
         .rev()
-        .find(|node| pointer.distance(input_port(node_screen_rect(state, node.id, rect))) <= radius)
-        .map(|node| (node.id, PortId(0)))
+        .find(|node| {
+            let node_rect = node_screen_rect(state, node.id, rect);
+            pointer.distance(output_port(node_rect, state.zoom)) <= radius
+        })
+        .map(|node| node.id)
 }
 
-fn pipe_label(port: PortId) -> String {
-    match port.0 {
-        0 => "B".to_string(),
-        1 => "A".to_string(),
-        other => other.to_string(),
+/// Human label for an input port, keyed to the node's input semantics.
+///
+/// Merge-style nodes keep Nuke's `B`/`A`/`M` order. Two-input filters expose
+/// port 0 as the main `in` pipe and port 1 as the optional mask, so a mask can
+/// never be mistaken for the A pipe. Single-input nodes stay unlabeled.
+pub fn input_port_label(kind: &str, input_count: usize, port_index: usize) -> &'static str {
+    if kind == "Merge2" || input_count == 3 {
+        return match port_index {
+            0 => "B",
+            1 => "A",
+            2 => "M",
+            _ => "",
+        };
+    }
+    match input_count {
+        2 => match port_index {
+            0 => "in",
+            1 => "M",
+            _ => "",
+        },
+        _ => "",
     }
 }
 
@@ -548,6 +1498,7 @@ fn draw_grid(painter: &Painter, rect: Rect, pan: Vec2, zoom: f32) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_node(
     painter: &Painter,
     rect: Rect,
@@ -555,6 +1506,7 @@ fn draw_node(
     selected: bool,
     is_viewer: bool,
     zoom: f32,
+    active_port: Option<PortId>,
 ) {
     let crashed = node.crashed.is_some();
     let (fill, header, border) = if crashed {
@@ -575,24 +1527,37 @@ fn draw_node(
         Stroke::new(1.0, Color32::from_black_alpha(90)),
     );
 
-    let input = input_port(rect);
     let output = output_port(rect, zoom);
     let stub = Stroke::new((1.5 * zoom).max(0.6), border);
 
-    painter.line_segment(
-        [Pos2::new(input.x, input.y - PORT_LEAD * zoom), input],
-        stub,
-    );
-    let arrow = 5.0 * zoom.max(0.7);
-    painter.add(Shape::convex_polygon(
-        vec![
-            Pos2::new(input.x, input.y + arrow),
-            Pos2::new(input.x - arrow, input.y - arrow),
-            Pos2::new(input.x + arrow, input.y - arrow),
-        ],
-        border,
-        Stroke::NONE,
-    ));
+    // Input ports: B (0), A (1), mask (2) laid out along the top edge.
+    let count = input_port_count(&node.kind);
+    let box_size = (9.0 * zoom).max(5.0);
+    for port in 0..count {
+        let port_id = PortId(port as u16);
+        let position = input_port(rect, port_id, count);
+        painter.line_segment(
+            [position - Vec2::new(0.0, PORT_LEAD * zoom), position],
+            stub,
+        );
+        let active = active_port == Some(port_id);
+        let port_rect = Rect::from_center_size(position, Vec2::splat(box_size));
+        painter.rect_filled(
+            port_rect,
+            CornerRadius::same(1),
+            if active { WIRE_ACTIVE } else { border },
+        );
+        let label = input_port_label(&node.kind, count, port);
+        if !label.is_empty() {
+            painter.text(
+                port_label_position(position, zoom),
+                Align2::CENTER_BOTTOM,
+                label,
+                FontId::proportional((9.0 * zoom).clamp(7.0, 11.0)),
+                Color32::from_gray(200),
+            );
+        }
+    }
 
     painter.line_segment([rect.center_bottom(), output], stub);
     painter.circle_filled(output, (4.0 * zoom).max(2.5), border);
@@ -608,8 +1573,8 @@ fn draw_node(
 
     let body_font = FontId::proportional((12.0 * zoom).clamp(9.0, 16.0));
     painter.text(
-        rect.left_top() + Vec2::new(8.0 * zoom, (HEADER_H + 6.0) * zoom),
-        Align2::LEFT_TOP,
+        rect.left_bottom() + Vec2::new(8.0 * zoom, -6.0 * zoom),
+        Align2::LEFT_BOTTOM,
         format!("#{}", node.id.0),
         body_font,
         Color32::from_gray(190),
@@ -617,8 +1582,8 @@ fn draw_node(
 
     if crashed {
         painter.text(
-            rect.right_bottom() - Vec2::new(7.0 * zoom, 6.0 * zoom),
-            Align2::RIGHT_BOTTOM,
+            rect.right_top() + Vec2::new(-7.0 * zoom, 5.0 * zoom),
+            Align2::RIGHT_TOP,
             "CRASHED",
             FontId::proportional((10.0 * zoom).clamp(8.0, 13.0)),
             Color32::from_rgb(255, 130, 130),
@@ -644,7 +1609,7 @@ fn draw_node(
             StrokeKind::Outside,
         );
         let tag = Rect::from_min_size(
-            rect.right_top() + Vec2::new(-58.0 * zoom, 3.0 * zoom),
+            rect.right_bottom() + Vec2::new(-58.0 * zoom, -16.0 * zoom),
             Vec2::new(54.0 * zoom, 13.0 * zoom),
         );
         painter.rect_filled(tag, CornerRadius::same(2), VIEWER);
@@ -708,10 +1673,12 @@ fn draw_wire(
 mod tests {
     use super::*;
 
-    fn add_node(id: u64) -> UndoableCommand {
+    fn add_node(id: u64, x: f32, y: f32) -> UndoableCommand {
         UndoableCommand::AddNode {
             id: NodeId(id),
             kind: "Dummy".to_string(),
+            x,
+            y,
         }
     }
 
@@ -727,8 +1694,8 @@ mod tests {
     #[test]
     fn mirror_follows_applied_undone_and_redone_events() {
         let mut graph = GraphMirror::default();
-        graph.apply_event(&KernelEvent::Applied(add_node(1)));
-        graph.apply_event(&KernelEvent::Applied(add_node(2)));
+        graph.apply_event(&KernelEvent::Applied(add_node(1, 10.0, 20.0)));
+        graph.apply_event(&KernelEvent::Applied(add_node(2, 10.0, 120.0)));
         graph.apply_event(&KernelEvent::Applied(connect(1, 2)));
 
         assert_eq!(graph.node_count(), 2);
@@ -741,15 +1708,44 @@ mod tests {
         graph.apply_event(&KernelEvent::Redone(connect(1, 2)));
         assert_eq!(graph.edge_count(), 1);
 
-        graph.apply_event(&KernelEvent::Undone(add_node(2)));
+        graph.apply_event(&KernelEvent::Undone(add_node(2, 10.0, 120.0)));
         assert_eq!(graph.node_count(), 1);
         assert_eq!(graph.edge_count(), 0);
     }
 
     #[test]
+    fn mirror_restores_full_state_when_a_removal_is_undone() {
+        let mut graph = GraphMirror::default();
+        graph.apply_event(&KernelEvent::Applied(add_node(1, 10.0, 20.0)));
+        graph.apply_event(&KernelEvent::Applied(add_node(2, 40.0, 160.0)));
+        graph.apply_event(&KernelEvent::Applied(connect(1, 2)));
+
+        let command = graph.removal_command(NodeId(2)).expect("snapshot");
+        match &command {
+            UndoableCommand::RemoveNode { knobs, edges, .. } => {
+                assert_eq!(knobs.len(), 0);
+                assert_eq!(edges.len(), 1);
+            }
+            other => panic!("expected RemoveNode, got {other:?}"),
+        }
+
+        graph.apply_event(&KernelEvent::Applied(command.clone()));
+        assert_eq!(graph.node_count(), 1);
+        assert_eq!(graph.edge_count(), 0);
+
+        graph.apply_event(&KernelEvent::Undone(command));
+        assert_eq!(graph.node_count(), 2);
+        assert_eq!(graph.edge_count(), 1);
+        assert_eq!(
+            graph.node(NodeId(2)).map(|node| (node.x, node.y)),
+            Some((40.0, 160.0))
+        );
+    }
+
+    #[test]
     fn crash_events_mark_the_node() {
         let mut graph = GraphMirror::default();
-        graph.apply_event(&KernelEvent::Applied(add_node(1)));
+        graph.apply_event(&KernelEvent::Applied(add_node(1, 0.0, 0.0)));
         graph.apply_event(&KernelEvent::NodeCrashed {
             node: NodeId(1),
             message: "boom".to_string(),
@@ -763,17 +1759,492 @@ mod tests {
     }
 
     #[test]
-    fn layout_stacks_nodes_vertically() {
+    fn layout_uses_add_node_coordinates() {
         let mut graph = GraphMirror::default();
-        graph.apply_event(&KernelEvent::Applied(add_node(1)));
-        graph.apply_event(&KernelEvent::Applied(add_node(2)));
+        graph.apply_event(&KernelEvent::Applied(add_node(1, 32.0, 48.0)));
+        graph.apply_event(&KernelEvent::Applied(add_node(2, 32.0, 172.0)));
 
         let mut state = NodeCanvasState::default();
         state.layout_nodes(&graph);
 
-        let first = state.node_position(NodeId(1)).expect("first laid out");
-        let second = state.node_position(NodeId(2)).expect("second laid out");
-        assert!(second.y > first.y);
-        assert_eq!(first.x, second.x);
+        assert_eq!(state.node_position(NodeId(1)), Some(Pos2::new(32.0, 48.0)));
+        assert_eq!(state.node_position(NodeId(2)), Some(Pos2::new(32.0, 172.0)));
+    }
+
+    #[test]
+    fn screen_and_world_round_trip_through_pan_and_zoom() {
+        let state = NodeCanvasState {
+            pan: Vec2::new(120.0, -30.0),
+            zoom: 1.75,
+            ..Default::default()
+        };
+        let viewport = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(800.0, 600.0));
+        let world = Pos2::new(42.0, -17.0);
+
+        let screen = state.world_to_screen(viewport, world);
+        let round_trip = state.screen_to_world(viewport, screen);
+
+        assert!((round_trip.x - world.x).abs() < 1e-4);
+        assert!((round_trip.y - world.y).abs() < 1e-4);
+    }
+
+    #[test]
+    fn box_selection_maps_through_pan_and_zoom() {
+        let mut graph = GraphMirror::default();
+        graph.apply_event(&KernelEvent::Applied(add_node(1, 0.0, 0.0)));
+        graph.apply_event(&KernelEvent::Applied(add_node(2, 400.0, 400.0)));
+
+        let mut state = NodeCanvasState {
+            pan: Vec2::new(120.0, -30.0),
+            zoom: 1.75,
+            ..Default::default()
+        };
+        state.layout_nodes(&graph);
+        let viewport = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(1200.0, 900.0));
+
+        // A box around the first node's world rect, expressed in screen space.
+        let node_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(NODE_W, NODE_H));
+        let start = state.world_to_screen(viewport, node_rect.min - Vec2::new(10.0, 10.0));
+        let end = state.world_to_screen(viewport, node_rect.max + Vec2::new(10.0, 10.0));
+        assert_eq!(
+            state.nodes_in_screen_box(&graph, viewport, start, end),
+            vec![NodeId(1)]
+        );
+
+        // A box covering both nodes.
+        let start = state.world_to_screen(viewport, Pos2::new(-20.0, -20.0));
+        let end = state.world_to_screen(viewport, Pos2::new(600.0, 600.0));
+        assert_eq!(
+            state.nodes_in_screen_box(&graph, viewport, start, end),
+            vec![NodeId(1), NodeId(2)]
+        );
+    }
+
+    #[test]
+    fn shift_click_toggles_and_keeps_primary_deterministic() {
+        let mut state = NodeCanvasState::default();
+        apply_node_click(&mut state, NodeId(3), false);
+        apply_node_click(&mut state, NodeId(5), true);
+
+        assert_eq!(state.primary_selected, Some(NodeId(5)));
+        assert_eq!(state.selected_nodes.len(), 2);
+
+        apply_node_click(&mut state, NodeId(5), true);
+        assert_eq!(
+            state.primary_selected,
+            Some(NodeId(3)),
+            "removing the primary falls back to the lowest remaining id"
+        );
+        assert_eq!(state.selected_nodes.len(), 1);
+
+        // A plain click inside the multi-selection keeps it for group drags.
+        apply_node_click(&mut state, NodeId(3), false);
+        assert_eq!(state.selected_nodes.len(), 1);
+        apply_node_click(&mut state, NodeId(5), true);
+        apply_node_click(&mut state, NodeId(5), false);
+        assert_eq!(state.primary_selected, Some(NodeId(5)));
+        assert_eq!(state.selected_nodes.len(), 2);
+    }
+
+    #[test]
+    fn keyboard_guard_blocks_shortcuts_while_a_field_is_focused() {
+        egui::__run_test_ui(|ui| {
+            assert!(
+                !keyboard_is_busy(ui),
+                "an idle canvas must let Delete and 1 through"
+            );
+
+            // Simulates a knob field holding the keyboard.
+            ui.memory_mut(|memory| memory.request_focus(egui::Id::unique(module_path!())));
+            assert!(
+                keyboard_is_busy(ui),
+                "typing in a knob must never delete nodes"
+            );
+
+            // Clicking the canvas ends the edit, so shortcuts work again.
+            ui.memory_mut(|memory| memory.stop_text_input());
+            assert!(!keyboard_is_busy(ui));
+        });
+    }
+
+    #[test]
+    fn escape_cancels_a_detach_without_side_effects() {
+        let mut state = NodeCanvasState {
+            active_wire_drag: Some(WireDrag::Detaching {
+                from_node: NodeId(1),
+                from_port: PortId(0),
+                orig_to_node: NodeId(2),
+                orig_to_port: PortId(0),
+            }),
+            ..Default::default()
+        };
+
+        let messages = cancel_wire_drag(&mut state);
+
+        assert!(messages.is_empty(), "cancelling must emit zero messages");
+        assert!(state.active_wire_drag.is_none());
+    }
+
+    #[test]
+    fn detaching_dropped_on_empty_space_disconnects_once() {
+        let drag = WireDrag::Detaching {
+            from_node: NodeId(1),
+            from_port: PortId(0),
+            orig_to_node: NodeId(2),
+            orig_to_port: PortId(0),
+        };
+
+        assert_eq!(
+            resolve_wire_release(drag, None, None),
+            vec![UndoableCommand::DisconnectEdge {
+                from_node: NodeId(1),
+                from_port: PortId(0),
+                to_node: NodeId(2),
+                to_port: PortId(0),
+            }]
+        );
+    }
+
+    #[test]
+    fn detaching_dropped_on_a_new_input_moves_the_wire() {
+        let drag = WireDrag::Detaching {
+            from_node: NodeId(1),
+            from_port: PortId(0),
+            orig_to_node: NodeId(2),
+            orig_to_port: PortId(0),
+        };
+
+        assert_eq!(
+            resolve_wire_release(drag, Some((NodeId(3), PortId(1))), Some(NodeId(1))),
+            vec![
+                UndoableCommand::DisconnectEdge {
+                    from_node: NodeId(1),
+                    from_port: PortId(0),
+                    to_node: NodeId(2),
+                    to_port: PortId(0),
+                },
+                UndoableCommand::ConnectEdge {
+                    from_node: NodeId(1),
+                    from_port: PortId(0),
+                    to_node: NodeId(3),
+                    to_port: PortId(1),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn detaching_dropped_back_on_the_same_port_is_a_no_op() {
+        let drag = WireDrag::Detaching {
+            from_node: NodeId(1),
+            from_port: PortId(0),
+            orig_to_node: NodeId(2),
+            orig_to_port: PortId(0),
+        };
+
+        assert!(resolve_wire_release(drag, Some((NodeId(2), PortId(0))), None).is_empty());
+    }
+
+    #[test]
+    fn output_and_input_drags_connect_in_the_right_direction() {
+        let from_output = resolve_wire_release(
+            WireDrag::FromOutput {
+                from_node: NodeId(1),
+                from_port: PortId(0),
+            },
+            Some((NodeId(2), PortId(1))),
+            None,
+        );
+        assert_eq!(
+            from_output,
+            vec![UndoableCommand::ConnectEdge {
+                from_node: NodeId(1),
+                from_port: PortId(0),
+                to_node: NodeId(2),
+                to_port: PortId(1),
+            }]
+        );
+
+        let from_input = resolve_wire_release(
+            WireDrag::FromInput {
+                to_node: NodeId(2),
+                to_port: PortId(1),
+            },
+            None,
+            Some(NodeId(1)),
+        );
+        assert_eq!(
+            from_input,
+            vec![UndoableCommand::ConnectEdge {
+                from_node: NodeId(1),
+                from_port: PortId(0),
+                to_node: NodeId(2),
+                to_port: PortId(1),
+            }]
+        );
+
+        // Self-connections are rejected in both directions.
+        assert!(
+            resolve_wire_release(
+                WireDrag::FromOutput {
+                    from_node: NodeId(2),
+                    from_port: PortId(0),
+                },
+                Some((NodeId(2), PortId(0))),
+                None,
+            )
+            .is_empty()
+        );
+        assert!(
+            resolve_wire_release(
+                WireDrag::FromInput {
+                    to_node: NodeId(2),
+                    to_port: PortId(0),
+                },
+                None,
+                Some(NodeId(2)),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn input_ports_spread_across_the_node_top() {
+        let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(120.0, 72.0));
+
+        assert_eq!(input_port(rect, PortId(0), 1), Pos2::new(60.0, 0.0));
+        assert_eq!(input_port(rect, PortId(0), 2), Pos2::new(40.0, 0.0));
+        assert_eq!(input_port(rect, PortId(1), 2), Pos2::new(80.0, 0.0));
+        assert_eq!(input_port(rect, PortId(2), 3), Pos2::new(90.0, 0.0));
+    }
+
+    #[test]
+    fn port_counts_match_cartridge_inputs() {
+        assert_eq!(input_port_count("Constant"), 0);
+        assert_eq!(input_port_count("Read"), 0);
+        assert_eq!(input_port_count("Merge2"), 3);
+        assert_eq!(input_port_count("Grade"), 2);
+        assert_eq!(input_port_count("Viewer"), 1);
+    }
+
+    #[test]
+    fn switching_to_nuke_clears_a_non_viewer_binding() {
+        let mut graph = GraphMirror::default();
+        graph.apply_event(&KernelEvent::Applied(add_node(1, 0.0, 0.0)));
+
+        let message = nuke_workflow_binding_message(&graph, Some(NodeId(1)));
+        assert!(
+            matches!(message, KernelMessage::SetViewerNode(None)),
+            "a non-Viewer must never stay bound in Nuke mode, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn switching_to_nuke_binds_an_existing_viewer() {
+        let mut graph = GraphMirror::default();
+        graph.apply_event(&KernelEvent::Applied(add_node(1, 0.0, 0.0)));
+        graph.apply_event(&KernelEvent::Applied(UndoableCommand::AddNode {
+            id: NodeId(2),
+            kind: "Viewer".to_string(),
+            x: 0.0,
+            y: 120.0,
+        }));
+
+        let message = nuke_workflow_binding_message(&graph, Some(NodeId(1)));
+        assert!(
+            matches!(message, KernelMessage::SetViewerNode(Some(NodeId(2)))),
+            "an existing Viewer takes over, got {message:?}"
+        );
+
+        let message = nuke_workflow_binding_message(&graph, Some(NodeId(2)));
+        assert!(
+            matches!(message, KernelMessage::SetViewerNode(Some(NodeId(2)))),
+            "an already-correct binding is left alone, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn user_spawn_list_hides_dummy_and_gates_viewer() {
+        let nuke = spawnable_kinds(ViewerWorkflow::Nuke);
+        assert!(!nuke.contains(&"Dummy"), "Dummy is a test-only cartridge");
+        assert!(nuke.contains(&"Viewer"));
+
+        let fusion = spawnable_kinds(ViewerWorkflow::Fusion);
+        assert!(!fusion.contains(&"Dummy"));
+        assert!(
+            !fusion.contains(&"Viewer"),
+            "Fusion has no physical Viewer node"
+        );
+    }
+
+    #[test]
+    fn tab_search_matches_grade_and_spawns_at_the_anchor() {
+        assert_eq!(
+            matching_kinds(ViewerWorkflow::Nuke, "gr"),
+            vec!["Grade"],
+            "typing `gr` must resolve to Grade"
+        );
+
+        let state = NodeCanvasState {
+            pan: Vec2::new(40.0, 20.0),
+            zoom: 1.5,
+            ..Default::default()
+        };
+        let viewport = Rect::from_min_max(Pos2::new(10.0, 30.0), Pos2::new(900.0, 700.0));
+        let anchor = Pos2::new(310.0, 330.0);
+        let world = state.screen_to_world(viewport, anchor);
+
+        let graph = GraphMirror::default();
+        let kind = matching_kinds(ViewerWorkflow::Nuke, "gr")
+            .first()
+            .copied()
+            .expect("a match");
+        match add_node_message(&graph, kind, world) {
+            KernelMessage::Execute(UndoableCommand::AddNode { kind, x, y, id, .. }) => {
+                assert_eq!(kind, "Grade");
+                assert_eq!(id, NodeId(1));
+                assert!((x - world.x).abs() < 1e-4);
+                assert!((y - world.y).abs() < 1e-4);
+            }
+            other => panic!("expected an AddNode command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_open_flag_tracks_the_popup() {
+        let mut state = NodeCanvasState::default();
+        assert!(!state.is_search_open());
+
+        state.tab_search = Some(TabSearchState {
+            screen_pos: Pos2::ZERO,
+            world_pos: Pos2::ZERO,
+            query: String::new(),
+            just_opened: true,
+        });
+        assert!(state.is_search_open());
+    }
+
+    #[test]
+    fn port_labels_distinguish_masks_from_merge_pipes() {
+        assert_eq!(input_port_label("Merge2", 3, 0), "B");
+        assert_eq!(input_port_label("Merge2", 3, 1), "A");
+        assert_eq!(input_port_label("Merge2", 3, 2), "M");
+
+        assert_eq!(input_port_label("Grade", 2, 0), "in");
+        assert_eq!(input_port_label("Grade", 2, 1), "M");
+        assert_ne!(input_port_label("Grade", 2, 1), "A");
+
+        assert_eq!(input_port_label("Blur", 1, 0), "");
+    }
+
+    #[test]
+    fn port_labels_sit_above_the_stem_tip() {
+        let port = Pos2::new(120.0, 80.0);
+        for zoom in [0.25, 1.0, 2.5] {
+            let label = port_label_position(port, zoom);
+            let stem_tip = port.y - PORT_LEAD * zoom;
+            assert_eq!(label.x, port.x, "labels stay centred on the port");
+            assert!(
+                stem_tip - label.y >= 3.0 * zoom - 1e-4,
+                "zoom {zoom}: label bottom {} must clear stem tip {stem_tip}",
+                label.y
+            );
+        }
+    }
+
+    #[test]
+    fn physical_tab_opens_search_and_enter_spawns_grade() {
+        let ctx = egui::Context::default();
+        let graph = GraphMirror::default();
+        let mut canvas = NodeCanvasState::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0));
+
+        // Frame 1: a toolbar button owns keyboard focus, as it would after a
+        // click.
+        let mut focused_after_frame_one = false;
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        ui.button("toolbar").request_focus();
+                    });
+                });
+                focused_after_frame_one = ctx.memory(|memory| memory.focused().is_some());
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            focused_after_frame_one,
+            "frame 1 should leave a button focused"
+        );
+
+        // Frame 2: a raw physical Tab event must open the quick search even
+        // though a non-text button is focused.
+        let mut messages = Vec::new();
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Key {
+                    key: Key::Tab,
+                    physical_key: Some(Key::Tab),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        messages =
+                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            canvas.is_search_open(),
+            "physical Tab must open the quick-search popup"
+        );
+        assert!(messages.is_empty());
+
+        // Frame 3: typing `gr` and pressing Enter spawns Grade and closes.
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::Text("gr".to_string()),
+                    egui::Event::Key {
+                        key: Key::Enter,
+                        physical_key: Some(Key::Enter),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        messages =
+                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(!canvas.is_search_open(), "Enter closes the popup");
+        match messages.first() {
+            Some(KernelMessage::Execute(UndoableCommand::AddNode { kind, .. })) => {
+                assert_eq!(kind, "Grade");
+            }
+            other => panic!("expected an AddNode for Grade, got {other:?}"),
+        }
     }
 }

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tanova_kernel::{
     EvalContext, KnobTable, KnobValue, NodeCartridgeDescriptor, NodeError, NodeTrait, Packet,
 };
+use tanova_render::coords::BBox;
 use tanova_render::{EvalContextGpu, MergeOp, MergeRequest, merge_raster};
 
 use crate::util::{float_knob, format_float, raster_input, text_knob};
@@ -71,15 +72,12 @@ impl NodeTrait for Merge2Node {
 
         let operation = MergeOp::from_name(&text_knob(knobs, "operation", DEFAULT_OPERATION))
             .unwrap_or(MergeOp::Over);
-        let output_bbox = match text_knob(knobs, "bbox", DEFAULT_BBOX)
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "b" => background.bbox,
-            "a" => foreground.bbox,
-            "intersection" => background.bbox.intersection(&foreground.bbox),
-            _ => background.bbox.union(&foreground.bbox),
+        // Output always covers the full project format canvas so A and B are
+        // composited at the same resolution. Out-of-bounds source pixels read
+        // as transparent black.
+        let output_bbox = match ctx.project_format() {
+            Some(fmt) => BBox::new(0, 0, fmt.width as i32, fmt.height as i32),
+            None => background.bbox.union(&foreground.bbox),
         };
         let mix = float_knob(knobs, "mix", DEFAULT_MIX);
 

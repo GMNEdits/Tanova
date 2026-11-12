@@ -11,6 +11,7 @@ use tanova_kernel::{
     EvalContext, KnobTable, KnobValue, MemoryGovernor, NodeCartridgeDescriptor, NodeError,
     NodeTrait, Packet,
 };
+use tanova_render::coords::BBox;
 use tanova_render::{
     Channel, ChannelPlane, EvalContextGpu, Mat3x3, Raster2D, TILE_SIZE, TileBuffer, TileCoord,
     transform_gathered_tile,
@@ -94,7 +95,14 @@ impl NodeTrait for TransformNode {
             knob: "scale".to_string(),
             reason: "the affine matrix is singular".to_string(),
         })?;
-        let output_bbox = input.bbox.transform(&matrix);
+        // Output always covers the full project format canvas so every
+        // destination pixel (x, y) in 0..format_w, 0..format_h is sampled via
+        // inverse mapping. Out-of-bounds source pixels read as transparent
+        // black.
+        let output_bbox = match ctx.project_format() {
+            Some(fmt) => BBox::new(0, 0, fmt.width as i32, fmt.height as i32),
+            None => input.format.to_bbox(),
+        };
 
         let governor = ctx.governor();
         let gpu = ctx.gpu();
@@ -187,8 +195,8 @@ pub fn transform_matrix(
 ) -> Mat3x3 {
     Mat3x3::translate(translate[0], translate[1])
         .mul(&Mat3x3::translate(center[0], center[1]))
-        .mul(&Mat3x3::scale(scale, scale))
         .mul(&Mat3x3::rotate(rotate_degrees.to_radians()))
+        .mul(&Mat3x3::scale(scale, scale))
         .mul(&Mat3x3::translate(-center[0], -center[1]))
 }
 
@@ -344,7 +352,10 @@ mod tests {
             &context([10.0, -5.0, 0.0, 1.0], 0.0, 1.0, DEFAULT_CENTER),
         );
 
-        assert_eq!(output.bbox, BBox::new(10, -5, 110, 95));
+        // Output always covers the full format canvas; the translated content
+        // lives at the right world coordinates within it.
+        assert_eq!(output.bbox, BBox::new(0, 0, 100, 100));
+        // dst(60, 45) -> inverse(T(10,-5)) -> src(50, 50), still the same color.
         let pixel = output.sample_rgba(60, 45);
         for channel in 0..4 {
             assert!((pixel[channel] - color[channel]).abs() < 1e-5);
@@ -358,7 +369,10 @@ mod tests {
             &context(DEFAULT_TRANSLATE, 45.0, 1.0, DEFAULT_CENTER),
         );
 
-        assert_eq!(output.bbox, BBox::new(-71, 0, 71, 142));
+        // Output always covers the full format canvas; rotated content stays
+        // within [0..100, 0..100] with transparent black outside the rotated
+        // source footprint.
+        assert_eq!(output.bbox, BBox::new(0, 0, 100, 100));
     }
 
     #[test]
@@ -369,7 +383,7 @@ mod tests {
             &context(DEFAULT_TRANSLATE, 0.0, 2.0, [50.0, 50.0, 0.0, 1.0]),
         );
 
-        assert_eq!(output.bbox, BBox::new(-50, -50, 150, 150));
+        assert_eq!(output.bbox, BBox::new(0, 0, 100, 100));
         let pixel = output.sample_rgba(50, 50);
         for channel in 0..4 {
             assert!((pixel[channel] - color[channel]).abs() < 1e-5);
@@ -406,6 +420,132 @@ mod tests {
             .and_then(|plane| plane.get(&TileCoord::new(0, 0)))
             .expect("depth tile");
         assert!(Arc::ptr_eq(&depth_buffer, output_depth));
+    }
+
+    #[test]
+    fn scaled_transform_composites_over_a_background() {
+        use crate::merge::Merge2Node;
+
+        let background = solid_raster(256, 256, [0.0, 0.0, 1.0, 1.0]);
+        let foreground = solid_raster(256, 256, [1.0, 0.0, 0.0, 1.0]);
+
+        let transformed = evaluate(
+            foreground,
+            &context([64.0, 64.0, 0.0, 1.0], 0.0, 0.5, DEFAULT_CENTER),
+        );
+        assert_eq!(
+            transformed.bbox,
+            BBox::new(0, 0, 256, 256),
+            "transform output always covers the format canvas"
+        );
+        assert_eq!(transformed.format.to_bbox(), BBox::new(0, 0, 256, 256),);
+
+        let inside = transformed.sample_rgba(128, 128);
+        assert!(
+            inside[0] > 0.99 && inside[1] < 0.01 && inside[2] < 0.01,
+            "inside the scaled square must be red, got {inside:?}"
+        );
+
+        let mut background_packet = Packet::new();
+        background_packet.insert(background);
+        let mut foreground_packet = Packet::new();
+        foreground_packet.insert(transformed);
+
+        let merged = Merge2Node::new()
+            .evaluate(&EvalContext::new(), &[background_packet, foreground_packet])
+            .expect("merge should evaluate");
+        let merged = merged.get::<Raster2D>().expect("raster");
+
+        let inside = merged.sample_rgba(128, 128);
+        assert!(
+            inside[0] > 0.99 && inside[1] < 0.01 && inside[2] < 0.01,
+            "inside the scaled square must be red, got {inside:?}"
+        );
+
+        for (x, y) in [(10, 10), (220, 220)] {
+            let outside = merged.sample_rgba(x, y);
+            assert!(
+                outside[2] > 0.99 && outside[0] < 0.01,
+                "({x}, {y}) must stay blue, got {outside:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scaled_transform_partial_negative_translate_composites_over_background() {
+        use crate::merge::Merge2Node;
+
+        let background = solid_raster(256, 256, [0.0, 0.0, 1.0, 1.0]);
+        let foreground = solid_raster(256, 256, [1.0, 0.0, 0.0, 1.0]);
+
+        // scale=0.5, translate=(-64, 48): A occupies x in -64..64, y in 48..176.
+        // Inside the frame, only x in 0..64, y in 48..176 is red.
+        let transformed = evaluate(
+            foreground,
+            &context([-64.0, 48.0, 0.0, 1.0], 0.0, 0.5, DEFAULT_CENTER),
+        );
+        assert_eq!(transformed.bbox, BBox::new(0, 0, 256, 256));
+
+        let mut background_packet = Packet::new();
+        background_packet.insert(background);
+        let mut foreground_packet = Packet::new();
+        foreground_packet.insert(transformed);
+
+        let merged = Merge2Node::new()
+            .evaluate(&EvalContext::new(), &[background_packet, foreground_packet])
+            .expect("merge should evaluate");
+        let merged = merged.get::<Raster2D>().expect("raster");
+
+        // x=32, y=100 is inside [0..64, 48..176]: red.
+        let inside = merged.sample_rgba(32, 100);
+        assert!(
+            inside[0] > 0.99 && inside[1] < 0.01 && inside[2] < 0.01,
+            "pixel (32, 100) must be red, got {inside:?}"
+        );
+
+        // x=100 is right of the square: blue.
+        for (x, y) in [(100, 100), (100, 10)] {
+            let outside = merged.sample_rgba(x, y);
+            assert!(
+                outside[2] > 0.99 && outside[0] < 0.01,
+                "pixel ({x}, {y}) must stay blue, got {outside:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scaled_transform_offscreen_left_is_all_blue() {
+        use crate::merge::Merge2Node;
+
+        let background = solid_raster(256, 256, [0.0, 0.0, 1.0, 1.0]);
+        let foreground = solid_raster(256, 256, [1.0, 0.0, 0.0, 1.0]);
+
+        // scale=0.5, translate=(-174, 49): A occupies x in -174..-46, y in 49..177.
+        // Zero pixels overlap [0..256, 0..256], so the entire output is blue.
+        let transformed = evaluate(
+            foreground,
+            &context([-174.0, 49.0, 0.0, 1.0], 0.0, 0.5, DEFAULT_CENTER),
+        );
+        assert_eq!(transformed.bbox, BBox::new(0, 0, 256, 256));
+
+        let mut background_packet = Packet::new();
+        background_packet.insert(background);
+        let mut foreground_packet = Packet::new();
+        foreground_packet.insert(transformed);
+
+        let merged = Merge2Node::new()
+            .evaluate(&EvalContext::new(), &[background_packet, foreground_packet])
+            .expect("merge should evaluate");
+        let merged = merged.get::<Raster2D>().expect("raster");
+
+        // Every pixel in the frame must be blue.
+        for (x, y) in [(128, 100), (0, 0), (255, 255), (64, 64), (192, 128)] {
+            let pixel = merged.sample_rgba(x, y);
+            assert!(
+                pixel[2] > 0.99 && pixel[0] < 0.01,
+                "({x}, {y}) must be blue, got {pixel:?}"
+            );
+        }
     }
 
     #[test]

@@ -53,6 +53,8 @@ fn read_refreshes_after_the_disk_worker_finishes() {
         KernelMessage::Execute(UndoableCommand::AddNode {
             id: node,
             kind: "Read".to_string(),
+            x: 0.0,
+            y: 0.0,
         }),
         set_knob(
             node,

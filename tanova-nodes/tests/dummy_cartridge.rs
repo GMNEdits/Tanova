@@ -25,6 +25,8 @@ fn dummy_cartridge_is_discovered_and_evaluated() {
     dag.apply_command(&UndoableCommand::AddNode {
         id: NodeId(1),
         kind: "Dummy".to_string(),
+        x: 0.0,
+        y: 0.0,
     })
     .expect("AddNode should apply");
 
@@ -63,6 +65,8 @@ fn set_knob_updates_payload_through_eval_context() {
     dag.apply_command(&UndoableCommand::AddNode {
         id: NodeId(1),
         kind: "Dummy".to_string(),
+        x: 0.0,
+        y: 0.0,
     })
     .expect("AddNode should apply");
 

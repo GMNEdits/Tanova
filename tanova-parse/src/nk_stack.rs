@@ -25,7 +25,11 @@ const GENERATORS: &[&str] = &[
 ];
 
 /// Classes that never leave a node on the stack.
-const NON_PUSHING: &[&str] = &["Root", "Viewer", "BackdropNode", "StickyNote"];
+///
+/// `Viewer` is intentionally **not** listed: it is a real cartridge now and
+/// participates in the stack like any other node, so scripts can wire it up
+/// and the loader can focus its `NodeId`.
+const NON_PUSHING: &[&str] = &["Root", "BackdropNode", "StickyNote"];
 
 /// One node recovered from a script.
 #[derive(Debug, Clone)]
@@ -53,7 +57,10 @@ pub struct ParsedScript {
     pub names: HashMap<String, NodeId>,
     /// Id to node name.
     pub node_names: HashMap<NodeId, String>,
-    /// Input of the last `Viewer` block, when the script had one.
+    /// `NodeId` of the last `Viewer` block, when the script had one.
+    ///
+    /// The Viewer cartridge is a passthrough, so the app focuses this node
+    /// rather than its upstream input.
     pub viewer_target: Option<NodeId>,
     /// Node left on top of the root stack.
     pub stack_top: Option<NodeId>,
@@ -318,7 +325,9 @@ impl<'a> Machine<'a> {
         }
 
         if class == "Viewer" {
-            self.script.viewer_target = input_nodes.first().copied().flatten();
+            // The Viewer cartridge is a passthrough node, so the app should
+            // focus the node itself rather than its input.
+            self.script.viewer_target = Some(id);
         }
 
         if class == "Group" {

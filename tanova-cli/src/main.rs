@@ -218,12 +218,25 @@ fn run_headless_check() -> Result<(), CliError> {
         .get("Merge1")
         .copied()
         .ok_or("Merge1 was not parsed")?;
-    if parsed.viewer_target != Some(merge) || target != merge {
+    let viewer = parsed
+        .names
+        .get("Viewer1")
+        .copied()
+        .ok_or("Viewer1 was not parsed")?;
+    if parsed.viewer_target != Some(viewer) || target != viewer {
         return Err(format!(
-            "expected the Viewer to target Merge1 (#{}), got viewer={:?} target=#{}",
-            merge.0, parsed.viewer_target, target.0
+            "expected the Viewer node (#{}) to be the render target, got viewer={:?} target=#{}",
+            viewer.0, parsed.viewer_target, target.0
         )
         .into());
+    }
+    let viewer_node = parsed
+        .nodes
+        .iter()
+        .find(|node| node.id == viewer)
+        .ok_or("Viewer1 descriptor missing")?;
+    if viewer_node.input_nodes.first().copied().flatten() != Some(merge) {
+        return Err(format!("expected Viewer1 to be wired to Merge1 (#{})", merge.0).into());
     }
 
     let shake = parsed

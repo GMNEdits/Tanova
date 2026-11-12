@@ -120,6 +120,23 @@ impl PropertiesPanel {
                                 changed = true;
                             }
                         }
+                        KnobValue::Color(channels) if name == "translate" || name == "center" => {
+                            // 2D spatial knobs keep `Color([x, y, z, w])`
+                            // storage for cartridge compatibility but edit as
+                            // coordinates, never as RGBA.
+                            let mut color = *channels;
+                            ui.label("X");
+                            if ui.add(DragValue::new(&mut color[0]).speed(1.0)).changed() {
+                                changed = true;
+                            }
+                            ui.label("Y");
+                            if ui.add(DragValue::new(&mut color[1]).speed(1.0)).changed() {
+                                changed = true;
+                            }
+                            if changed {
+                                next = KnobValue::Color(color);
+                            }
+                        }
                         KnobValue::Color(channels) => {
                             let mut color = *channels;
                             let mut srgba = Color32::from_rgba_unmultiplied(

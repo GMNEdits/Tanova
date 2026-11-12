@@ -65,9 +65,20 @@ impl NodeTrait for ConstantNode {
     fn evaluate(&self, ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
         let knobs = ctx.knobs().unwrap_or(&self.knobs);
         let color = color_knob(knobs, "color", DEFAULT_COLOR);
-        let width = int_knob(knobs, "format_width", DEFAULT_WIDTH).clamp(1, i32::MAX as i64) as u32;
-        let height =
-            int_knob(knobs, "format_height", DEFAULT_HEIGHT).clamp(1, i32::MAX as i64) as u32;
+
+        // Use the project format from EvalContext when available, so every
+        // Constant in the graph shares the active project resolution
+        // (e.g. 256x256) instead of its own default (1920x1080).
+        let (width, height) = match ctx.project_format() {
+            Some(fmt) => (fmt.width, fmt.height),
+            None => {
+                let width =
+                    int_knob(knobs, "format_width", DEFAULT_WIDTH).clamp(1, i32::MAX as i64) as u32;
+                let height = int_knob(knobs, "format_height", DEFAULT_HEIGHT)
+                    .clamp(1, i32::MAX as i64) as u32;
+                (width, height)
+            }
+        };
 
         let format = Format::new("Constant", width, height, 1.0);
         let mut raster = Raster2D::for_format(format);

@@ -11,6 +11,7 @@ pub mod merge;
 pub mod read;
 pub mod transform;
 pub mod util;
+pub mod viewer;
 
 pub use blur::BlurNode;
 pub use constant::{ConstantNode, DEFAULT_COLOR};
@@ -19,6 +20,7 @@ pub use grade::{GradeNode, grade_op};
 pub use merge::Merge2Node;
 pub use read::ReadNode;
 pub use transform::TransformNode;
+pub use viewer::ViewerNode;
 
 /// Forces this crate, and therefore its `inventory` constructors, to be linked.
 ///

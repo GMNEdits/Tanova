@@ -30,6 +30,21 @@ pub struct Time(pub f64);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct View(pub String);
 
+/// The active project format, carried top-down so every source cartridge
+/// (e.g. `Constant`) produces rasters at the project resolution instead of
+/// its own default format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProjectFormat {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ProjectFormat {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+}
+
 /// Generic data travelling bottom-up from a node to its consumers.
 #[derive(Debug, Clone)]
 pub struct Packet {
@@ -164,6 +179,11 @@ impl EvalContext {
     /// kernel can enforce its cap before the allocator runs.
     pub fn governor(&self) -> Option<&MemoryGovernor> {
         self.get::<MemoryGovernor>()
+    }
+
+    /// The active project format, if one was provided.
+    pub fn project_format(&self) -> Option<ProjectFormat> {
+        self.get::<ProjectFormat>().copied()
     }
 }
 

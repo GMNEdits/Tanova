@@ -7,7 +7,12 @@
 pub mod canvas;
 pub mod properties;
 pub mod viewer;
+pub mod workflow;
 
-pub use canvas::{CanvasEdge, CanvasNode, GraphMirror, NodeCanvas, NodeCanvasState, WireDrag};
+pub use canvas::{
+    CanvasEdge, CanvasNode, GraphMirror, NodeCanvas, NodeCanvasState, WireDrag,
+    nuke_workflow_binding_message,
+};
 pub use properties::PropertiesPanel;
 pub use viewer::ViewerPanel;
+pub use workflow::ViewerWorkflow;

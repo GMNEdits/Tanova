@@ -5,6 +5,7 @@
 //! command/texture message bus. Deliberately blind to VFX math.
 
 pub mod bus;
+pub mod command;
 pub mod dag;
 pub mod governor;
 pub mod knobs;
@@ -15,11 +16,12 @@ pub use bus::{
     FrameNotification, KernelEvent, KernelHandle, KernelMessage, NodeId, PortId, UndoStack,
     UndoableCommand,
 };
+pub use command::{EdgeSnapshot, NodeSnapshot};
 pub use dag::{Dag, DagNode, Edge, OpHash, RamCache};
 pub use governor::{MemoryGovernor, MemoryPermit, RenderEpoch, evaluate_with_airbag};
 pub use knobs::{KnobTable, KnobValue};
 pub use registry::{NodeCartridgeDescriptor, find_cartridge, registered_cartridge_kinds};
-pub use types::{EvalContext, NodeError, NodeTrait, Packet, Time, TypeMap, View};
+pub use types::{EvalContext, NodeError, NodeTrait, Packet, ProjectFormat, Time, TypeMap, View};
 
 #[cfg(test)]
 mod tests {
@@ -110,6 +112,8 @@ mod tests {
         let command = UndoableCommand::AddNode {
             id: NodeId(7),
             kind: "Dummy".to_string(),
+            x: 12.0,
+            y: 34.0,
         };
 
         kernel

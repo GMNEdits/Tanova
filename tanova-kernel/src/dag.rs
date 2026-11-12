@@ -11,6 +11,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 
 use crate::bus::{NodeId, PortId, UndoableCommand};
+use crate::command::{EdgeSnapshot, NodeSnapshot};
 use crate::governor::{MemoryGovernor, RenderEpoch, evaluate_with_airbag};
 use crate::knobs::{KnobTable, KnobValue, canonical_f64};
 use crate::registry::find_cartridge;
@@ -71,6 +72,10 @@ pub struct DagNode {
     pub implementation: Option<Arc<dyn NodeTrait>>,
     /// Last panic message, if evaluation crashed this node.
     pub crashed: Option<String>,
+    /// Canvas-space X position of the node.
+    pub x: f32,
+    /// Canvas-space Y position of the node.
+    pub y: f32,
 }
 
 impl DagNode {
@@ -82,6 +87,8 @@ impl DagNode {
             knobs: KnobTable::new(),
             implementation: None,
             crashed: None,
+            x: 0.0,
+            y: 0.0,
         }
     }
 
@@ -100,6 +107,8 @@ impl fmt::Debug for DagNode {
             .field("knobs", &self.knobs)
             .field("has_implementation", &self.implementation.is_some())
             .field("crashed", &self.crashed)
+            .field("x", &self.x)
+            .field("y", &self.y)
             .finish()
     }
 }
@@ -248,6 +257,8 @@ pub struct Dag {
     nodes: IndexMap<NodeId, DagNode>,
     edges: Vec<Edge>,
     cache: RamCache,
+    /// Most recent op hash per node, used for targeted cache invalidation.
+    node_hashes: HashMap<NodeId, OpHash>,
 }
 
 impl Dag {
@@ -262,6 +273,7 @@ impl Dag {
             nodes: IndexMap::new(),
             edges: Vec::new(),
             cache: RamCache::new(capacity),
+            node_hashes: HashMap::new(),
         }
     }
 
@@ -285,6 +297,23 @@ impl Dag {
         self.nodes.len()
     }
 
+    /// Returns `true` if the graph currently holds `id`.
+    pub fn contains_node(&self, id: NodeId) -> bool {
+        self.nodes.contains_key(&id)
+    }
+
+    /// Next unused node id, used when the kernel has to create a node itself.
+    pub fn next_node_id(&self) -> NodeId {
+        NodeId(
+            self.nodes
+                .keys()
+                .map(|id| id.0)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        )
+    }
+
     /// Iterates edges in connection order.
     pub fn edges(&self) -> impl Iterator<Item = &Edge> + '_ {
         self.edges.iter()
@@ -303,6 +332,35 @@ impl Dag {
     /// Mutably borrows the packet cache.
     pub fn cache_mut(&mut self) -> &mut RamCache {
         &mut self.cache
+    }
+
+    /// Removes cached packets for `node_id` and every node downstream of it
+    /// (reachable via outgoing edges). Upstream nodes (e.g. a `Constant` feeding
+    /// a `Transform`) keep their cache entries intact, so a knob drag on a
+    /// downstream node doesn't force upstream re-allocation.
+    pub fn invalidate_downstream(&mut self, node_id: NodeId) {
+        let mut downstream: Vec<NodeId> = Vec::new();
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut queue = vec![node_id];
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            for edge in self.edges.iter() {
+                if edge.from_node == current
+                    && edge.to_node != current
+                    && !visited.contains(&edge.to_node)
+                {
+                    downstream.push(edge.to_node);
+                    queue.push(edge.to_node);
+                }
+            }
+        }
+        for node in downstream {
+            if let Some(hash) = self.node_hashes.get(&node) {
+                self.cache.remove(hash);
+            }
+        }
     }
 
     /// Serializes the whole graph back into Nuke `.nk` stack syntax.
@@ -424,6 +482,29 @@ impl Dag {
         self.insert_node(node)
     }
 
+    /// Adds a node and records its canvas position.
+    pub fn add_node_at(
+        &mut self,
+        id: NodeId,
+        kind: impl Into<String>,
+        x: f32,
+        y: f32,
+    ) -> Result<(), NodeError> {
+        self.add_node(id, kind)?;
+        self.set_position(id, x, y)
+    }
+
+    /// Moves a node in canvas space.
+    pub fn set_position(&mut self, id: NodeId, x: f32, y: f32) -> Result<(), NodeError> {
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .ok_or(NodeError::UnknownNode(id.0))?;
+        node.x = x;
+        node.y = y;
+        Ok(())
+    }
+
     /// Adds a node with its cartridge attached.
     pub fn add_node_with_implementation(
         &mut self,
@@ -451,6 +532,97 @@ impl Dag {
         Some(node)
     }
 
+    /// Captures everything needed to recreate `id` exactly.
+    ///
+    /// The snapshot includes the full knob table and every incident edge, so
+    /// undoing a removal never loses user edits or wiring.
+    pub fn snapshot_node(&self, id: NodeId) -> Option<NodeSnapshot> {
+        let node = self.nodes.get(&id)?;
+        let edges = self
+            .edges
+            .iter()
+            .filter(|edge| edge.from_node == id || edge.to_node == id)
+            .map(|edge| {
+                EdgeSnapshot::new(edge.from_node, edge.from_port, edge.to_node, edge.to_port)
+            })
+            .collect();
+
+        Some(NodeSnapshot {
+            id,
+            kind: node.kind.clone(),
+            x: node.x,
+            y: node.y,
+            knobs: node.knobs.clone(),
+            edges,
+        })
+    }
+
+    /// Builds the full-state [`UndoableCommand::RemoveNode`] for `id`.
+    pub fn removal_command(&self, id: NodeId) -> Option<UndoableCommand> {
+        let snapshot = self.snapshot_node(id)?;
+        Some(UndoableCommand::RemoveNode {
+            id: snapshot.id,
+            kind: snapshot.kind,
+            x: snapshot.x,
+            y: snapshot.y,
+            knobs: Box::new(snapshot.knobs),
+            edges: snapshot.edges,
+        })
+    }
+
+    /// Replaces a UI-built removal with the live snapshot from this graph.
+    ///
+    /// Other commands pass through untouched. If the node is already gone the
+    /// command is returned as-is so the normal error path reports it.
+    pub fn enrich(&self, command: UndoableCommand) -> UndoableCommand {
+        if let UndoableCommand::RemoveNode { id, .. } = &command {
+            if let Some(enriched) = self.removal_command(*id) {
+                return enriched;
+            }
+        }
+        command
+    }
+
+    /// Recreates a removed node with its exact knobs, position, and wiring.
+    ///
+    /// Edges are restored best-effort: when several connected nodes are undone
+    /// one at a time, a peer may not exist yet. The edge is present in both
+    /// endpoints' snapshots, so the later restore reconnects it.
+    pub fn restore_node(
+        &mut self,
+        id: NodeId,
+        kind: &str,
+        x: f32,
+        y: f32,
+        knobs: &KnobTable,
+        edges: &[EdgeSnapshot],
+    ) -> Result<(), NodeError> {
+        if self.nodes.contains_key(&id) {
+            return Err(NodeError::NodeAlreadyExists(id.0));
+        }
+
+        let mut node = DagNode::new(id, kind);
+        node.knobs = knobs.clone();
+        node.x = x;
+        node.y = y;
+        node.implementation = Some(match find_cartridge(kind) {
+            Some(descriptor) => (descriptor.factory)(),
+            None => Arc::new(PassthroughNode) as Arc<dyn NodeTrait>,
+        });
+        self.insert_node(node)?;
+
+        for edge in edges {
+            let _ = self.connect_edge(Edge::new(
+                edge.from_node,
+                edge.from_port,
+                edge.to_node,
+                edge.to_port,
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Attaches or replaces a node's cartridge.
     pub fn set_implementation(
         &mut self,
@@ -463,6 +635,25 @@ impl Dag {
             .ok_or(NodeError::UnknownNode(id.0))?;
         node.implementation = Some(implementation);
         Ok(())
+    }
+
+    /// Connects `from`'s output to input `port` of `to`.
+    ///
+    /// Before connecting, a depth-first search walks **upstream** from
+    /// `from`. If it reaches `to`, then `to` already feeds `from` and the new
+    /// edge would close a loop, so the connection is rejected.
+    pub fn connect(&mut self, from: NodeId, to: NodeId, port: PortId) -> Result<(), NodeError> {
+        if !self.nodes.contains_key(&from) {
+            return Err(NodeError::UnknownNode(from.0));
+        }
+        if !self.nodes.contains_key(&to) {
+            return Err(NodeError::UnknownNode(to.0));
+        }
+        if self.upstream_contains(from, to) {
+            return Err(NodeError::Other("Cyclic connection rejected".to_string()));
+        }
+
+        self.connect_edge(Edge::new(from, PortId(0), to, port))
     }
 
     /// Connects two nodes, rejecting loops and dangling endpoints.
@@ -497,7 +688,33 @@ impl Dag {
     /// Returns `true` if data already flows from `from` to `to`, directly or
     /// through other nodes.
     pub fn would_create_cycle(&self, from: NodeId, to: NodeId) -> bool {
-        self.is_reachable(to, from)
+        self.upstream_contains(from, to)
+    }
+
+    /// Depth-first search **upwards** from `start`, following each node's
+    /// inputs. Returns `true` when `target` is reached (or `start` is
+    /// `target`, which would be a self-loop).
+    fn upstream_contains(&self, start: NodeId, target: NodeId) -> bool {
+        if start == target {
+            return true;
+        }
+
+        let mut seen = HashSet::new();
+        let mut stack = vec![start];
+
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            for edge in self.edges.iter().filter(|edge| edge.to_node == current) {
+                if edge.from_node == target {
+                    return true;
+                }
+                stack.push(edge.from_node);
+            }
+        }
+
+        false
     }
 
     /// Sets one knob on a node.
@@ -518,11 +735,21 @@ impl Dag {
     /// Applies a bus command to the graph.
     pub fn apply_command(&mut self, command: &UndoableCommand) -> Result<(), NodeError> {
         match command {
-            UndoableCommand::AddNode { id, kind } => self.add_node(*id, kind.clone()),
+            UndoableCommand::AddNode { id, kind, x, y } => {
+                self.add_node_at(*id, kind.clone(), *x, *y)
+            }
             UndoableCommand::RemoveNode { id, .. } => self
                 .remove_node(*id)
                 .map(|_| ())
                 .ok_or(NodeError::UnknownNode(id.0)),
+            UndoableCommand::RestoreNode {
+                id,
+                kind,
+                x,
+                y,
+                knobs,
+                edges,
+            } => self.restore_node(*id, kind, *x, *y, knobs, edges),
             UndoableCommand::ConnectEdge {
                 from_node,
                 from_port,
@@ -600,6 +827,7 @@ impl Dag {
         }
 
         let hash = self.compute_op_hash(id, ctx)?;
+        self.node_hashes.insert(id, hash);
         if let Some(cached) = self.cache.get(&hash) {
             visiting.remove(&id);
             return Ok(cached);
@@ -720,30 +948,6 @@ impl Dag {
         memo.insert(id, hash);
         Ok(hash)
     }
-
-    fn is_reachable(&self, start: NodeId, target: NodeId) -> bool {
-        if start == target {
-            return true;
-        }
-
-        let mut seen = HashSet::new();
-        let mut queue = VecDeque::new();
-        seen.insert(start);
-        queue.push_back(start);
-
-        while let Some(current) = queue.pop_front() {
-            for edge in self.edges.iter().filter(|edge| edge.from_node == current) {
-                if edge.to_node == target {
-                    return true;
-                }
-                if seen.insert(edge.to_node) {
-                    queue.push_back(edge.to_node);
-                }
-            }
-        }
-
-        false
-    }
 }
 
 impl Default for Dag {
@@ -824,6 +1028,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::UndoStack;
     use crate::types::Time;
 
     struct CountingNode {
@@ -966,6 +1171,69 @@ mod tests {
             Err(NodeError::CycleDetected { from: 1, to: 1 })
         ));
         assert_eq!(dag.edge_count(), 1);
+    }
+
+    #[test]
+    fn connect_rejects_cycles_with_the_documented_error() {
+        let (mut dag, _) = chain(false);
+
+        let error = dag
+            .connect(NodeId(2), NodeId(1), PortId(0))
+            .expect_err("B -> A must be rejected");
+        assert_eq!(
+            error,
+            NodeError::Other("Cyclic connection rejected".to_string())
+        );
+
+        let self_loop = dag
+            .connect(NodeId(1), NodeId(1), PortId(0))
+            .expect_err("A -> A must be rejected");
+        assert_eq!(
+            self_loop,
+            NodeError::Other("Cyclic connection rejected".to_string())
+        );
+        assert_eq!(dag.edge_count(), 1);
+    }
+
+    #[test]
+    fn connect_accepts_an_acyclic_edge() {
+        let mut dag = Dag::new();
+        dag.add_node(NodeId(1), "Source").unwrap();
+        dag.add_node(NodeId(2), "Sink").unwrap();
+
+        dag.connect(NodeId(1), NodeId(2), PortId(1))
+            .expect("forward edge should connect");
+
+        let edge = dag.edges().next().copied().expect("edge recorded");
+        assert_eq!(edge.from_node, NodeId(1));
+        assert_eq!(edge.from_port, PortId(0));
+        assert_eq!(edge.to_node, NodeId(2));
+        assert_eq!(edge.to_port, PortId(1));
+    }
+
+    #[test]
+    fn add_node_command_records_canvas_coordinates() {
+        let command = UndoableCommand::AddNode {
+            id: NodeId(1),
+            kind: "Constant".to_string(),
+            x: 12.5,
+            y: -4.0,
+        };
+
+        let mut dag = Dag::new();
+        dag.apply_command(&command).expect("AddNode should apply");
+        let node = dag.node(NodeId(1)).expect("node exists");
+        assert_eq!((node.x, node.y), (12.5, -4.0));
+
+        // Undo removes the node, and redo restores the same coordinates.
+        dag.apply_command(&command.inverse())
+            .expect("undo should apply");
+        assert!(dag.node(NodeId(1)).is_none());
+
+        dag.apply_command(&command.inverse().inverse())
+            .expect("redo should apply");
+        let node = dag.node(NodeId(1)).expect("node re-created");
+        assert_eq!((node.x, node.y), (12.5, -4.0));
     }
 
     #[test]
@@ -1246,5 +1514,273 @@ mod tests {
             "unknown-node knobs must survive: {text}"
         );
         assert!(text.contains("inputs 1"), "input count missing: {text}");
+    }
+
+    #[test]
+    fn removal_snapshot_restores_knobs_position_and_both_edges() {
+        let mut dag = Dag::new();
+        dag.add_node_at(NodeId(1), "Constant", 10.0, 20.0).unwrap();
+        dag.add_node_at(NodeId(2), "Grade", 10.0, 144.0).unwrap();
+        dag.add_node_at(NodeId(3), "Blur", 10.0, 268.0).unwrap();
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .unwrap();
+        dag.connect_edge(Edge::new(NodeId(2), PortId(0), NodeId(3), PortId(0)))
+            .unwrap();
+
+        // A non-default knob value is the part a naive undo would lose.
+        let edited = KnobValue::Color([0.5, 1.25, 2.0, 0.75]);
+        dag.set_knob(NodeId(2), "multiply", edited.clone()).unwrap();
+
+        let command = dag.removal_command(NodeId(2)).expect("live snapshot");
+        match &command {
+            UndoableCommand::RemoveNode {
+                x,
+                y,
+                knobs,
+                edges,
+                kind,
+                ..
+            } => {
+                assert_eq!(kind, "Grade");
+                assert_eq!((*x, *y), (10.0, 144.0));
+                assert_eq!(knobs.get("multiply"), Some(&edited));
+                assert_eq!(edges.len(), 2, "both incident edges are captured");
+            }
+            other => panic!("expected RemoveNode, got {other:?}"),
+        }
+
+        dag.apply_command(&command).unwrap();
+        assert!(dag.node(NodeId(2)).is_none());
+        assert_eq!(dag.edge_count(), 0, "no dangling edge may survive");
+        assert!(
+            dag.edges()
+                .all(|edge| edge.from_node != NodeId(2) && edge.to_node != NodeId(2)),
+            "removal must purge every incident edge"
+        );
+
+        dag.undo_command(&command).unwrap();
+        let restored = dag.node(NodeId(2)).expect("Grade is back");
+        assert_eq!((restored.x, restored.y), (10.0, 144.0));
+        assert_eq!(restored.kind, "Grade");
+        assert_eq!(restored.knobs.get("multiply"), Some(&edited));
+
+        let edges: Vec<Edge> = dag.edges().copied().collect();
+        assert_eq!(edges.len(), 2, "both wires must be restored: {edges:?}");
+        assert!(edges.contains(&Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0))));
+        assert!(edges.contains(&Edge::new(NodeId(2), PortId(0), NodeId(3), PortId(0))));
+
+        // Redo must remove it again, still without dangling edges.
+        dag.apply_command(&command).unwrap();
+        assert!(dag.node(NodeId(2)).is_none());
+        assert_eq!(dag.edge_count(), 0);
+    }
+
+    #[test]
+    fn restoring_a_node_that_still_exists_is_an_error() {
+        let mut dag = Dag::new();
+        dag.add_node_at(NodeId(1), "Grade", 0.0, 0.0).unwrap();
+        let command = dag.removal_command(NodeId(1)).unwrap();
+
+        assert!(matches!(
+            dag.apply_command(&command.inverse()),
+            Err(NodeError::NodeAlreadyExists(1))
+        ));
+    }
+
+    /// A cartridge that echoes a u32 input with an offset, simulating a simple
+    /// transform for end-to-end evaluate_pull testing.
+    struct OffsetNode(i32);
+
+    impl NodeTrait for OffsetNode {
+        fn evaluate(&self, _ctx: &EvalContext, inputs: &[Packet]) -> Result<Packet, NodeError> {
+            let input = inputs
+                .first()
+                .and_then(|p| p.get::<u32>())
+                .copied()
+                .unwrap_or(0);
+            let mut packet = Packet::new();
+            packet.insert(input.wrapping_add(self.0 as u32));
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            format!("OffsetNode {{ offset {} }}", self.0)
+        }
+    }
+
+    /// A cartridge that combines two u32 inputs by taking the first non-zero,
+    /// simulating a simple merge for end-to-end evaluate_pull testing.
+    struct MergePickNode;
+
+    impl NodeTrait for MergePickNode {
+        fn evaluate(&self, _ctx: &EvalContext, inputs: &[Packet]) -> Result<Packet, NodeError> {
+            let value = inputs
+                .iter()
+                .find_map(|p| p.get::<u32>().copied())
+                .filter(|&v| v != 0)
+                .unwrap_or(0);
+            let mut packet = Packet::new();
+            packet.insert(value);
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            "MergePickNode {}".to_string()
+        }
+    }
+
+    fn offset_factory(offset: i32) -> Arc<dyn NodeTrait> {
+        Arc::new(OffsetNode(offset))
+    }
+
+    #[test]
+    fn evaluate_pull_end_to_end_through_dag() {
+        let mut dag = Dag::new();
+
+        // Source A: constant value 1 (red) — no inputs, offset 1 → output 1
+        dag.add_node_with_implementation(NodeId(1), "SourceA", offset_factory(1))
+            .unwrap();
+
+        // Source B: constant value 2 (blue) — no inputs, offset 2 → output 2
+        dag.add_node_with_implementation(NodeId(2), "SourceB", offset_factory(2))
+            .unwrap();
+
+        // Transform on source A: offset by 100 → 1 + 100 = 101
+        dag.add_node_with_implementation(NodeId(3), "Transform", offset_factory(100))
+            .unwrap();
+
+        // Merge: A over B (pick first non-zero) → picks 101
+        dag.add_node_with_implementation(NodeId(4), "Merge2", Arc::new(MergePickNode))
+            .unwrap();
+
+        // Viewer: pulls from merge, offset 0 → passes through 101
+        dag.add_node_with_implementation(NodeId(5), "Viewer", offset_factory(0))
+            .unwrap();
+
+        // Wire: SourceA(1) -> Transform(3) -> Merge2(4, port 0 = A)
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(3), PortId(0)))
+            .unwrap();
+        dag.connect_edge(Edge::new(NodeId(3), PortId(0), NodeId(4), PortId(0)))
+            .unwrap();
+        // Wire: SourceB(2) -> Merge2(4, port 1 = B)
+        dag.connect_edge(Edge::new(NodeId(2), PortId(0), NodeId(4), PortId(1)))
+            .unwrap();
+        // Wire: Merge2(4) -> Viewer(5)
+        dag.connect_edge(Edge::new(NodeId(4), PortId(0), NodeId(5), PortId(0)))
+            .unwrap();
+
+        let ctx = EvalContext::new();
+        let governor = MemoryGovernor::new(usize::MAX);
+        let epoch = RenderEpoch::new();
+        let target_epoch = epoch.bump();
+
+        let packet = dag
+            .evaluate_pull(NodeId(5), &ctx, &governor, &epoch, target_epoch)
+            .expect("evaluate_pull should succeed");
+        let value = packet.get::<u32>().expect("viewer packet should carry u32");
+        // SourceA(1) -> Transform(+100) = 101 -> Merge2 picks 101 (first non-zero)
+        assert_eq!(
+            *value, 101,
+            "end-to-end evaluate_pull should produce transformed value"
+        );
+    }
+
+    #[test]
+    fn invalidate_downstream_keeps_upstream_cached() {
+        let mut dag = Dag::new();
+
+        // Chain: Constant(1) -> Transform(+10) -> Merge2(pick first)
+        dag.add_node(NodeId(1), "Constant").unwrap();
+        dag.node_mut(NodeId(1)).unwrap().implementation = Some(offset_factory(1));
+
+        dag.add_node(NodeId(2), "Transform").unwrap();
+        dag.node_mut(NodeId(2)).unwrap().implementation = Some(offset_factory(10));
+
+        dag.add_node(NodeId(3), "Merge2").unwrap();
+        dag.node_mut(NodeId(3)).unwrap().implementation = Some(Arc::new(MergePickNode));
+
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .unwrap();
+        dag.connect_edge(Edge::new(NodeId(2), PortId(0), NodeId(3), PortId(0)))
+            .unwrap();
+
+        let ctx = EvalContext::new();
+        let governor = MemoryGovernor::new(usize::MAX);
+        let epoch = RenderEpoch::new();
+        let target_epoch = epoch.bump();
+
+        // Evaluate to populate cache: Constant=1, Transform=11, Merge2=11
+        let _ = dag.evaluate_pull(NodeId(3), &ctx, &governor, &epoch, target_epoch);
+        let cache_size_before = dag.cache().len();
+        assert!(
+            cache_size_before > 0,
+            "cache should have entries after evaluation"
+        );
+
+        // Invalidate downstream of Transform (node 2): should remove Transform and Merge2
+        dag.invalidate_downstream(NodeId(2));
+        let cache_size_after = dag.cache().len();
+        assert!(
+            cache_size_after < cache_size_before,
+            "downstream invalidation should reduce cache size"
+        );
+
+        // Re-evaluate: Constant should still be cached (its hash didn't change)
+        let packet = dag
+            .evaluate_pull(NodeId(3), &ctx, &governor, &epoch, target_epoch)
+            .expect("re-evaluate should succeed");
+        let value = packet.get::<u32>().expect("packet should carry u32");
+        assert_eq!(
+            *value, 11,
+            "result should still be correct after downstream invalidation"
+        );
+    }
+
+    #[test]
+    fn set_knob_coalesces_on_undo_stack() {
+        let mut stack = UndoStack::new();
+
+        stack.push(UndoableCommand::SetKnob {
+            node: NodeId(1),
+            knob: "translate".to_string(),
+            value: KnobValue::Color([1.0, 2.0, 0.0, 1.0]),
+            previous: KnobValue::Color([0.0, 0.0, 0.0, 1.0]),
+        });
+        stack.push(UndoableCommand::SetKnob {
+            node: NodeId(1),
+            knob: "translate".to_string(),
+            value: KnobValue::Color([5.0, 6.0, 0.0, 1.0]),
+            previous: KnobValue::Color([1.0, 2.0, 0.0, 1.0]),
+        });
+        stack.push(UndoableCommand::SetKnob {
+            node: NodeId(1),
+            knob: "translate".to_string(),
+            value: KnobValue::Color([9.0, 10.0, 0.0, 1.0]),
+            previous: KnobValue::Color([5.0, 6.0, 0.0, 1.0]),
+        });
+
+        // Three rapid SetKnobs should coalesce into one undo step
+        assert!(stack.can_undo(), "should have one undo entry");
+        assert!(!stack.can_redo(), "redo should be empty after push");
+
+        let undone = stack.undo().expect("one coalesced undo step");
+        match undone {
+            UndoableCommand::SetKnob {
+                value, previous, ..
+            } => {
+                assert_eq!(
+                    value,
+                    KnobValue::Color([9.0, 10.0, 0.0, 1.0]),
+                    "coalesced value should be the last"
+                );
+                assert_eq!(
+                    previous,
+                    KnobValue::Color([0.0, 0.0, 0.0, 1.0]),
+                    "coalesced previous should be the first"
+                );
+            }
+            other => panic!("expected SetKnob, got {other:?}"),
+        }
+        assert!(!stack.can_undo(), "drag must undo in one step");
     }
 }
