@@ -45,3 +45,8 @@ Implement a `Transform` cartridge with 3x3 matrix concatenation and bilinear fil
 
 **Milestone 13: Multi-Channel EXR I/O & Timeline Playback (`tanova-io`)**
 Read and write multi-channel OpenEXR frames and drive timeline playback through the message bus.
+
+## Release & Tagging Policy
+
+- Every milestone/version tag must first record all Added, Changed, and Fixed items in `CHANGELOG.md`.
+- Every release must use an annotated Git tag (`git tag -a vX.Y.Z-... -m "..."`) and push both the branch and `--tags` to `origin`.
