@@ -320,6 +320,8 @@ impl TanovaApp {
         // rasters at this resolution so downstream Transform/Merge2 stay
         // aligned with the viewer frame.
         context.insert(ProjectFormat::new(STARTER_SIZE as u32, STARTER_SIZE as u32));
+        self.graph
+            .set_project_format(ProjectFormat::new(STARTER_SIZE as u32, STARTER_SIZE as u32));
 
         let seed = [
             KernelMessage::SetBaseContext(context),
@@ -384,7 +386,14 @@ impl TanovaApp {
 
     /// Non-blocking drain of kernel events and frame notifications.
     fn pump(&mut self) {
+        let mut graph_updated = false;
         while let Ok(event) = self.kernel.events().try_recv() {
+            if matches!(
+                event,
+                KernelEvent::Applied(_) | KernelEvent::Undone(_) | KernelEvent::Redone(_)
+            ) {
+                graph_updated = true;
+            }
             self.fold_event(event);
         }
         let mut frame_received = false;
@@ -393,7 +402,7 @@ impl TanovaApp {
             self.last_frame = Some(frame);
             frame_received = true;
         }
-        if frame_received {
+        if frame_received || graph_updated {
             self.awaiting_kernel = false;
         }
     }
@@ -498,9 +507,9 @@ impl TanovaApp {
 
     /// Sends every message the UI asked for, syncing viewer state first.
     ///
-    /// `SetKnob` commands are optimistically applied to the local `GraphMirror`
-    /// before being sent to the kernel, so the UI stays in sync with zero
-    /// jump-back on mouse release while the kernel round-trips.
+    /// `SetKnob` and `MoveNode` commands are optimistically applied to the local
+    /// `GraphMirror` before being sent to the kernel, so the UI stays in sync
+    /// with zero jump-back on mouse release while the kernel round-trips.
     ///
     /// Sets `awaiting_kernel` so egui keeps repainting until the new frame
     /// arrives, eliminating visual lag on undo/redo and drag release.
@@ -513,17 +522,31 @@ impl TanovaApp {
                 self.viewer.bind(*node);
             }
             if let KernelMessage::Execute(command) = &message {
-                if let UndoableCommand::SetKnob { .. } = command {
-                    // Optimistically mirror the knob edit locally so
-                    // PropertiesPanel and ViewerPanel see the new value
-                    // immediately, before the kernel event arrives.
-                    let optimistic = command.clone();
-                    self.graph.apply_command(&optimistic);
-                }
+                let optimistic = command.clone();
+                self.apply_optimistic_mirror_update(&optimistic);
             }
             if let Err(error) = self.kernel.send(message) {
                 self.failure = Some(format!("kernel send failed: {error}"));
             }
+        }
+    }
+
+    /// Optimistically applies a command's effect to the local `GraphMirror`.
+    ///
+    /// Handles `SetKnob`, `MoveNode`, and `Batch` recursively so that the UI
+    /// mirrors knob edits and node moves immediately, before the kernel
+    /// round-trips.
+    fn apply_optimistic_mirror_update(&mut self, command: &UndoableCommand) {
+        match command {
+            UndoableCommand::SetKnob { .. } | UndoableCommand::MoveNode { .. } => {
+                self.graph.apply_command(command);
+            }
+            UndoableCommand::Batch(cmds) => {
+                for cmd in cmds {
+                    self.apply_optimistic_mirror_update(cmd);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -553,6 +576,16 @@ impl TanovaApp {
 
 impl eframe::App for TanovaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+impl TanovaApp {
+    /// Draws one frame of the real panel layout.
+    ///
+    /// Split out of the `eframe::App` impl so tests can drive the app with a
+    /// plain `egui::Ui` instead of an `eframe::Frame`.
+    fn draw(&mut self, ui: &mut egui::Ui) {
         self.pump();
         self.handle_shortcuts(ui.ctx());
         self.advance_timeline();
@@ -668,6 +701,7 @@ fn check_failed(message: impl Into<String>) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::{Modifiers, PointerButton, Pos2, Rect, Vec2};
 
     fn ctrl() -> egui::Modifiers {
         egui::Modifiers {
@@ -893,5 +927,467 @@ mod tests {
         }
 
         kernel.shutdown();
+    }
+
+    /// A `Constant` spawned via `AddNode` in a `ProjectFormat(256, 256)` graph
+    /// should have its `format_width`/`format_height` knobs stamped to 256/256.
+    /// Editing only `format_width` to 128 keeps `format_height` at 256.
+    #[test]
+    fn spawned_constant_inherits_project_format_knobs() {
+        use tanova_kernel::{KnobValue, UndoableCommand};
+        use tanova_ui::GraphMirror;
+
+        let mut graph = GraphMirror::default();
+        graph.set_project_format(tanova_kernel::ProjectFormat::new(256, 256));
+
+        // Spawn a new Constant node via AddNode.
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(10),
+            kind: "Constant".to_string(),
+            x: 40.0,
+            y: 40.0,
+        });
+
+        // Check the GraphMirror: format_width should be 256 (from project format),
+        // not the cartridge default 1920.
+        let constant_node = graph.node(NodeId(10)).expect("Constant #10 should exist");
+        let format_width = constant_node
+            .knobs
+            .get("format_width")
+            .and_then(|v| match v {
+                KnobValue::Int(w) => Some(w),
+                _ => None,
+            });
+        let format_height = constant_node
+            .knobs
+            .get("format_height")
+            .and_then(|v| match v {
+                KnobValue::Int(h) => Some(h),
+                _ => None,
+            });
+        assert_eq!(
+            format_width,
+            Some(&256i64),
+            "format_width should be 256 from project format, got {format_width:?}"
+        );
+        assert_eq!(
+            format_height,
+            Some(&256i64),
+            "format_height should be 256 from project format, got {format_height:?}"
+        );
+
+        // Now edit only format_width to 128; format_height should stay 256.
+        graph.apply_command(&UndoableCommand::SetKnob {
+            node: NodeId(10),
+            knob: "format_width".to_string(),
+            value: KnobValue::Int(128),
+            previous: KnobValue::Int(256),
+        });
+
+        let constant_node = graph.node(NodeId(10)).expect("Constant #10 should exist");
+        let format_width = constant_node
+            .knobs
+            .get("format_width")
+            .and_then(|v| match v {
+                KnobValue::Int(w) => Some(w),
+                _ => None,
+            });
+        let format_height = constant_node
+            .knobs
+            .get("format_height")
+            .and_then(|v| match v {
+                KnobValue::Int(h) => Some(h),
+                _ => None,
+            });
+        assert_eq!(
+            format_width,
+            Some(&128i64),
+            "format_width should be 128 after edit, got {format_width:?}"
+        );
+        assert_eq!(
+            format_height,
+            Some(&256i64),
+            "format_height should stay 256 when only width is edited, got {format_height:?}"
+        );
+    }
+
+    /// Draining the kernel event queue into a mirror, as `TanovaApp::pump` does.
+    ///
+    /// Keeps folding until the queue has been quiet for a moment, which is long
+    /// enough for one command's `Applied`/`Undone`/`Redone` event to land.
+    fn pump_into_mirror(kernel: &KernelHandle, mirror: &mut GraphMirror) {
+        while let Ok(event) = kernel
+            .events()
+            .recv_timeout(std::time::Duration::from_millis(100))
+        {
+            mirror.apply_event(&event);
+        }
+    }
+
+    /// A single-node and group drag must survive undo/redo in the mirror.
+    ///
+    /// Two consecutive `Batch` moves inside the coalescing window collapse into
+    /// one undo step, so one `Undo` returns both nodes to their start.
+    #[test]
+    fn single_and_group_node_drag_undo_redo_roundtrip() {
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut mirror = GraphMirror::default();
+
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(1),
+                kind: "Constant".to_string(),
+                x: 100.0,
+                y: 100.0,
+            }))
+            .expect("add node #1");
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(2),
+                kind: "Constant".to_string(),
+                x: 300.0,
+                y: 300.0,
+            }))
+            .expect("add node #2");
+        pump_into_mirror(&kernel, &mut mirror);
+
+        let start_1 = {
+            let node = mirror.node(NodeId(1)).expect("node #1 in mirror");
+            (node.x, node.y)
+        };
+        let start_2 = {
+            let node = mirror.node(NodeId(2)).expect("node #2 in mirror");
+            (node.x, node.y)
+        };
+
+        // First leg: +40,+20 for both nodes.
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::Batch(vec![
+                UndoableCommand::MoveNode {
+                    id: NodeId(1),
+                    from_x: start_1.0,
+                    from_y: start_1.1,
+                    to_x: start_1.0 + 40.0,
+                    to_y: start_1.1 + 20.0,
+                },
+                UndoableCommand::MoveNode {
+                    id: NodeId(2),
+                    from_x: start_2.0,
+                    from_y: start_2.1,
+                    to_x: start_2.0 + 40.0,
+                    to_y: start_2.1 + 20.0,
+                },
+            ])))
+            .expect("first group move");
+        pump_into_mirror(&kernel, &mut mirror);
+
+        // Second leg: another +60,+30 for both nodes.
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::Batch(vec![
+                UndoableCommand::MoveNode {
+                    id: NodeId(1),
+                    from_x: start_1.0 + 40.0,
+                    from_y: start_1.1 + 20.0,
+                    to_x: start_1.0 + 100.0,
+                    to_y: start_1.1 + 50.0,
+                },
+                UndoableCommand::MoveNode {
+                    id: NodeId(2),
+                    from_x: start_2.0 + 40.0,
+                    from_y: start_2.1 + 20.0,
+                    to_x: start_2.0 + 100.0,
+                    to_y: start_2.1 + 50.0,
+                },
+            ])))
+            .expect("second group move");
+        pump_into_mirror(&kernel, &mut mirror);
+
+        // Both legs coalesced, so ONE undo restores the start positions.
+        kernel.send(KernelMessage::Undo).expect("undo");
+        pump_into_mirror(&kernel, &mut mirror);
+
+        let after_undo_1 = {
+            let node = mirror.node(NodeId(1)).expect("node #1 in mirror");
+            (node.x, node.y)
+        };
+        let after_undo_2 = {
+            let node = mirror.node(NodeId(2)).expect("node #2 in mirror");
+            (node.x, node.y)
+        };
+        assert!(
+            (after_undo_1.0 - start_1.0).abs() < 1e-3 && (after_undo_1.1 - start_1.1).abs() < 1e-3,
+            "one undo should restore node #1 to {start_1:?}, got {after_undo_1:?}"
+        );
+        assert!(
+            (after_undo_2.0 - start_2.0).abs() < 1e-3 && (after_undo_2.1 - start_2.1).abs() < 1e-3,
+            "one undo should restore node #2 to {start_2:?}, got {after_undo_2:?}"
+        );
+
+        // Redo replays the whole coalesced gesture.
+        kernel.send(KernelMessage::Redo).expect("redo");
+        pump_into_mirror(&kernel, &mut mirror);
+
+        let after_redo_1 = {
+            let node = mirror.node(NodeId(1)).expect("node #1 in mirror");
+            (node.x, node.y)
+        };
+        let after_redo_2 = {
+            let node = mirror.node(NodeId(2)).expect("node #2 in mirror");
+            (node.x, node.y)
+        };
+        assert!(
+            (after_redo_1.0 - (start_1.0 + 100.0)).abs() < 1e-3
+                && (after_redo_1.1 - (start_1.1 + 50.0)).abs() < 1e-3,
+            "redo should move node #1 to {:?}, got {after_redo_1:?}",
+            (start_1.0 + 100.0, start_1.1 + 50.0)
+        );
+        assert!(
+            (after_redo_2.0 - (start_2.0 + 100.0)).abs() < 1e-3
+                && (after_redo_2.1 - (start_2.1 + 50.0)).abs() < 1e-3,
+            "redo should move node #2 to {:?}, got {after_redo_2:?}",
+            (start_2.0 + 100.0, start_2.1 + 50.0)
+        );
+
+        kernel.shutdown();
+    }
+
+    /// A spawned `Constant` in a 256x256 project that has its width edited to
+    /// 128 must render 128x256, not 128x1080.
+    ///
+    /// The kernel has to stamp the project format onto the node's knobs when it
+    /// spawns; otherwise `Constant` falls back to its static 1080 height as soon
+    /// as the width knob stops matching the 1920x1080 default pair.
+    #[test]
+    fn spawned_constant_width_edit_renders_128x256_not_128x1080() {
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+
+        let mut context = EvalContext::new();
+        context.insert(ProjectFormat::new(256, 256));
+        kernel
+            .send(KernelMessage::SetBaseContext(context))
+            .expect("set base context");
+
+        // Constant #4, spawned under the 256x256 project format.
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(4),
+                kind: "Constant".to_string(),
+                x: 40.0,
+                y: 40.0,
+            }))
+            .expect("add Constant #4");
+
+        // Viewer #3.
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: VIEWER,
+                kind: "Viewer".to_string(),
+                x: 40.0,
+                y: 288.0,
+            }))
+            .expect("add Viewer #3");
+
+        // Edit only the width knob to 128.
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(4),
+                knob: "format_width".to_string(),
+                value: KnobValue::Int(128),
+                previous: KnobValue::Int(256),
+            }))
+            .expect("set Constant #4 width to 128");
+
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::ConnectEdge {
+                from_node: NodeId(4),
+                from_port: PortId(0),
+                to_node: VIEWER,
+                to_port: PortId(0),
+            }))
+            .expect("connect Constant #4 -> Viewer #3");
+
+        kernel
+            .send(KernelMessage::SetViewerNode(Some(VIEWER)))
+            .expect("set viewer");
+
+        let frame = kernel
+            .frames()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("should receive a frame from the viewer");
+
+        let raster = frame
+            .packet
+            .get::<Raster2D>()
+            .expect("frame should carry a Raster2D");
+
+        assert_eq!(
+            raster.format.width, 128,
+            "width knob 128 should win, got {}",
+            raster.format.width
+        );
+        assert_eq!(
+            raster.format.height, 256,
+            "height should stay at the stamped project format 256, got {}",
+            raster.format.height
+        );
+
+        kernel.shutdown();
+    }
+
+    /// Drives one full `TanovaApp` frame, panels and all.
+    fn run_app_frame(
+        ctx: &egui::Context,
+        app: &mut TanovaApp,
+        screen: Rect,
+        events: Vec<egui::Event>,
+    ) {
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| app.draw(ui));
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+
+    /// End-to-end live path: a real `NodeCanvas::show` drag inside `TanovaApp`
+    /// followed by `Ctrl+Z` must move the node back on screen.
+    ///
+    /// This is the regression the isolated tests missed: the mirror was correct
+    /// after undo, but `NodeCanvasState::positions` kept the dragged value, so
+    /// the canvas never re-laid the node out.
+    #[test]
+    fn live_app_ui_drag_and_ctrl_z_restores_node_position() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Frames 1..: lay the panels out and let the starter comp land.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "the starter comp must reach the mirror"
+        );
+
+        let start = {
+            let node = app.graph.node(NodeId(1)).expect("node #1 in mirror");
+            (node.x, node.y)
+        };
+        let canvas_rect = app
+            .canvas
+            .last_canvas_rect
+            .expect("the canvas must have been laid out");
+
+        // Aim at a point inside node #1's body.
+        let press = app
+            .canvas
+            .world_to_screen(canvas_rect, Pos2::new(start.0 + 20.0, start.1 + 20.0));
+        let dragged = press + egui::vec2(40.0, 30.0);
+
+        // Frame: press on the node body.
+        run_app_frame(
+            &ctx,
+            &mut app,
+            screen,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+
+        // Frame: drag.
+        run_app_frame(
+            &ctx,
+            &mut app,
+            screen,
+            vec![egui::Event::PointerMoved(dragged)],
+        );
+
+        // Frame: release.
+        run_app_frame(
+            &ctx,
+            &mut app,
+            screen,
+            vec![egui::Event::PointerButton {
+                pos: dragged,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+
+        let moved = {
+            let node = app.graph.node(NodeId(1)).expect("node #1 in mirror");
+            (node.x, node.y)
+        };
+        assert!(
+            (moved.0 - start.0).abs() > 1.0 || (moved.1 - start.1).abs() > 1.0,
+            "the drag must move node #1 from {start:?}, still at {moved:?}"
+        );
+
+        // Frame: Ctrl+Z.
+        run_app_frame(
+            &ctx,
+            &mut app,
+            screen,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: Some(egui::Key::Z),
+                pressed: true,
+                repeat: false,
+                modifiers: ctrl(),
+            }],
+        );
+
+        // The kernel round-trips asynchronously; keep pumping until it lands.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let node = app.graph.node(NodeId(1)).expect("node #1 in mirror");
+            if (node.x - start.0).abs() < 1e-3 && (node.y - start.1).abs() < 1e-3 {
+                break;
+            }
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let restored = {
+            let node = app.graph.node(NodeId(1)).expect("node #1 in mirror");
+            (node.x, node.y)
+        };
+        assert!(
+            (restored.0 - start.0).abs() < 1e-3 && (restored.1 - start.1).abs() < 1e-3,
+            "Ctrl+Z must restore node #1 to {start:?}, got {restored:?}"
+        );
+
+        // One more frame must re-lay the canvas out from the restored mirror,
+        // otherwise the node stays visually stuck where it was dropped.
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+        let laid_out = app
+            .canvas
+            .node_position(NodeId(1))
+            .expect("node #1 must have a canvas position");
+        assert!(
+            (laid_out.x - start.0).abs() < 1e-3 && (laid_out.y - start.1).abs() < 1e-3,
+            "the canvas must redraw node #1 at {start:?}, got {laid_out:?}"
+        );
     }
 }

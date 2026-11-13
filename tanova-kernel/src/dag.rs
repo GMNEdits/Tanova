@@ -15,7 +15,16 @@ use crate::command::{EdgeSnapshot, NodeSnapshot};
 use crate::governor::{MemoryGovernor, RenderEpoch, evaluate_with_airbag};
 use crate::knobs::{KnobTable, KnobValue, canonical_f64};
 use crate::registry::find_cartridge;
-use crate::types::{EvalContext, NodeError, NodeTrait, Packet};
+use crate::types::{EvalContext, NodeError, NodeTrait, Packet, ProjectFormat};
+
+/// Static cartridge default width for source nodes (`Constant`).
+///
+/// Duplicated from `tanova-nodes` because the kernel cannot depend on the
+/// cartridge crate; a node's knob at this value means "still untouched".
+const DEFAULT_FORMAT_WIDTH: i64 = 1920;
+
+/// Static cartridge default height for source nodes (`Constant`).
+const DEFAULT_FORMAT_HEIGHT: i64 = 1080;
 
 /// A directed connection from an upstream output to a downstream input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -259,6 +268,8 @@ pub struct Dag {
     cache: RamCache,
     /// Most recent op hash per node, used for targeted cache invalidation.
     node_hashes: HashMap<NodeId, OpHash>,
+    /// Active project format, stamped onto source cartridges when they spawn.
+    project_format: Option<ProjectFormat>,
 }
 
 impl Dag {
@@ -274,7 +285,16 @@ impl Dag {
             edges: Vec::new(),
             cache: RamCache::new(capacity),
             node_hashes: HashMap::new(),
+            project_format: None,
         }
+    }
+
+    /// Records the active project format so newly spawned sources inherit it.
+    ///
+    /// Mirrors `GraphMirror::set_project_format` on the UI side so the kernel
+    /// and the panel agree on a Constant's initial `format_width`/`format_height`.
+    pub fn set_project_format(&mut self, format: Option<ProjectFormat>) {
+        self.project_format = format;
     }
 
     /// Borrows a node.
@@ -503,6 +523,35 @@ impl Dag {
         node.x = x;
         node.y = y;
         Ok(())
+    }
+
+    /// Stamps the active project format onto a freshly added source node.
+    ///
+    /// Only a node whose `format_width`/`format_height` knobs still sit at the
+    /// cartridge's static 1920x1080 default is rewritten, so user-edited values
+    /// are never clobbered. With no project format active the defaults stay put,
+    /// which keeps standalone node and kernel tests unchanged.
+    fn stamp_project_format(&mut self, id: NodeId) {
+        let Some(format) = self.project_format else {
+            return;
+        };
+        let Some(node) = self.nodes.get_mut(&id) else {
+            return;
+        };
+        let width_is_default = matches!(
+            node.knobs.get("format_width"),
+            Some(KnobValue::Int(value)) if *value == DEFAULT_FORMAT_WIDTH
+        );
+        let height_is_default = matches!(
+            node.knobs.get("format_height"),
+            Some(KnobValue::Int(value)) if *value == DEFAULT_FORMAT_HEIGHT
+        );
+        if width_is_default && height_is_default {
+            node.knobs
+                .insert("format_width", KnobValue::Int(format.width as i64));
+            node.knobs
+                .insert("format_height", KnobValue::Int(format.height as i64));
+        }
     }
 
     /// Adds a node with its cartridge attached.
@@ -745,6 +794,7 @@ impl Dag {
         match command {
             UndoableCommand::AddNode { id, kind, x, y } => {
                 self.add_node_at(id, kind.clone(), x, y)?;
+                self.stamp_project_format(id);
                 Ok(UndoableCommand::AddNode { id, kind, x, y })
             }
             UndoableCommand::RemoveNode { id, .. } => {
@@ -796,12 +846,24 @@ impl Dag {
                     node,
                     knob,
                     value,
-                    previous: _,
+                    previous,
                 } = cmd
                 {
                     self.set_knob(node, knob.clone(), value.clone())?;
+                    // Keep the caller's `previous`. The properties panel
+                    // latches the value the artist saw before the edit started
+                    // and reports it on every keystroke of that session, so
+                    // overwriting it here would split the session's undo into
+                    // the intermediate keystrokes (`1.0 -> 0.0 -> 0.5`).
+                    Ok(UndoableCommand::SetKnob {
+                        node,
+                        knob,
+                        value,
+                        previous,
+                    })
+                } else {
+                    Ok(command)
                 }
-                Ok(command)
             }
             UndoableCommand::MoveNode {
                 id,
