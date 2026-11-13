@@ -235,10 +235,16 @@ pub fn merge_pixel(
 }
 
 /// Reads a mask pixel: alpha if present, else red, else fully opaque.
+///
+/// Out-of-bounds samples always return 0.0 so a differently sized mask never
+/// causes a panic or undefined behavior, regardless of the mask's edge mode.
 pub fn mask_value(mask: Option<&Raster2D>, x: i32, y: i32) -> f32 {
     let Some(raster) = mask else {
         return 1.0;
     };
+    if !raster.bbox.contains(x, y) {
+        return 0.0;
+    }
     if raster.channels.contains_key(&Channel::RgbaAlpha) {
         raster.sample(&Channel::RgbaAlpha, x, y)
     } else if raster.channels.contains_key(&Channel::RgbaRed) {
