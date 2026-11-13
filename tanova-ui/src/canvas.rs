@@ -11,8 +11,8 @@ use egui::{
     Sense, Shape, Stroke, StrokeKind, Ui, Vec2, epaint::CubicBezierShape,
 };
 use tanova_kernel::{
-    EdgeSnapshot, KernelEvent, KernelMessage, KnobTable, NodeId, PortId, UndoableCommand,
-    find_cartridge,
+    EdgeSnapshot, KernelEvent, KernelMessage, KnobTable, KnobValue, NodeId, PortId, ProjectFormat,
+    UndoableCommand, find_cartridge,
 };
 
 use crate::workflow::ViewerWorkflow;
@@ -97,9 +97,17 @@ impl CanvasEdge {
 pub struct GraphMirror {
     nodes: Vec<CanvasNode>,
     edges: Vec<CanvasEdge>,
+    /// Active project format, used to stamp source cartridges on spawn.
+    project_format: Option<ProjectFormat>,
 }
 
 impl GraphMirror {
+    /// Records the active project format so newly spawned sources can inherit
+    /// it instead of the cartridge's static default.
+    pub fn set_project_format(&mut self, format: ProjectFormat) {
+        self.project_format = Some(format);
+    }
+
     /// Nodes in creation order.
     pub fn nodes(&self) -> &[CanvasNode] {
         &self.nodes
@@ -201,9 +209,20 @@ impl GraphMirror {
         match command {
             UndoableCommand::AddNode { id, kind, x, y } => {
                 if !self.nodes.iter().any(|node| node.id == *id) {
-                    let knobs = find_cartridge(kind)
+                    let mut knobs = find_cartridge(kind)
                         .map(|descriptor| (descriptor.default_knobs)())
                         .unwrap_or_default();
+                    // Source cartridges default to 1920x1080; when a project
+                    // format is active, stamp the real resolution so a fresh
+                    // Constant matches the viewer instead of oversizing.
+                    if let Some(format) = self.project_format {
+                        if knobs.contains_key("format_width") {
+                            knobs.insert("format_width", KnobValue::Int(format.width as i64));
+                        }
+                        if knobs.contains_key("format_height") {
+                            knobs.insert("format_height", KnobValue::Int(format.height as i64));
+                        }
+                    }
                     self.nodes.push(CanvasNode {
                         id: *id,
                         kind: kind.clone(),
@@ -383,8 +402,10 @@ pub struct NodeCanvasState {
     /// `InputState::keys_down` survives `consume_key`, so the rising edge still
     /// fires even when egui's focus pass has already eaten the key event.
     pub was_tab_down: bool,
-    drag_node: Option<NodeId>,
-    /// Canvas positions of selected nodes when a group drag began.
+    /// True while a latched node-body drag is in progress.
+    dragging_nodes: bool,
+    /// Last position mirrored to the kernel for each dragged node. Used as the
+    /// `from` side of the next per-frame `MoveNode`.
     drag_start_positions: HashMap<NodeId, Pos2>,
     /// Monotonic high-water mark for node id allocation. Never decreases, so
     /// deleting the highest node and spawning a new one never reuses a deleted
@@ -411,7 +432,7 @@ impl Default for NodeCanvasState {
             box_selection: None,
             tab_search: None,
             was_tab_down: false,
-            drag_node: None,
+            dragging_nodes: false,
             drag_start_positions: HashMap::new(),
             next_node_id: 1,
             box_dragging: false,
@@ -662,19 +683,7 @@ impl NodeCanvas {
             messages.extend(cancel_wire_drag(state));
         }
 
-        if primary_pressed && response.hovered() {
-            // Any click on the canvas dismisses open menus. Clicks inside a
-            // popup never reach this response, so menu items still work.
-            state.context_menu_open = false;
-            state.context_menu_pos = None;
-            state.node_menu_open = false;
-            state.node_menu_pos = None;
-            state.node_menu_node = None;
-
-            // Clicking the graph also ends knob editing, so `Delete` removes
-            // the selection instead of a character in the last focused field.
-            ui.memory_mut(|memory| memory.stop_text_input());
-
+        if primary_pressed {
             if let Some(pointer) = pointer_pos {
                 if let Some((to_node, to_port)) = hit_input_port(state, graph, pointer, rect) {
                     // Grabbing a connected port rips the wire off, but the
@@ -688,32 +697,36 @@ impl NodeCanvas {
                         }),
                         None => Some(WireDrag::FromInput { to_node, to_port }),
                     };
+                    state.box_selection = None;
+                    state.dragging_nodes = false;
                 } else if let Some(from_node) = hit_output_port(state, graph, pointer, rect) {
                     state.active_wire_drag = Some(WireDrag::FromOutput {
                         from_node,
                         from_port: PortId(0),
                     });
+                    state.box_selection = None;
+                    state.dragging_nodes = false;
                 } else if let Some(node) = hit_node(state, graph, pointer, rect) {
                     apply_node_click(state, node, shift);
-                    if state.selected_nodes.contains(&node) {
-                        state.drag_node = Some(node);
-                        // Record start positions for all selected nodes so we
-                        // can emit MoveNode commands on release.
-                        state.drag_start_positions.clear();
-                        for id in &state.selected_nodes {
-                            if let Some(pos) = state.node_position(*id) {
-                                state.drag_start_positions.insert(*id, pos);
-                            }
+                    state.dragging_nodes = true;
+                    // Seed the mirrored position of every selected node so the
+                    // per-frame `MoveNode` stream starts from where they are.
+                    state.drag_start_positions.clear();
+                    for id in &state.selected_nodes {
+                        if let Some(pos) = state.node_position(*id) {
+                            state.drag_start_positions.insert(*id, pos);
                         }
                     }
+                } else {
                     // Empty background: start a world-space box selection.
+                    state.dragging_nodes = false;
                     if !shift {
                         state.selected_nodes.clear();
+                    } else {
                         state.primary_selected = None;
                     }
                     state.box_selection = Some((pointer, pointer));
                     state.box_dragging = true;
-                    state.drag_node = None;
                 }
             }
         }
@@ -725,15 +738,36 @@ impl NodeCanvas {
                         state.box_selection = Some((start, pointer));
                     }
                 }
-            } else if let Some(anchor) = state.drag_node {
-                if state.selected_nodes.contains(&anchor) {
-                    // Group drag: every selected node moves together in world
-                    // units, so the motion matches the cursor at any zoom.
-                    let delta = pointer_delta / state.zoom.max(MIN_ZOOM);
+            } else if state.dragging_nodes {
+                // Apply the pointer delta in world units so motion matches the
+                // cursor at any zoom, then mirror it to the kernel immediately.
+                // The undo stack coalesces the stream into one gesture.
+                let delta = pointer_delta / state.zoom.max(MIN_ZOOM);
+                if delta.length_sq() > 1e-9 {
+                    let mut moves: Vec<UndoableCommand> = Vec::new();
                     for id in &state.selected_nodes {
-                        if let Some(position) = state.positions.get_mut(id) {
-                            *position += delta;
-                        }
+                        let Some(position) = state.positions.get_mut(id) else {
+                            continue;
+                        };
+                        let from = *position;
+                        let to = from + delta;
+                        *position = to;
+                        state.drag_start_positions.insert(*id, to);
+                        moves.push(UndoableCommand::MoveNode {
+                            id: *id,
+                            from_x: from.x,
+                            from_y: from.y,
+                            to_x: to.x,
+                            to_y: to.y,
+                        });
+                    }
+                    // Sort by NodeId for deterministic ordering.
+                    moves.sort_by_key(|cmd| match cmd {
+                        UndoableCommand::MoveNode { id, .. } => *id,
+                        _ => NodeId(0),
+                    });
+                    if let Some(batch) = UndoableCommand::from_vec(moves) {
+                        messages.push(KernelMessage::Execute(batch));
                     }
                 }
             }
@@ -829,36 +863,12 @@ impl NodeCanvas {
                 }
             }
 
-            // Emit MoveNode commands for any group drag that just ended.
-            if !state.drag_start_positions.is_empty() {
-                let mut moves: Vec<UndoableCommand> = Vec::new();
-                for id in &state.selected_nodes {
-                    if let (Some(&start), Some(pos)) =
-                        (state.drag_start_positions.get(id), state.node_position(*id))
-                    {
-                        if (pos - start).length_sq() > 1e-6 {
-                            moves.push(UndoableCommand::MoveNode {
-                                id: *id,
-                                from_x: start.x,
-                                from_y: start.y,
-                                to_x: pos.x,
-                                to_y: pos.y,
-                            });
-                        }
-                    }
-                }
-                // Sort by NodeId for deterministic ordering.
-                moves.sort_by_key(|cmd| match cmd {
-                    UndoableCommand::MoveNode { id, .. } => *id,
-                    _ => NodeId(0),
-                });
-                if let Some(batch) = UndoableCommand::from_vec(moves) {
-                    messages.push(KernelMessage::Execute(batch));
-                }
+            // The per-frame `MoveNode` stream already reached the kernel, so
+            // releasing only clears the latched drag.
+            if state.dragging_nodes {
+                state.dragging_nodes = false;
                 state.drag_start_positions.clear();
             }
-
-            state.drag_node = None;
         }
 
         if middle_down {
@@ -2354,5 +2364,333 @@ mod tests {
             }
             other => panic!("expected an AddNode for Grade, got {other:?}"),
         }
+    }
+
+    /// 3-frame test: dragging on empty canvas background starts a box selection,
+    /// not a node drag. On release, nodes inside the selection box are selected.
+    #[test]
+    fn empty_canvas_drag_performs_box_selection() {
+        let ctx = egui::Context::default();
+        let mut graph = GraphMirror::default();
+        graph.apply_event(&KernelEvent::Applied(add_node(1, 500.0, 500.0)));
+        let mut canvas = NodeCanvasState::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0));
+
+        let pointer_pos_1 = Pos2::new(38.0, 70.0);
+        let pointer_pos_2 = Pos2::new(508.0, 440.0);
+
+        // Frame 1: pointer moves to empty canvas coordinate (30, 30 world)
+        // and presses primary.
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pointer_pos_1),
+                    egui::Event::PointerButton {
+                        pos: pointer_pos_1,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let _ =
+                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            canvas.box_selection.is_some(),
+            "box selection should start on empty canvas drag"
+        );
+        assert!(!canvas.dragging_nodes);
+
+        // Frame 2: pointer drags to world (500, 400) while holding primary.
+        // Screen pos = rect.min + (500, 400) = (508, 440).
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pointer_pos_2),
+                    egui::Event::PointerButton {
+                        pos: pointer_pos_2,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let _ =
+                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            canvas.box_selection.is_some(),
+            "box selection should still be active during drag"
+        );
+        assert!(!canvas.dragging_nodes);
+
+        // Frame 3: pointer releases primary.
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer_pos_2,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let _ =
+                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            canvas.box_selection.is_none(),
+            "box selection should be cleared on release"
+        );
+        assert!(!canvas.dragging_nodes);
+        // No nodes are inside the selection box (node is at world (500,500)
+        // which is outside the selection box from world (30,30) to (500,400)).
+        assert!(canvas.selected_nodes.is_empty());
+    }
+
+    /// 3-frame test: dragging on a node body moves the node, never starts box
+    /// selection.
+    #[test]
+    fn node_body_drag_moves_node_without_box_selection() {
+        let ctx = egui::Context::default();
+        let mut graph = GraphMirror::default();
+        graph.apply_event(&KernelEvent::Applied(add_node(1, 100.0, 100.0)));
+        assert!(
+            graph.node(NodeId(1)).is_some(),
+            "NodeId(1) should be in graph"
+        );
+        let mut canvas = NodeCanvasState::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0));
+
+        // Frame 1: pointer at NodeId(1)'s center (100, 100 world) and presses.
+        // Canvas rect starts at (8, 40), so screen pos = (108, 140).
+        let pointer_pos_1 = Pos2::new(108.0, 140.0);
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pointer_pos_1),
+                    egui::Event::PointerButton {
+                        pos: pointer_pos_1,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let _ =
+                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            canvas.dragging_nodes,
+            "node drag should be latched on press"
+        );
+        assert!(
+            canvas.box_selection.is_none(),
+            "no box selection on node press"
+        );
+
+        // Frame 2: pointer drags by (40, 20) while holding primary.
+        let pointer_pos_2 = Pos2::new(158.0, 160.0); // pointer_pos_1 + (50, -30)
+        let mut messages = Vec::new();
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pointer_pos_2),
+                    egui::Event::PointerButton {
+                        pos: pointer_pos_2,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        messages =
+                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            canvas.box_selection.is_none(),
+            "box selection should not start on node drag"
+        );
+        assert!(canvas.dragging_nodes, "node drag should be latched");
+
+        // Check that a MoveNode command was emitted for NodeId(1).
+        let move_msgs: Vec<_> = messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    KernelMessage::Execute(UndoableCommand::MoveNode { id, .. }) if *id == NodeId(1)
+                )
+            })
+            .collect();
+        assert!(
+            !move_msgs.is_empty(),
+            "MoveNode command should be emitted for node drag"
+        );
+
+        // Frame 3: pointer releases primary.
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer_pos_2,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let _ =
+                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(!canvas.dragging_nodes, "drag should end on release");
+    }
+
+    /// Pre-select two nodes, drag on one body, and assert a single Batch MoveNode
+    /// containing both nodes is emitted, with no box selection.
+    #[test]
+    fn group_node_drag_moves_all_selected_nodes_in_batch() {
+        let ctx = egui::Context::default();
+        let mut graph = GraphMirror::default();
+        graph.apply_event(&KernelEvent::Applied(add_node(1, 100.0, 100.0)));
+        graph.apply_event(&KernelEvent::Applied(add_node(2, 300.0, 300.0)));
+        let mut canvas = NodeCanvasState::default();
+        // Pre-select both nodes.
+        canvas.selected_nodes.insert(NodeId(1));
+        canvas.selected_nodes.insert(NodeId(2));
+        canvas.primary_selected = Some(NodeId(1));
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0));
+
+        // Frame 1: pointer at NodeId(1)'s center (100, 100 world = 108, 140 screen) and presses.
+        let pointer_pos_1 = Pos2::new(108.0, 140.0);
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pointer_pos_1),
+                    egui::Event::PointerButton {
+                        pos: pointer_pos_1,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let _ =
+                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(canvas.dragging_nodes, "group drag should be latched");
+
+        // Frame 2: pointer drags by (50, -30) while holding primary.
+        // Screen pos = (108+50, 140-30) = (158, 110).
+        let pointer_pos_2 = Pos2::new(158.0, 160.0);
+        let mut messages = Vec::new();
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pointer_pos_2),
+                    egui::Event::PointerButton {
+                        pos: pointer_pos_2,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        messages =
+                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            canvas.box_selection.is_none(),
+            "box selection should not start on group drag"
+        );
+
+        // Find the Batch MoveNode command.
+        let batch_msgs: Vec<_> = messages
+            .iter()
+            .filter(|m| match m {
+                KernelMessage::Execute(UndoableCommand::Batch(cmds)) => cmds
+                    .iter()
+                    .map(|c| match c {
+                        UndoableCommand::MoveNode { id, .. } => *id,
+                        _ => NodeId(0),
+                    })
+                    .eq([NodeId(1), NodeId(2)]),
+                _ => false,
+            })
+            .collect();
+        assert!(
+            !batch_msgs.is_empty(),
+            "Batch MoveNode for both nodes should be emitted"
+        );
     }
 }

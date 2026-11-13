@@ -320,6 +320,8 @@ impl TanovaApp {
         // rasters at this resolution so downstream Transform/Merge2 stay
         // aligned with the viewer frame.
         context.insert(ProjectFormat::new(STARTER_SIZE as u32, STARTER_SIZE as u32));
+        self.graph
+            .set_project_format(ProjectFormat::new(STARTER_SIZE as u32, STARTER_SIZE as u32));
 
         let seed = [
             KernelMessage::SetBaseContext(context),
@@ -384,7 +386,14 @@ impl TanovaApp {
 
     /// Non-blocking drain of kernel events and frame notifications.
     fn pump(&mut self) {
+        let mut graph_updated = false;
         while let Ok(event) = self.kernel.events().try_recv() {
+            if matches!(
+                event,
+                KernelEvent::Applied(_) | KernelEvent::Undone(_) | KernelEvent::Redone(_)
+            ) {
+                graph_updated = true;
+            }
             self.fold_event(event);
         }
         let mut frame_received = false;
@@ -393,7 +402,7 @@ impl TanovaApp {
             self.last_frame = Some(frame);
             frame_received = true;
         }
-        if frame_received {
+        if frame_received || graph_updated {
             self.awaiting_kernel = false;
         }
     }
@@ -498,9 +507,9 @@ impl TanovaApp {
 
     /// Sends every message the UI asked for, syncing viewer state first.
     ///
-    /// `SetKnob` commands are optimistically applied to the local `GraphMirror`
-    /// before being sent to the kernel, so the UI stays in sync with zero
-    /// jump-back on mouse release while the kernel round-trips.
+    /// `SetKnob` and `MoveNode` commands are optimistically applied to the local
+    /// `GraphMirror` before being sent to the kernel, so the UI stays in sync
+    /// with zero jump-back on mouse release while the kernel round-trips.
     ///
     /// Sets `awaiting_kernel` so egui keeps repainting until the new frame
     /// arrives, eliminating visual lag on undo/redo and drag release.
@@ -513,17 +522,31 @@ impl TanovaApp {
                 self.viewer.bind(*node);
             }
             if let KernelMessage::Execute(command) = &message {
-                if let UndoableCommand::SetKnob { .. } = command {
-                    // Optimistically mirror the knob edit locally so
-                    // PropertiesPanel and ViewerPanel see the new value
-                    // immediately, before the kernel event arrives.
-                    let optimistic = command.clone();
-                    self.graph.apply_command(&optimistic);
-                }
+                let optimistic = command.clone();
+                self.apply_optimistic_mirror_update(&optimistic);
             }
             if let Err(error) = self.kernel.send(message) {
                 self.failure = Some(format!("kernel send failed: {error}"));
             }
+        }
+    }
+
+    /// Optimistically applies a command's effect to the local `GraphMirror`.
+    ///
+    /// Handles `SetKnob`, `MoveNode`, and `Batch` recursively so that the UI
+    /// mirrors knob edits and node moves immediately, before the kernel
+    /// round-trips.
+    fn apply_optimistic_mirror_update(&mut self, command: &UndoableCommand) {
+        match command {
+            UndoableCommand::SetKnob { .. } | UndoableCommand::MoveNode { .. } => {
+                self.graph.apply_command(command);
+            }
+            UndoableCommand::Batch(cmds) => {
+                for cmd in cmds {
+                    self.apply_optimistic_mirror_update(cmd);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -893,5 +916,87 @@ mod tests {
         }
 
         kernel.shutdown();
+    }
+
+    /// A `Constant` spawned via `AddNode` in a `ProjectFormat(256, 256)` graph
+    /// should have its `format_width`/`format_height` knobs stamped to 256/256.
+    /// Editing only `format_width` to 128 keeps `format_height` at 256.
+    #[test]
+    fn spawned_constant_inherits_project_format_knobs() {
+        use tanova_kernel::{KnobValue, UndoableCommand};
+        use tanova_ui::GraphMirror;
+
+        let mut graph = GraphMirror::default();
+        graph.set_project_format(tanova_kernel::ProjectFormat::new(256, 256));
+
+        // Spawn a new Constant node via AddNode.
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(10),
+            kind: "Constant".to_string(),
+            x: 40.0,
+            y: 40.0,
+        });
+
+        // Check the GraphMirror: format_width should be 256 (from project format),
+        // not the cartridge default 1920.
+        let constant_node = graph.node(NodeId(10)).expect("Constant #10 should exist");
+        let format_width = constant_node
+            .knobs
+            .get("format_width")
+            .and_then(|v| match v {
+                KnobValue::Int(w) => Some(w),
+                _ => None,
+            });
+        let format_height = constant_node
+            .knobs
+            .get("format_height")
+            .and_then(|v| match v {
+                KnobValue::Int(h) => Some(h),
+                _ => None,
+            });
+        assert_eq!(
+            format_width,
+            Some(&256i64),
+            "format_width should be 256 from project format, got {format_width:?}"
+        );
+        assert_eq!(
+            format_height,
+            Some(&256i64),
+            "format_height should be 256 from project format, got {format_height:?}"
+        );
+
+        // Now edit only format_width to 128; format_height should stay 256.
+        graph.apply_command(&UndoableCommand::SetKnob {
+            node: NodeId(10),
+            knob: "format_width".to_string(),
+            value: KnobValue::Int(128),
+            previous: KnobValue::Int(256),
+        });
+
+        let constant_node = graph.node(NodeId(10)).expect("Constant #10 should exist");
+        let format_width = constant_node
+            .knobs
+            .get("format_width")
+            .and_then(|v| match v {
+                KnobValue::Int(w) => Some(w),
+                _ => None,
+            });
+        let format_height = constant_node
+            .knobs
+            .get("format_height")
+            .and_then(|v| match v {
+                KnobValue::Int(h) => Some(h),
+                _ => None,
+            });
+        assert_eq!(
+            format_width,
+            Some(&128i64),
+            "format_width should be 128 after edit, got {format_width:?}"
+        );
+        assert_eq!(
+            format_height,
+            Some(&256i64),
+            "format_height should stay 256 when only width is edited, got {format_height:?}"
+        );
     }
 }

@@ -903,16 +903,18 @@ fn apply_and_record(
 /// These invalidate every cached op hash downstream of the change, so the
 /// worker drops the packet cache before the next render.
 fn changes_topology(command: &UndoableCommand) -> bool {
-    matches!(
-        command,
-        UndoableCommand::AddNode { .. }
-            | UndoableCommand::RemoveNode { .. }
-            | UndoableCommand::RestoreNode { .. }
-            | UndoableCommand::ConnectEdge { .. }
-            | UndoableCommand::DisconnectEdge { .. }
-            | UndoableCommand::Batch(_)
-            | UndoableCommand::MoveNode { .. }
-    )
+    match command {
+        UndoableCommand::MoveNode { .. } => false,
+        UndoableCommand::Batch(cmds) => cmds.iter().any(changes_topology),
+        _ => matches!(
+            command,
+            UndoableCommand::AddNode { .. }
+                | UndoableCommand::RemoveNode { .. }
+                | UndoableCommand::RestoreNode { .. }
+                | UndoableCommand::ConnectEdge { .. }
+                | UndoableCommand::DisconnectEdge { .. }
+        ),
+    }
 }
 
 /// Atomically routes a physical `Viewer` node at `target_node`.
