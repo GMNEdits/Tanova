@@ -105,6 +105,47 @@ impl GraphMirror {
         self.project_format = Some(format);
     }
 
+    /// Clears all nodes and edges, preserving `project_format`.
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.edges.clear();
+    }
+
+    /// Rebuilds the mirror directly from a kernel `Dag`, populating nodes with
+    /// their exact `id`, `kind`, `x`, `y`, and `knobs`, plus all edges, so a
+    /// loaded `.nk` script immediately displays on the canvas.
+    pub fn from_dag(
+        dag: &tanova_kernel::Dag,
+        _viewer_node: Option<NodeId>,
+        project_format: Option<ProjectFormat>,
+    ) -> Self {
+        let nodes: Vec<CanvasNode> = dag
+            .nodes()
+            .map(|node| CanvasNode {
+                id: node.id,
+                kind: node.kind.clone(),
+                crashed: None,
+                knobs: node.knobs.clone(),
+                x: node.x,
+                y: node.y,
+            })
+            .collect();
+        let edges: Vec<CanvasEdge> = dag
+            .edges()
+            .map(|edge| CanvasEdge {
+                from_node: edge.from_node,
+                from_port: edge.from_port,
+                to_node: edge.to_node,
+                to_port: edge.to_port,
+            })
+            .collect();
+        Self {
+            nodes,
+            edges,
+            project_format,
+        }
+    }
+
     /// Nodes in creation order.
     pub fn nodes(&self) -> &[CanvasNode] {
         &self.nodes
@@ -123,6 +164,11 @@ impl GraphMirror {
     /// Number of nodes.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Active project format, if any.
+    pub fn project_format(&self) -> Option<ProjectFormat> {
+        self.project_format
     }
 
     /// Number of edges.
@@ -197,7 +243,10 @@ impl GraphMirror {
             }
             KernelEvent::CommandFailed { .. }
             | KernelEvent::EpochChanged(_)
-            | KernelEvent::ViewerChanged(_) => {}
+            | KernelEvent::ViewerChanged(_)
+            | KernelEvent::DirtyStateChanged { .. }
+            | KernelEvent::ScriptSaved { .. }
+            | KernelEvent::ScriptError { .. } => {}
         }
     }
 
@@ -482,6 +531,35 @@ impl NodeCanvasState {
         }
     }
 
+    /// Resets all transient canvas state for a new or loaded script, clearing
+    /// selection, drags, box selection, search, pan/zoom, and rebasing the
+    /// node-id allocator on the mirror's highest id.
+    pub fn reset_for_script(&mut self, mirror: &GraphMirror) {
+        self.selected_nodes.clear();
+        self.primary_selected = None;
+        self.active_wire_drag = None;
+        self.box_selection = None;
+        self.dragging_nodes = false;
+        self.tab_search = None;
+        self.pan = Vec2::ZERO;
+        self.zoom = 1.0;
+        self.drag_start_positions.clear();
+        self.box_dragging = false;
+        self.panning = false;
+        self.context_menu_pos = None;
+        self.context_menu_open = false;
+        self.node_menu_pos = None;
+        self.node_menu_node = None;
+        self.node_menu_open = false;
+        self.next_node_id = mirror
+            .nodes()
+            .iter()
+            .map(|node| node.id.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+    }
+
     /// `true` while the `Tab` quick-search popup owns the keyboard.
     pub fn is_search_open(&self) -> bool {
         self.tab_search.is_some()
@@ -528,12 +606,17 @@ pub struct NodeCanvas;
 
 impl NodeCanvas {
     /// Draws the canvas and returns every kernel message the user asked for.
+    ///
+    /// When `modal_open` is `true`, canvas keyboard shortcuts (`1`, `Delete`,
+    /// `Backspace`) are suppressed so a file modal or unsaved-changes dialog
+    /// owns the keyboard.
     pub fn show(
         ui: &mut Ui,
         state: &mut NodeCanvasState,
         graph: &GraphMirror,
         viewer: Option<NodeId>,
         workflow: ViewerWorkflow,
+        modal_open: bool,
     ) -> Vec<KernelMessage> {
         let mut messages = Vec::new();
 
@@ -1048,7 +1131,11 @@ impl NodeCanvas {
         let keyboard_busy = keyboard_is_busy(ui);
 
         // Nuke binds `1` to "view this node".
-        if ui.input(|input| input.key_pressed(Key::Num1)) && !keyboard_busy && !search_open {
+        if ui.input(|input| input.key_pressed(Key::Num1))
+            && !keyboard_busy
+            && !search_open
+            && !modal_open
+        {
             if let Some(selected) = state.primary_selected {
                 messages.push(viewer_message(graph, workflow, selected));
             }
@@ -1059,6 +1146,7 @@ impl NodeCanvas {
         if delete_pressed
             && !keyboard_busy
             && !search_open
+            && !modal_open
             && state.active_wire_drag.is_none()
             && state.box_selection.is_none()
         {
@@ -2357,8 +2445,14 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        messages =
-                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                        messages = NodeCanvas::show(
+                            ui,
+                            &mut canvas,
+                            &graph,
+                            None,
+                            ViewerWorkflow::Nuke,
+                            false,
+                        );
                     });
                 });
             },
@@ -2389,8 +2483,14 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        messages =
-                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                        messages = NodeCanvas::show(
+                            ui,
+                            &mut canvas,
+                            &graph,
+                            None,
+                            ViewerWorkflow::Nuke,
+                            false,
+                        );
                     });
                 });
             },
@@ -2437,8 +2537,14 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        let _ =
-                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                        let _ = NodeCanvas::show(
+                            ui,
+                            &mut canvas,
+                            &graph,
+                            None,
+                            ViewerWorkflow::Nuke,
+                            false,
+                        );
                     });
                 });
             },
@@ -2469,8 +2575,14 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        let _ =
-                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                        let _ = NodeCanvas::show(
+                            ui,
+                            &mut canvas,
+                            &graph,
+                            None,
+                            ViewerWorkflow::Nuke,
+                            false,
+                        );
                     });
                 });
             },
@@ -2497,8 +2609,14 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        let _ =
-                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                        let _ = NodeCanvas::show(
+                            ui,
+                            &mut canvas,
+                            &graph,
+                            None,
+                            ViewerWorkflow::Nuke,
+                            false,
+                        );
                     });
                 });
             },
@@ -2552,8 +2670,14 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        let _ =
-                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                        let _ = NodeCanvas::show(
+                            ui,
+                            &mut canvas,
+                            &graph,
+                            None,
+                            ViewerWorkflow::Nuke,
+                            false,
+                        );
                     });
                 });
             },
@@ -2614,8 +2738,14 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        let _ =
-                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                        let _ = NodeCanvas::show(
+                            ui,
+                            &mut canvas,
+                            &graph,
+                            None,
+                            ViewerWorkflow::Nuke,
+                            false,
+                        );
                     });
                 });
             },
@@ -2663,8 +2793,14 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        let _ =
-                            NodeCanvas::show(ui, &mut canvas, &graph, None, ViewerWorkflow::Nuke);
+                        let _ = NodeCanvas::show(
+                            ui,
+                            &mut canvas,
+                            &graph,
+                            None,
+                            ViewerWorkflow::Nuke,
+                            false,
+                        );
                     });
                 });
             },
@@ -2757,6 +2893,7 @@ mod tests {
                                 &graph,
                                 None,
                                 ViewerWorkflow::Nuke,
+                                false,
                             );
                         },
                     );
@@ -2795,6 +2932,7 @@ mod tests {
                                 &graph,
                                 None,
                                 ViewerWorkflow::Nuke,
+                                false,
                             );
                         },
                     );
@@ -2834,7 +2972,8 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        messages = NodeCanvas::show(ui, canvas, graph, None, ViewerWorkflow::Nuke);
+                        messages =
+                            NodeCanvas::show(ui, canvas, graph, None, ViewerWorkflow::Nuke, false);
                     });
                 });
             },

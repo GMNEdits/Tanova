@@ -40,6 +40,10 @@ pub struct ParsedNode {
     pub class: String,
     /// Value of the `name` knob, if the script had one.
     pub name: Option<String>,
+    /// Canvas-space X position, when the script declared one.
+    pub xpos: Option<f32>,
+    /// Canvas-space Y position, when the script declared one.
+    pub ypos: Option<f32>,
     /// Knobs explicitly present in the script.
     pub knobs: KnobTable,
     /// Declared input count (ports `0..inputs`).
@@ -238,6 +242,8 @@ impl<'a> Machine<'a> {
         let mut knobs = KnobTable::new();
         let mut name = None;
         let mut explicit_inputs = None;
+        let mut xpos: Option<f32> = None;
+        let mut ypos: Option<f32> = None;
 
         for (body_line, raw) in body {
             let trimmed = raw.trim();
@@ -259,6 +265,21 @@ impl<'a> Machine<'a> {
                 continue;
             }
 
+            // xpos/ypos are layout data, never user knobs — intercept them
+            // here so they never enter ParsedNode.knobs.
+            if let Some(rest) = trimmed.strip_prefix("xpos ") {
+                if let Ok(value) = rest.trim().parse::<f32>() {
+                    xpos = Some(value);
+                }
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("ypos ") {
+                if let Ok(value) = rest.trim().parse::<f32>() {
+                    ypos = Some(value);
+                }
+                continue;
+            }
+
             let Some((knob, raw_value)) = split_knob(trimmed) else {
                 return Err(self.syntax(*body_line, format!("invalid knob line `{trimmed}`")));
             };
@@ -272,7 +293,7 @@ impl<'a> Machine<'a> {
         }
 
         let total_inputs = explicit_inputs.unwrap_or_else(|| default_input_count(class));
-        self.create_node(class, total_inputs, knobs, name)
+        self.create_node(class, total_inputs, knobs, name, xpos, ypos)
     }
 
     fn create_node(
@@ -281,6 +302,8 @@ impl<'a> Machine<'a> {
         total_inputs: usize,
         knobs: KnobTable,
         name: Option<String>,
+        xpos: Option<f32>,
+        ypos: Option<f32>,
     ) -> Result<(), ParseError> {
         let id = NodeId(self.next_id);
         self.next_id += 1;
@@ -298,6 +321,16 @@ impl<'a> Machine<'a> {
         if let Some(dag) = self.dag.as_deref_mut() {
             dag.add_node(id, class)
                 .map_err(|error| ParseError::Kernel(error.to_string()))?;
+            // Apply persisted canvas position before any knobs, so (0,0)
+            // defaults match the DagNode initial state and non-zero values
+            // round-trip through export_to_tcl.
+            if let Some(x) = xpos {
+                dag.set_position(id, x, ypos.unwrap_or(0.0))
+                    .map_err(|error| ParseError::Kernel(error.to_string()))?;
+            } else if let Some(y) = ypos {
+                dag.set_position(id, 0.0, y)
+                    .map_err(|error| ParseError::Kernel(error.to_string()))?;
+            }
             for (knob, value) in knobs.iter() {
                 dag.set_knob(id, knob, value.clone())
                     .map_err(|error| ParseError::Kernel(error.to_string()))?;
@@ -315,6 +348,8 @@ impl<'a> Machine<'a> {
             id,
             class: class.to_string(),
             name: name.clone(),
+            xpos,
+            ypos,
             knobs,
             inputs: total_inputs,
             input_nodes: input_nodes.clone(),
@@ -593,4 +628,93 @@ fn strip_comment(line: &str) -> &str {
         }
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xpos_ypos_round_trip_without_knob_collision() {
+        // Build a graph: Constant at (140, 60), Grade at (140, 210).
+        let mut dag = Dag::new();
+        dag.add_node_at(NodeId(1), "Constant", 140.0, 60.0).unwrap();
+        dag.add_node_at(NodeId(2), "Grade", 140.0, 210.0).unwrap();
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .unwrap();
+
+        // Export to .nk TCL.
+        let tcl = dag.export_to_tcl();
+
+        // The exported script must contain xpos/ypos for non-zero positions.
+        assert!(tcl.contains("xpos 140"), "missing xpos in export: {tcl}");
+        assert!(tcl.contains("ypos 60"), "missing ypos in export: {tcl}");
+        assert!(
+            tcl.contains("ypos 210"),
+            "missing ypos 210 in export: {tcl}"
+        );
+
+        // Load back into a fresh Dag.
+        let mut dag2 = Dag::new();
+        let parsed = load_nk_into_dag(&tcl, &mut dag2).expect("parse should succeed");
+
+        // Both parsed nodes must carry xpos/ypos.
+        let const_parsed = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == NodeId(1))
+            .expect("Constant #1 parsed");
+        let grade_parsed = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == NodeId(2))
+            .expect("Grade #2 parsed");
+        assert_eq!(const_parsed.xpos, Some(140.0));
+        assert_eq!(const_parsed.ypos, Some(60.0));
+        assert_eq!(grade_parsed.xpos, Some(140.0));
+        assert_eq!(grade_parsed.ypos, Some(210.0));
+
+        // Positions must round-trip into the Dag.
+        let const_node = dag2.node(NodeId(1)).expect("Constant #1 in dag");
+        let grade_node = dag2.node(NodeId(2)).expect("Grade #2 in dag");
+        assert!((const_node.x - 140.0).abs() < 1e-4, "x: {:?}", const_node.x);
+        assert!((const_node.y - 60.0).abs() < 1e-4, "y: {:?}", const_node.y);
+        assert!((grade_node.x - 140.0).abs() < 1e-4, "x: {:?}", grade_node.x);
+        assert!((grade_node.y - 210.0).abs() < 1e-4, "y: {:?}", grade_node.y);
+
+        // Neither node may have "xpos" or "ypos" inside its knobs map.
+        assert!(
+            !const_node.knobs.contains_key("xpos"),
+            "xpos must not be a knob"
+        );
+        assert!(
+            !const_node.knobs.contains_key("ypos"),
+            "ypos must not be a knob"
+        );
+        assert!(
+            !grade_node.knobs.contains_key("xpos"),
+            "xpos must not be a knob"
+        );
+        assert!(
+            !grade_node.knobs.contains_key("ypos"),
+            "ypos must not be a knob"
+        );
+    }
+
+    #[test]
+    fn zero_position_is_omitted_from_export() {
+        // A node at (0, 0) must not emit xpos/ypos (backward compat).
+        let mut dag = Dag::new();
+        dag.add_node_at(NodeId(1), "Constant", 0.0, 0.0).unwrap();
+        let tcl = dag.export_to_tcl();
+        assert!(!tcl.contains("xpos"), "xpos must be omitted at zero: {tcl}");
+        assert!(!tcl.contains("ypos"), "ypos must be omitted at zero: {tcl}");
+
+        // Loading a script without xpos/ypos yields (0, 0).
+        let mut dag2 = Dag::new();
+        load_nk_into_dag(&tcl, &mut dag2).expect("parse should succeed");
+        let node = dag2.node(NodeId(1)).expect("node #1");
+        assert!((node.x - 0.0).abs() < 1e-4);
+        assert!((node.y - 0.0).abs() < 1e-4);
+    }
 }

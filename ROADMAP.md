@@ -46,6 +46,18 @@ Implement a `Transform` cartridge with 3x3 matrix concatenation and bilinear fil
 **Milestone 13: Multi-Channel EXR I/O & Timeline Playback (`tanova-io`)**
 Read and write multi-channel OpenEXR frames and drive timeline playback through the message bus.
 
+# TANOVA ROADMAP - PHASE 4: APPLICATION LIFECYCLE & STUDIO PIPELINE
+*AI DIRECTIVE: Execute one milestone at a time. Do not skip or combine milestones.*
+
+**Milestone 14: Application File Menu & Script Lifecycle (`tanova-app`, `tanova-kernel`, `tanova-parse`, `tanova-ui`)**
+Application File Menu (`New`, `Open .nk`, `Save`, `Save As`), `xpos`/`ypos` Layout Persistence, Revision Dirty-State Tracking & Unsaved-Changes Close Guard
+
+**Milestone 15: Node Bypass, Copy/Paste & Duplicate (`tanova-app`, `tanova-kernel`)**
+Node Bypass (`D` Key), Copy/Paste (`Ctrl+C`/`Ctrl+V` via `.nk` TCL Clipboard) & Duplicate
+
+**Milestone 16: Multi-Channel EXR `Write` Cartridge & Sequence Render Execution (`tanova-io`, `tanova-app`)**
+Multi-Channel EXR `Write` Cartridge & Sequence Render Execution
+
 ## Release & Tagging Policy
 
 - Every milestone/version tag must first record all Added, Changed, and Fixed items in `CHANGELOG.md`.

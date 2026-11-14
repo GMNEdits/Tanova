@@ -428,7 +428,23 @@ impl Dag {
 
             let _ = writeln!(out, "{} {{", node.kind);
             let _ = writeln!(out, " inputs {total_inputs}");
+            // Persist non-zero canvas coordinates as xpos/ypos for
+            // round-trip compatibility with .nk loaders. Zero positions are
+            // omitted so existing Milestone 10 scripts remain 100%
+            // compatible. The "xpos" and "ypos" keys are never stored in
+            // node.knobs, so they can never collide with emitted values.
+            if node.x.abs() > 1e-4 {
+                let _ = writeln!(out, " xpos {}", node.x.round() as i32);
+            }
+            if node.y.abs() > 1e-4 {
+                let _ = writeln!(out, " ypos {}", node.y.round() as i32);
+            }
             for (name, value) in node.knobs.iter() {
+                // Skip xpos/ypos knobs if present (they are layout data, not
+                // user parameters).
+                if name == "xpos" || name == "ypos" {
+                    continue;
+                }
                 let _ = writeln!(out, " {name} {}", format_knob_value(value));
             }
             out.push_str("}\n");

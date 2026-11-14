@@ -2364,12 +2364,14 @@ dependencies = [
 name = "tanova-app"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "eframe",
  "egui",
  "pollster 0.4.0",
  "tanova-io",
  "tanova-kernel",
  "tanova-nodes",
+ "tanova-parse",
  "tanova-render",
  "tanova-ui",
  "wgpu",
