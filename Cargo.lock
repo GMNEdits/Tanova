@@ -2381,6 +2381,7 @@ dependencies = [
 name = "tanova-cli"
 version = "0.1.0"
 dependencies = [
+ "tanova-io",
  "tanova-kernel",
  "tanova-nodes",
  "tanova-parse",

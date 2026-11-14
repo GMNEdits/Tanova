@@ -249,6 +249,10 @@ pub enum NodeError {
     /// Any other cartridge-specific failure.
     #[error("{0}")]
     Other(String),
+
+    /// A non-graph operation (e.g. disk write) failed.
+    #[error("execution failed: {0}")]
+    ExecutionFailed(String),
 }
 
 /// The cartridge contract implemented by every node.

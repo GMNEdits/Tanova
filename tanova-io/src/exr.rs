@@ -8,7 +8,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use exr::prelude::{AnyChannels, FlatSamples, Image, Layer, read_first_flat_layer_from_file};
+use exr::prelude::{
+    AnyChannel, AnyChannels, Encoding, FlatSamples, Image, ImageAttributes, IntegerBounds, Layer,
+    LayerAttributes, SmallVec, Vec2, WritableImage, read_first_flat_layer_from_file,
+};
 use tanova_kernel::{MemoryGovernor, NodeError};
 use tanova_render::{
     BBox, Channel, ChannelPlane, EdgeMode, Format, Raster2D, TileBuffer, world_to_tile,
@@ -29,6 +32,131 @@ pub fn load_exr(path: &str, governor: Option<&MemoryGovernor>) -> Result<Raster2
         .map_err(|error| NodeError::Other(format!("failed to read EXR `{path}`: {error}")))?;
 
     raster_from_image(image, governor)
+}
+
+/// Writes a [`Raster2D`] to an OpenEXR file at `path`.
+///
+/// The raster uses Bottom-Left origin (`+Y` up); OpenEXR scanlines run
+/// Top-Left (`+Y` down), so pixels are inverted before writing.
+///
+/// Parent directories are created automatically.
+pub fn write_exr_to_path(
+    path: &std::path::Path,
+    raster: &Raster2D,
+    channels_mode: &str,
+) -> Result<(), NodeError> {
+    // Create parent directories.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                NodeError::ExecutionFailed(format!(
+                    "failed to create directory `{}`: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+
+    let bounds = raster.format.to_bbox();
+    let width = bounds.width().max(1) as usize;
+    let height = bounds.height().max(1) as usize;
+
+    // Build f32 pixel data for each channel, inverting Y from Bottom-Left
+    // (Tanova) to Top-Left (OpenEXR).
+    let mut r_data = Vec::with_capacity(width * height);
+    let mut g_data = Vec::with_capacity(width * height);
+    let mut b_data = Vec::with_capacity(width * height);
+    let mut a_data = Vec::with_capacity(width * height);
+
+    for exr_y in 0..height {
+        let nuke_y = (bounds.max_y - 1) - exr_y as i32;
+        for exr_x in 0..width {
+            let nuke_x = bounds.min_x + exr_x as i32;
+            r_data.push(raster.sample(&Channel::RgbaRed, nuke_x, nuke_y));
+            g_data.push(raster.sample(&Channel::RgbaGreen, nuke_x, nuke_y));
+            b_data.push(raster.sample(&Channel::RgbaBlue, nuke_x, nuke_y));
+            a_data.push(raster.sample(&Channel::RgbaAlpha, nuke_x, nuke_y));
+        }
+    }
+
+    // Build sorted channel map as required by the EXR spec.
+    let mut channel_list: SmallVec<[AnyChannel<FlatSamples>; 4]> = SmallVec::new();
+    channel_list.push(AnyChannel::new("A", FlatSamples::F32(a_data)));
+    channel_list.push(AnyChannel::new("B", FlatSamples::F32(b_data)));
+    channel_list.push(AnyChannel::new("G", FlatSamples::F32(g_data)));
+    channel_list.push(AnyChannel::new("R", FlatSamples::F32(r_data)));
+
+    // Add extra channels when mode is "all".
+    if channels_mode.eq_ignore_ascii_case("all") {
+        for (channel, plane) in raster.channels.iter() {
+            match channel {
+                Channel::DepthZ => {
+                    let mut z_data = Vec::with_capacity(width * height);
+                    for exr_y in 0..height {
+                        let nuke_y = (bounds.max_y - 1) - exr_y as i32;
+                        for exr_x in 0..width {
+                            let nuke_x = bounds.min_x + exr_x as i32;
+                            z_data.push(plane.sample(nuke_x, nuke_y, bounds, raster.edge_mode));
+                        }
+                    }
+                    channel_list.push(AnyChannel::new("Z", FlatSamples::F32(z_data)));
+                }
+                Channel::Custom(name) => {
+                    if name.is_empty() {
+                        continue;
+                    }
+                    if name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+                    {
+                        let mut custom_data = Vec::with_capacity(width * height);
+                        for exr_y in 0..height {
+                            let nuke_y = (bounds.max_y - 1) - exr_y as i32;
+                            for exr_x in 0..width {
+                                let nuke_x = bounds.min_x + exr_x as i32;
+                                custom_data.push(plane.sample(
+                                    nuke_x,
+                                    nuke_y,
+                                    bounds,
+                                    raster.edge_mode,
+                                ));
+                            }
+                        }
+                        channel_list.push(AnyChannel::new(
+                            name.as_str(),
+                            FlatSamples::F32(custom_data),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let sorted_channels = AnyChannels::sort(channel_list);
+
+    let display_window = IntegerBounds {
+        position: Vec2(0, 0),
+        size: Vec2(width, height),
+    };
+    let image_attributes = ImageAttributes::new(display_window);
+    let layer_attributes = LayerAttributes::default();
+    let encoding = Encoding::default();
+
+    let layer = Layer::new(
+        Vec2(width, height),
+        layer_attributes,
+        encoding,
+        sorted_channels,
+    );
+
+    let image = Image::new(image_attributes, layer);
+    (&image)
+        .write()
+        .to_file(path)
+        .map_err(|e| NodeError::ExecutionFailed(e.to_string()))?;
+
+    Ok(())
 }
 
 fn raster_from_image(
@@ -283,5 +411,68 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(matches!(result, Err(NodeError::MemoryExceeded { .. })));
+    }
+
+    #[test]
+    fn write_read_exr_round_trip_y_inversion_and_aov() {
+        use tanova_render::{Channel, Format, Raster2D};
+
+        let width = 64;
+        let height = 64;
+        let format = Format::new("test", width as u32, height as u32, 1.0);
+        let bbox = format.to_bbox();
+        let mut raster = Raster2D::new(format, bbox, Default::default());
+
+        // Bottom-Left pixel (4, 4) -> RGBA
+        raster.set_pixel(Channel::RgbaRed, 4, 4, 0.9, None).unwrap();
+        raster
+            .set_pixel(Channel::RgbaGreen, 4, 4, 0.2, None)
+            .unwrap();
+        raster
+            .set_pixel(Channel::RgbaBlue, 4, 4, 0.4, None)
+            .unwrap();
+        raster
+            .set_pixel(Channel::RgbaAlpha, 4, 4, 1.0, None)
+            .unwrap();
+
+        // Top-Right pixel (59, 59)
+        raster
+            .set_pixel(Channel::RgbaRed, 59, 59, 0.1, None)
+            .unwrap();
+        raster
+            .set_pixel(Channel::RgbaGreen, 59, 59, 0.8, None)
+            .unwrap();
+        raster
+            .set_pixel(Channel::RgbaBlue, 59, 59, 0.3, None)
+            .unwrap();
+        raster
+            .set_pixel(Channel::RgbaAlpha, 59, 59, 0.5, None)
+            .unwrap();
+
+        let path = temp_exr("roundtrip");
+        write_exr_to_path(&path, &raster, "all").expect("write EXR");
+
+        let loaded = load_exr(path.to_str().expect("utf-8 path"), None).expect("load EXR");
+        let _ = std::fs::remove_file(&path);
+
+        // Y-inversion must be symmetric: Bottom-Left (4,4) reads back correctly.
+        let bl = loaded.sample_rgba(4, 4);
+        assert!(
+            (bl[0] - 0.9).abs() < 1e-4
+                && (bl[1] - 0.2).abs() < 1e-4
+                && (bl[2] - 0.4).abs() < 1e-4
+                && (bl[3] - 1.0).abs() < 1e-4,
+            "bottom-left pixel mismatch: {bl:?}"
+        );
+
+        // Top-Right (59,59) reads back correctly.
+        let tr = loaded.sample_rgba(59, 59);
+        assert!(
+            (tr[0] - 0.1).abs() < 1e-4
+                && (tr[1] - 0.8).abs() < 1e-4
+                && (tr[2] - 0.3).abs() < 1e-4
+                && (tr[3] - 0.5).abs() < 1e-4,
+            "top-right pixel mismatch: {tr:?}"
+        );
     }
 }

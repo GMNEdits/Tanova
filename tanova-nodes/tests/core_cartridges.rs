@@ -52,6 +52,7 @@ fn registry_links_every_core_cartridge() {
         "Merge2",
         "Read",
         "Transform",
+        "Write",
     ] {
         assert!(
             kinds.contains(&expected),

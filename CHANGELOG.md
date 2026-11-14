@@ -5,6 +5,23 @@ All notable changes to Tanova are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.4.0] - 2026-11-14
+
+### Added
+
+- **Milestone 16:** Multi-channel OpenEXR `Write` cartridge & sequence render execution
+  - `tanova-io`: `write_exr_to_path()` — 32-bit float EXR writer with Bottom-Left to Top-Left Y-inversion, parent directory creation, `"rgba"`/`"all"` channel modes, and `AnyChannels::sort()`-sorted output.
+  - `tanova-nodes`: `Write` cartridge — zero-copy interactive passthrough of `PortId(0)`; `export_packet_with_write_knobs()` helper resolves `file`/`channels`/`first`/`last` knobs and writes to disk via `write_exr_to_path`.
+  - `tanova-kernel`: `FrameExporter` type (decoupled from `tanova-io`/`tanova-render`); `KernelMessage::ExecuteWriteNode` renders frame sequences to disk without marking the project dirty; `KernelEvent::WriteFrameRendered` / `WriteCompleted` report progress.
+  - `tanova-ui`: `PropertiesPanel::pending_write_render` / `take_pending_write_render()`; `"rgba"`/`"all"` dropdown on `Write` `channels` knob; `[Render Sequence to Disk]` button.
+  - `tanova-app`: `FrameExporter` wired into `base_ctx`; `ExecuteWriteNode` dispatch from `PropertiesPanel`; `last_render_status` displayed in top bar (pure ASCII).
+  - `tanova-cli`: `--out-exr <path>` flag writes the rendered frame as multi-channel OpenEXR.
+
+### Fixed
+
+- `Ctrl+C` / `Ctrl+V` on the Node Canvas now works on Linux eframe (handles both `Event::Copy`/`Event::Paste` and `Key::C`/`Key::V`).
+- Persistent `arboard::Clipboard` handle kept on `TanovaApp` (fixes X11/Wayland instant clipboard-ownership drop).
+
 ## [v0.3.1-ux-hardening] - 2026-11-13
 
 ### Added

@@ -7,6 +7,7 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
+use tanova_io::{resolve_sequence_path, write_exr_to_path};
 use tanova_kernel::{Dag, EvalContext, KnobValue, MemoryGovernor, NodeId, RenderEpoch, Time, View};
 use tanova_parse::{ParsedScript, load_nk_into_dag};
 use tanova_render::Raster2D;
@@ -89,6 +90,13 @@ fn run() -> Result<(), CliError> {
         write_ppm(&path, &raster)?;
         println!("wrote {}", path.display());
     }
+    if let Some(path) = args.out_exr {
+        let resolved =
+            resolve_sequence_path(path.to_str().ok_or("invalid --out-exr path")?, args.frame);
+        let resolved_path = PathBuf::from(resolved);
+        write_exr_to_path(&resolved_path, &raster, "all")?;
+        println!("wrote {}", resolved_path.display());
+    }
     Ok(())
 }
 
@@ -98,6 +106,7 @@ struct Args {
     frame: f64,
     node: Option<String>,
     out_ppm: Option<PathBuf>,
+    out_exr: Option<PathBuf>,
     check_headless: bool,
 }
 
@@ -108,6 +117,7 @@ impl Args {
             frame: 1.0,
             node: None,
             out_ppm: None,
+            out_exr: None,
             check_headless: false,
         };
 
@@ -130,6 +140,9 @@ impl Args {
                 "--out-ppm" => {
                     args.out_ppm = Some(iter.next().ok_or("--out-ppm needs a path")?.into());
                 }
+                "--out-exr" => {
+                    args.out_exr = Some(iter.next().ok_or("--out-exr needs a path")?.into());
+                }
                 "--check-headless" => args.check_headless = true,
                 "--help" | "-h" => {
                     print_usage();
@@ -148,7 +161,7 @@ fn print_usage() {
         "tanova-cli {}\n\
          \n\
          Usage:\n\
-           tanova-cli --script <path.nk> [--frame <f64>] [--node <name|id>] [--out-ppm <path>]\n\
+           tanova-cli --script <path.nk> [--frame <f64>] [--node <name|id>] [--out-ppm <path>] [--out-exr <path>]\n\
            tanova-cli --check-headless\n",
         env!("CARGO_PKG_VERSION")
     );

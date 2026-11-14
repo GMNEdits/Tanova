@@ -355,6 +355,10 @@ struct TanovaApp {
     /// Paste offset cascade: each `Ctrl+V` shifts the next paste by `40pt`.
     /// Resets to `0` on every `Ctrl+C`.
     pub paste_cascade: u32,
+    /// The properties panel, holds `pending_write_render` across frames.
+    pub properties: PropertiesPanel,
+    /// Last render status message (pure ASCII).
+    pub last_render_status: Option<String>,
 }
 
 impl TanovaApp {
@@ -381,6 +385,8 @@ impl TanovaApp {
             internal_clipboard: None,
             os_clipboard: arboard::Clipboard::new().ok(),
             paste_cascade: 0,
+            properties: PropertiesPanel::default(),
+            last_render_status: None,
         };
         app.seed_graph();
         app
@@ -404,6 +410,11 @@ impl TanovaApp {
         // rasters at this resolution so downstream Transform/Merge2 stay
         // aligned with the viewer frame.
         context.insert(ProjectFormat::new(STARTER_SIZE as u32, STARTER_SIZE as u32));
+        // The Write cartridge exports frames to disk via this callback;
+        // the kernel invokes it on `ExecuteWriteNode`.
+        context.insert(tanova_kernel::FrameExporter(std::sync::Arc::new(
+            tanova_nodes::export_packet_with_write_knobs,
+        )));
         self.graph
             .set_project_format(ProjectFormat::new(STARTER_SIZE as u32, STARTER_SIZE as u32));
 
@@ -504,6 +515,32 @@ impl TanovaApp {
             KernelEvent::ScriptSaved { .. } => {}
             KernelEvent::ScriptError { message } => {
                 self.last_script_error = Some(message.clone());
+            }
+            KernelEvent::WriteFrameRendered {
+                node: _,
+                frame,
+                first,
+                last,
+                path,
+            } => {
+                self.last_render_status = Some(format!(
+                    "Rendered frame {frame} of {first}..{last} -> {}",
+                    path.display()
+                ));
+            }
+            KernelEvent::WriteCompleted {
+                node: _,
+                frames_written,
+                last_path,
+            } => {
+                if let Some(path) = last_path {
+                    self.last_render_status = Some(format!(
+                        "Rendered {frames_written} frame(s) -> {}",
+                        path.display()
+                    ));
+                } else {
+                    self.last_render_status = Some(format!("Rendered {frames_written} frame(s)"));
+                }
             }
             // The kernel owns the viewer binding: it may clear it when the
             // target is deleted, or bind it when it creates a physical Viewer.
@@ -948,6 +985,10 @@ impl TanovaApp {
                     ui.separator();
                     ui.colored_label(egui::Color32::from_rgb(235, 90, 90), error);
                 }
+                if let Some(status) = &self.last_render_status {
+                    ui.separator();
+                    ui.label(status);
+                }
                 ui.separator();
                 ui.label("Viewer Mode:");
                 let mut next_workflow = self.workflow;
@@ -984,7 +1025,7 @@ impl TanovaApp {
             .min_size(250.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let messages = PropertiesPanel::show(
+                    let messages = self.properties.show(
                         ui,
                         &self.graph,
                         self.canvas.primary_selected,
@@ -992,6 +1033,12 @@ impl TanovaApp {
                     );
                     self.dispatch(messages);
                 });
+
+                if let Some(write_node_id) = self.properties.take_pending_write_render() {
+                    self.dispatch(vec![KernelMessage::ExecuteWriteNode {
+                        node: write_node_id,
+                    }]);
+                }
             });
 
         let modal_open = self.file_modal.is_some() || self.pending_unsaved.is_some();
@@ -3402,5 +3449,164 @@ mod tests {
         assert_eq!(dup.kind, "Grade");
         assert!((dup.x - 80.0).abs() < 1e-4, "Grade #4 at x=80");
         assert!((dup.y - 204.0).abs() < 1e-4, "Grade #4 at y=204");
+    }
+
+    /// `Write` node interactive evaluation is a pure passthrough (no disk I/O);
+    /// `ExecuteWriteNode` writes the full sequence and leaves the project clean.
+    #[test]
+    fn write_node_interactive_passthrough_and_sequence_render() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        // Let the seeded starter comp round-trip into the mirror.
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        let temp_dir = std::env::temp_dir();
+        let file_pattern = temp_dir.join("shot.%04d.exr");
+        let file_str = file_pattern.to_str().expect("utf-8 path").to_string();
+
+        // Add Write #4 connected to Grade #2 -> Viewer #3.
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(4),
+                kind: "Write".to_string(),
+                x: 40.0,
+                y: 288.0,
+            }))
+            .expect("add Write #4");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::ConnectEdge {
+                from_node: GRADE,
+                from_port: PortId(0),
+                to_node: NodeId(4),
+                to_port: PortId(0),
+            }))
+            .expect("connect Grade -> Write");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::ConnectEdge {
+                from_node: NodeId(4),
+                from_port: PortId(0),
+                to_node: VIEWER,
+                to_port: PortId(0),
+            }))
+            .expect("connect Write -> Viewer");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(4),
+                knob: "file".to_string(),
+                value: KnobValue::Text(file_str.clone()),
+                previous: KnobValue::Text("render.%04d.exr".to_string()),
+            }))
+            .expect("set Write #4 file");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(4),
+                knob: "first".to_string(),
+                value: KnobValue::Int(1),
+                previous: KnobValue::Int(1),
+            }))
+            .expect("set Write #4 first");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(4),
+                knob: "last".to_string(),
+                value: KnobValue::Int(3),
+                previous: KnobValue::Int(1),
+            }))
+            .expect("set Write #4 last");
+        app.pump();
+
+        // Interactive Viewer evaluation must NOT write to disk.
+        let f1 = temp_dir.join("shot.0001.exr");
+        let f2 = temp_dir.join("shot.0002.exr");
+        let f3 = temp_dir.join("shot.0003.exr");
+        // Clean up any stale files from a previous run.
+        let _ = std::fs::remove_file(&f1);
+        let _ = std::fs::remove_file(&f2);
+        let _ = std::fs::remove_file(&f3);
+
+        assert!(
+            !f1.exists(),
+            "interactive passthrough must not write frame 1"
+        );
+        assert!(
+            !f2.exists(),
+            "interactive passthrough must not write frame 2"
+        );
+        assert!(
+            !f3.exists(),
+            "interactive passthrough must not write frame 3"
+        );
+
+        // Mark the script clean before the sequence render.
+        app.kernel
+            .send(KernelMessage::MarkClean)
+            .expect("mark clean");
+        let clean_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < clean_deadline && app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.is_dirty, "script must be clean before render");
+
+        // Dispatch ExecuteWriteNode and wait for completion.
+        app.kernel
+            .send(KernelMessage::ExecuteWriteNode { node: NodeId(4) })
+            .expect("execute write node");
+        let complete_deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < complete_deadline {
+            app.pump();
+            if f1.exists() && f2.exists() && f3.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // All three frames must exist and be valid EXRs.
+        for path in [&f1, &f2, &f3] {
+            assert!(
+                path.exists(),
+                "frame must exist on disk: {}",
+                path.display()
+            );
+            let loaded = tanova_io::load_exr(path.to_str().expect("utf-8 path"), None)
+                .expect("frame must be a valid EXR");
+            let pixel = loaded.sample_rgba(0, 0);
+            // Grade is identity, so the output equals the Constant starter color.
+            for (i, (actual, expected)) in pixel.iter().zip(STARTER_COLOR.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 1e-3,
+                    "frame {} channel {} mismatch: {actual} vs {expected}",
+                    path.display(),
+                    i
+                );
+            }
+        }
+
+        // Rendering must not dirty the project.
+        assert!(!app.is_dirty, "sequence render must not mark project dirty");
+
+        // Status message must be pure ASCII.
+        let status = app.last_render_status.as_deref().unwrap();
+        assert!(status.is_ascii(), "render status must be ASCII: {status:?}");
+
+        // Clean up.
+        let _ = std::fs::remove_file(&f1);
+        let _ = std::fs::remove_file(&f2);
+        let _ = std::fs::remove_file(&f3);
+
+        app.kernel.shutdown();
     }
 }

@@ -35,6 +35,7 @@ const CONTEXT_MENU_KINDS: &[&str] = &[
     "Transform",
     "Blur",
     "Merge2",
+    "Write",
     "Viewer",
 ];
 
@@ -256,7 +257,9 @@ impl GraphMirror {
             | KernelEvent::ViewerChanged(_)
             | KernelEvent::DirtyStateChanged { .. }
             | KernelEvent::ScriptSaved { .. }
-            | KernelEvent::ScriptError { .. } => {}
+            | KernelEvent::ScriptError { .. }
+            | KernelEvent::WriteFrameRendered { .. }
+            | KernelEvent::WriteCompleted { .. } => {}
         }
     }
 

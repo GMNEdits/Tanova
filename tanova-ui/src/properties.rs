@@ -44,13 +44,26 @@ const OPERATIONS: &[&str] = &[
     "over", "under", "plus", "from", "minus", "multiply", "stencil", "mask",
 ];
 const BBOX_MODES: &[&str] = &["union", "B", "A", "intersection"];
+/// Channel export modes for the `Write` node's `channels` knob.
+const CHANNELS_MODES: &[&str] = &["rgba", "all"];
 
 /// Draws controls for every knob on the selected node.
-pub struct PropertiesPanel;
+#[derive(Default)]
+pub struct PropertiesPanel {
+    /// A `Write` node waiting to render its sequence to disk, set when the
+    /// artist clicks `[Render Sequence to Disk]` and consumed by the app.
+    pub pending_write_render: Option<NodeId>,
+}
 
 impl PropertiesPanel {
+    /// Consumes and returns the pending write-render node, if any.
+    pub fn take_pending_write_render(&mut self) -> Option<NodeId> {
+        self.pending_write_render.take()
+    }
+
     /// Renders the panel and returns the commands the user requested.
     pub fn show(
+        &mut self,
         ui: &mut Ui,
         graph: &GraphMirror,
         selected: Option<NodeId>,
@@ -160,6 +173,7 @@ impl PropertiesPanel {
                                     let presets = match name {
                                         "operation" => Some(OPERATIONS),
                                         "bbox" => Some(BBOX_MODES),
+                                        "channels" if node.kind == "Write" => Some(CHANNELS_MODES),
                                         _ => None,
                                     };
                                     if let Some(presets) = presets {
@@ -312,6 +326,14 @@ impl PropertiesPanel {
             });
         });
 
+        // A `Write` node offers a one-click render to disk.
+        if node.kind == "Write" {
+            ui.separator();
+            if ui.button("[Render Sequence to Disk]").clicked() {
+                self.pending_write_render = Some(node_id);
+            }
+        }
+
         messages
     }
 }
@@ -348,7 +370,7 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        messages = PropertiesPanel::show(ui, mirror, Some(NODE), None);
+                        messages = PropertiesPanel::default().show(ui, mirror, Some(NODE), None);
                     });
                 });
             },

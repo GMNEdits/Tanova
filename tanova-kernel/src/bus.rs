@@ -25,6 +25,18 @@ pub struct NodeId(pub u64);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PortId(pub u16);
 
+/// A callback registered by the UI (e.g. `tanova-app`) that exports a single
+/// evaluated frame to disk. Kept in `tanova-kernel` so the kernel thread can
+/// invoke it without depending on `tanova-io` or `tanova-render`.
+pub type FrameExporterFn = std::sync::Arc<
+    dyn Fn(&Packet, &KnobTable, f64) -> Result<std::path::PathBuf, NodeError> + Send + Sync,
+>;
+
+/// Wraps [`FrameExporterFn`] so it can be stored in `EvalContext`'s `TypeMap`
+/// (which requires `Clone + Send + Sync`).
+#[derive(Clone)]
+pub struct FrameExporter(pub FrameExporterFn);
+
 /// A state change the UI asks the kernel to perform.
 ///
 /// Every variant carries enough state to build its own inverse, which is what
@@ -313,6 +325,9 @@ pub enum KernelMessage {
     },
     /// Persist the current DAG to a `.nk` file.
     SaveScript { path: std::path::PathBuf },
+    /// Render a `Write` node's frame sequence to disk via the registered
+    /// `FrameExporter`. Does not mark the project dirty.
+    ExecuteWriteNode { node: NodeId },
     /// Ask the kernel thread to exit.
     Shutdown,
 }
@@ -351,6 +366,28 @@ pub enum KernelEvent {
     ScriptSaved { path: std::path::PathBuf },
     /// A script save or load failed.
     ScriptError { message: String },
+    /// A `Write` node rendered one frame to disk.
+    WriteFrameRendered {
+        /// Node being written.
+        node: NodeId,
+        /// Frame that was written.
+        frame: i32,
+        /// First frame of the sequence.
+        first: i32,
+        /// Last frame of the sequence.
+        last: i32,
+        /// Path the frame was written to.
+        path: std::path::PathBuf,
+    },
+    /// A `Write` node sequence render completed.
+    WriteCompleted {
+        /// Node that was written.
+        node: NodeId,
+        /// Number of frames successfully written.
+        frames_written: usize,
+        /// Path of the last written frame, if any.
+        last_path: Option<std::path::PathBuf>,
+    },
 }
 
 /// Metadata for a rendered frame delivered off-screen to the UI.
@@ -1017,6 +1054,98 @@ fn kernel_loop(
                     }
                 }
                 KernelMessage::Shutdown => shutdown = true,
+                KernelMessage::ExecuteWriteNode { node } => {
+                    // Rendering to disk must not mark the project dirty:
+                    // do not touch `undo` or emit `DirtyStateChanged`.
+                    let Some(dag_node) = dag.node(node) else {
+                        let _ = events.send(KernelEvent::ScriptError {
+                            message: format!("Write node #{} not found in graph", node.0),
+                        });
+                        continue;
+                    };
+                    let knobs = dag_node.knobs.clone();
+
+                    let Some(exporter) = base_ctx.get::<FrameExporter>().cloned() else {
+                        let _ = events.send(KernelEvent::ScriptError {
+                            message: "no FrameExporter registered in EvalContext".to_string(),
+                        });
+                        continue;
+                    };
+
+                    let first = knobs
+                        .get("first")
+                        .and_then(|v| match v {
+                            KnobValue::Int(i) => Some(*i as i32),
+                            _ => None,
+                        })
+                        .unwrap_or(1);
+                    let mut last = knobs
+                        .get("last")
+                        .and_then(|v| match v {
+                            KnobValue::Int(i) => Some(*i as i32),
+                            _ => None,
+                        })
+                        .unwrap_or(1);
+                    if last < first {
+                        last = first;
+                    }
+
+                    let saved_time = base_ctx.time();
+                    let mut frames_written = 0usize;
+                    let mut last_path: Option<std::path::PathBuf> = None;
+                    let mut aborted = false;
+
+                    for f in first..=last {
+                        dag.cache_mut().clear();
+                        base_ctx.insert(Time(f as f64));
+                        let current_epoch = epoch.bump();
+                        match dag.evaluate_pull(node, &base_ctx, &governor, &epoch, current_epoch) {
+                            Ok(packet) => match (exporter.0)(&packet, &knobs, f as f64) {
+                                Ok(path) => {
+                                    frames_written += 1;
+                                    last_path = Some(path.clone());
+                                    let _ = events.send(KernelEvent::WriteFrameRendered {
+                                        node,
+                                        frame: f,
+                                        first,
+                                        last,
+                                        path,
+                                    });
+                                }
+                                Err(e) => {
+                                    aborted = true;
+                                    let _ = events.send(KernelEvent::ScriptError {
+                                        message: format!("Write failed at frame {f}: {e}"),
+                                    });
+                                    break;
+                                }
+                            },
+                            Err(e) => {
+                                aborted = true;
+                                let _ = events.send(KernelEvent::ScriptError {
+                                    message: format!("Write failed at frame {f}: {e}"),
+                                });
+                                break;
+                            }
+                        }
+                    }
+
+                    // Restore the original time and clear the cache so the next
+                    // viewer render is unaffected by the sequence evaluation.
+                    if let Some(t) = saved_time {
+                        base_ctx.insert(Time(t));
+                    }
+                    dag.cache_mut().clear();
+
+                    let _ = events.send(KernelEvent::WriteCompleted {
+                        node,
+                        frames_written,
+                        last_path,
+                    });
+                    if aborted {
+                        continue;
+                    }
+                }
             }
         }
 

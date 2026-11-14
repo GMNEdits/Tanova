@@ -13,8 +13,8 @@ pub mod registry;
 pub mod types;
 
 pub use bus::{
-    FrameNotification, KernelEvent, KernelHandle, KernelMessage, NodeId, PortId, UndoStack,
-    UndoableCommand,
+    FrameExporter, FrameNotification, KernelEvent, KernelHandle, KernelMessage, NodeId, PortId,
+    UndoStack, UndoableCommand,
 };
 pub use command::{EdgeSnapshot, NodeSnapshot};
 pub use dag::{Dag, DagNode, Edge, OpHash, RamCache};

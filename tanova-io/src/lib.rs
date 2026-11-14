@@ -8,5 +8,5 @@ pub mod exr;
 pub mod path;
 
 pub use disk::{CACHE_CAPACITY, CacheEntry, CacheStatus, DiskCache};
-pub use exr::load_exr;
+pub use exr::{load_exr, write_exr_to_path};
 pub use path::resolve_sequence_path;
