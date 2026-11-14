@@ -6,15 +6,17 @@
 //! off-screen through [`FrameNotification`]s.
 
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tanova_io::DiskCache;
 use tanova_kernel::{
-    EvalContext, FrameNotification, KernelEvent, KernelHandle, KernelMessage, KnobValue, NodeId,
-    Packet, PortId, ProjectFormat, UndoableCommand,
+    Dag, EvalContext, FrameNotification, KernelEvent, KernelHandle, KernelMessage, KnobValue,
+    NodeId, Packet, PortId, ProjectFormat, UndoableCommand,
 };
+use tanova_parse::load_nk_into_dag;
 use tanova_render::{GpuComputeEngine, Raster2D};
 use tanova_ui::{
     GraphMirror, NodeCanvas, NodeCanvasState, PropertiesPanel, ViewerPanel, ViewerWorkflow,
@@ -50,6 +52,53 @@ const VIEWER: NodeId = NodeId(3);
 const STARTER_COLOR: [f32; 4] = [0.18, 0.35, 0.65, 1.0];
 /// Small resolution keeps startup and the headless check fast.
 const STARTER_SIZE: i64 = 256;
+
+/// Pending action blocked by unsaved changes, resolved by the confirmation
+/// modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingUnsavedAction {
+    NewScript,
+    OpenScript,
+    QuitApp,
+}
+
+/// In-app file browser modal for Open / Save As.
+#[derive(Debug, Clone)]
+pub enum FileModalState {
+    Open {
+        directory: PathBuf,
+        file_input: String,
+        /// True on the first frame the modal is shown; used to auto-focus
+        /// and select-all the `File:` text input.
+        just_opened: bool,
+    },
+    SaveAs {
+        directory: PathBuf,
+        file_input: String,
+        follow_up: Option<PendingUnsavedAction>,
+        /// True on the first frame the modal is shown; used to auto-focus
+        /// and select-all the `File:` text input.
+        just_opened: bool,
+    },
+}
+
+/// Outcome of one file-modal frame, resolved after `egui::Window` closes.
+///
+/// Using `take()` + `ModalOutcome` guarantees that closing and chained
+/// follow-up modals never collide: `self.file_modal` is set to `None` at the
+/// start of the frame and only restored when the outcome is `KeepOpen`.
+#[derive(Debug, Clone)]
+enum ModalOutcome {
+    KeepOpen,
+    Cancel,
+    ConfirmSave {
+        path: PathBuf,
+        follow_up: Option<PendingUnsavedAction>,
+    },
+    ConfirmOpen {
+        path: PathBuf,
+    },
+}
 
 /// GPU handles shared by the UI thread and the background render thread.
 ///
@@ -281,6 +330,21 @@ struct TanovaApp {
     /// keeps egui repainting until the new frame arrives so there's no visual
     /// lag on undo/redo or drag release.
     awaiting_kernel: bool,
+    /// Current script file path, if any.
+    pub script_path: Option<PathBuf>,
+    /// Whether the graph has unsaved changes.
+    pub is_dirty: bool,
+    /// Last script load/save error, if any.
+    pub last_script_error: Option<String>,
+    /// Open file browser modal, if any.
+    pub file_modal: Option<FileModalState>,
+    /// Action blocked by unsaved changes, if any.
+    pub pending_unsaved: Option<PendingUnsavedAction>,
+    /// Whether the app is allowed to close (set after user confirms discard).
+    pub allow_close: bool,
+    /// Optional clipboard override for headless unit tests (avoids requiring
+    /// an X11/Wayland display server).
+    pub test_clipboard: Option<String>,
 }
 
 impl TanovaApp {
@@ -297,6 +361,13 @@ impl TanovaApp {
             failure: None,
             gpu,
             awaiting_kernel: false,
+            script_path: None,
+            is_dirty: false,
+            last_script_error: None,
+            file_modal: None,
+            pending_unsaved: None,
+            allow_close: false,
+            test_clipboard: None,
         };
         app.seed_graph();
         app
@@ -382,6 +453,9 @@ impl TanovaApp {
                 self.failure = Some(format!("failed to seed the kernel: {error}"));
             }
         }
+        // A freshly seeded app starts clean.
+        let _ = self.kernel.send(KernelMessage::MarkClean);
+        self.is_dirty = false;
     }
 
     /// Non-blocking drain of kernel events and frame notifications.
@@ -411,6 +485,13 @@ impl TanovaApp {
     fn fold_event(&mut self, event: KernelEvent) {
         match &event {
             KernelEvent::EpochChanged(epoch) => self.epoch = *epoch,
+            KernelEvent::DirtyStateChanged { is_dirty } => {
+                self.is_dirty = *is_dirty;
+            }
+            KernelEvent::ScriptSaved { .. } => {}
+            KernelEvent::ScriptError { message } => {
+                self.last_script_error = Some(message.clone());
+            }
             // The kernel owns the viewer binding: it may clear it when the
             // target is deleted, or bind it when it creates a physical Viewer.
             // If the matching frame raced ahead of this event, replay it so the
@@ -482,7 +563,11 @@ impl TanovaApp {
     /// Text fields keep their own editing shortcuts, and an open canvas quick
     /// search owns the keyboard, so both suppress the global binding.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.canvas.is_search_open() {
+        if ctx.egui_wants_keyboard_input()
+            || self.canvas.is_search_open()
+            || self.file_modal.is_some()
+            || self.pending_unsaved.is_some()
+        {
             return;
         }
 
@@ -518,6 +603,9 @@ impl TanovaApp {
             self.awaiting_kernel = true;
         }
         for message in messages {
+            if let KernelMessage::Execute(_) = &message {
+                self.is_dirty = true;
+            }
             if let KernelMessage::SetViewerNode(node) = &message {
                 self.viewer.bind(*node);
             }
@@ -572,6 +660,63 @@ impl TanovaApp {
     fn shutdown(self) {
         self.kernel.shutdown();
     }
+
+    /// Starts a fresh empty script: clears the kernel DAG, mirror, canvas, and
+    /// viewer, and resets the dirty state.
+    pub fn execute_new_script(&mut self) {
+        let _ = self.kernel.send(KernelMessage::NewScript);
+        self.graph.clear();
+        self.canvas.reset_for_script(&self.graph);
+        self.viewer.clear_frame();
+        self.script_path = None;
+        self.is_dirty = false;
+        self.last_script_error = None;
+    }
+
+    /// Opens a `.nk` script from `path`, replacing the current graph. Returns
+    /// an error (and records it in `last_script_error`) without altering the
+    /// current graph on read or parse failure.
+    pub fn execute_open_path(&mut self, path: PathBuf) -> Result<(), String> {
+        let content =
+            std::fs::read_to_string(&path).map_err(|e| format!("failed to read {path:?}: {e}"))?;
+
+        let mut dag = Dag::new();
+        load_nk_into_dag(&content, &mut dag)
+            .map_err(|e| format!("failed to parse {path:?}: {e}"))?;
+
+        let viewer_target = match self.workflow {
+            ViewerWorkflow::Nuke => dag
+                .nodes()
+                .find(|node| node.kind == "Viewer")
+                .map(|node| node.id),
+            ViewerWorkflow::Fusion => None,
+        };
+
+        self.graph = GraphMirror::from_dag(&dag, viewer_target, self.graph.project_format());
+        self.canvas.reset_for_script(&self.graph);
+        self.viewer.clear_frame();
+        self.script_path = Some(path.clone());
+        self.is_dirty = false;
+        self.last_script_error = None;
+
+        self.kernel
+            .send(KernelMessage::ReplaceDag {
+                dag: Box::new(dag),
+                viewer_target,
+            })
+            .map_err(|e| format!("kernel send failed: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Saves the current graph to `path` (appending `.tnv` when no recognized
+    /// extension is present) and marks the script clean.
+    pub fn execute_save_to_path(&mut self, path: PathBuf) {
+        let path = ensure_script_extension(path);
+        self.script_path = Some(path.clone());
+        self.is_dirty = false;
+        let _ = self.kernel.send(KernelMessage::SaveScript { path });
+    }
 }
 
 impl eframe::App for TanovaApp {
@@ -587,14 +732,68 @@ impl TanovaApp {
     /// plain `egui::Ui` instead of an `eframe::Frame`.
     fn draw(&mut self, ui: &mut egui::Ui) {
         self.pump();
+
+        // Bridge Ctrl+V into egui::Event::Paste on backends (e.g. Linux)
+        // that don't emit it automatically. Must run before any modal or
+        // panel so the paste reaches the focused text input.
+        self.bridge_clipboard_paste(ui.ctx());
+
+        // Handle OS window close request (the "X" button) with the dirty
+        // guard.
+        if ui.ctx().input(|i| i.viewport().close_requested()) {
+            self.request_close(PendingUnsavedAction::QuitApp, ui.ctx());
+        }
+
+        // Global keyboard shortcuts for file operations.
+        self.handle_file_shortcuts(ui.ctx());
+
         self.handle_shortcuts(ui.ctx());
         self.advance_timeline();
 
+        // Top status bar: app name, File menu, script name with dirty marker,
+        // stats, viewer mode.
         egui::Panel::top("tanova_status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.strong("Tanova");
                 ui.separator();
-                ui.label(format!("epoch {}", self.epoch));
+                self.draw_file_menu(ui);
+                ui.separator();
+
+                // High-contrast project pill badge.
+                let script_name = self.script_display_name();
+                let badge_text = if self.is_dirty {
+                    format!("{} *", script_name)
+                } else {
+                    script_name
+                };
+                let (text_color, bg_color) = if self.is_dirty {
+                    (
+                        egui::Color32::from_rgb(255, 200, 70),
+                        egui::Color32::from_rgb(72, 48, 18),
+                    )
+                } else {
+                    (
+                        egui::Color32::from_rgb(235, 240, 248),
+                        egui::Color32::from_rgb(42, 52, 68),
+                    )
+                };
+                let hover_text = format!(
+                    "{} (epoch {})",
+                    self.script_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "Unsaved Tanova Project (.tnv)".to_string()),
+                    self.epoch
+                );
+                let badge_response = egui::Frame::new()
+                    .fill(bg_color)
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(&badge_text).strong().color(text_color),
+                        ))
+                    });
+                badge_response.response.on_hover_text(hover_text);
                 ui.separator();
                 ui.label(format!("{} node(s)", self.graph.node_count()));
                 ui.label(format!("{} wire(s)", self.graph.edge_count()));
@@ -618,6 +817,10 @@ impl TanovaApp {
                     ui.separator();
                     ui.colored_label(egui::Color32::from_rgb(235, 90, 90), failure);
                 }
+                if let Some(error) = &self.last_script_error {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::from_rgb(235, 90, 90), error);
+                }
                 ui.separator();
                 ui.label("Viewer Mode:");
                 let mut next_workflow = self.workflow;
@@ -630,8 +833,6 @@ impl TanovaApp {
         });
 
         // Nuke layout: Viewer on top, Properties on the right, graph below.
-        // The panels are declared before the central panel so the canvas only
-        // ever receives the space that is left over.
         egui::Panel::top("tanova_viewer")
             .resizable(true)
             .default_size(400.0)
@@ -666,6 +867,7 @@ impl TanovaApp {
                 });
             });
 
+        let modal_open = self.file_modal.is_some() || self.pending_unsaved.is_some();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
@@ -675,18 +877,515 @@ impl TanovaApp {
                     &self.graph,
                     self.viewer.viewer_node(),
                     self.workflow,
+                    modal_open,
                 );
                 self.dispatch(messages);
             });
 
+        // File browser modal (Open / Save As).
+        if self.file_modal.is_some() {
+            self.draw_file_modal(ui.ctx());
+        }
+
+        // Unsaved-changes confirmation modal.
+        if let Some(action) = self.pending_unsaved.clone() {
+            self.draw_unsaved_changes_modal(ui.ctx(), action);
+        }
+
         // The kernel runs on its own thread; poll it at display cadence.
         if self.awaiting_kernel {
-            // Keep egui repainting until the kernel finishes rendering so the
-            // new frame appears immediately instead of waiting for the next
-            // mouse event or timer tick.
             ui.ctx().request_repaint();
         }
         ui.ctx().request_repaint_after(Duration::from_millis(16));
+    }
+
+    /// Returns the display name for the current script: the file name, or
+    /// `"Untitled.tnv"` when no path is set (with `" *"` appended when dirty).
+    fn script_display_name(&self) -> String {
+        self.script_path
+            .as_ref()
+            .and_then(|p| p.file_name().and_then(|n| n.to_str()))
+            .unwrap_or("Untitled.tnv")
+            .to_string()
+    }
+
+    /// File menu in the top bar.
+    fn draw_file_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("File", |ui| {
+            if ui.button("New Script (Ctrl+N)").clicked() {
+                self.request_new_script(ui.ctx());
+                ui.close();
+            }
+            if ui.button("Open Script... (Ctrl+O)").clicked() {
+                self.request_open_script(ui.ctx());
+                ui.close();
+            }
+            if ui.button("Save (Ctrl+S)").clicked() {
+                match &self.script_path {
+                    Some(path) => self.execute_save_to_path(path.clone()),
+                    None => self.request_save_as(ui.ctx(), None),
+                }
+                ui.close();
+            }
+            if ui.button("Save As... (Ctrl+Shift+S)").clicked() {
+                self.request_save_as(ui.ctx(), None);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Quit (Ctrl+Q)").clicked() {
+                self.request_close(PendingUnsavedAction::QuitApp, ui.ctx());
+                ui.close();
+            }
+        });
+    }
+
+    /// Handles Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S / Ctrl+Q shortcuts.
+    fn handle_file_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.file_modal.is_some() || self.pending_unsaved.is_some() {
+            return;
+        }
+        let input = ctx.input(|i| i.clone());
+        for event in &input.events {
+            if let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            {
+                if !(modifiers.command || modifiers.ctrl) {
+                    continue;
+                }
+                match key {
+                    egui::Key::N => self.request_new_script(ctx),
+                    egui::Key::O => self.request_open_script(ctx),
+                    egui::Key::S if modifiers.shift => self.request_save_as(ctx, None),
+                    egui::Key::S => match &self.script_path {
+                        Some(path) => self.execute_save_to_path(path.clone()),
+                        None => self.request_save_as(ctx, None),
+                    },
+                    egui::Key::Q => self.request_close(PendingUnsavedAction::QuitApp, ctx),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Called when the user triggers New Script. Respects the dirty guard.
+    fn request_new_script(&mut self, _ctx: &egui::Context) {
+        if self.is_dirty && !self.allow_close {
+            self.pending_unsaved = Some(PendingUnsavedAction::NewScript);
+        } else {
+            self.execute_new_script();
+        }
+    }
+
+    /// Called when the user triggers Open Script. Respects the dirty guard.
+    fn request_open_script(&mut self, _ctx: &egui::Context) {
+        if self.is_dirty && !self.allow_close {
+            self.pending_unsaved = Some(PendingUnsavedAction::OpenScript);
+        } else {
+            self.open_file_modal();
+        }
+    }
+
+    /// Called when the user triggers Save As. Opens the file modal in SaveAs
+    /// mode.
+    fn request_save_as(&mut self, _ctx: &egui::Context, follow_up: Option<PendingUnsavedAction>) {
+        let directory = self
+            .script_path
+            .as_ref()
+            .and_then(|p| p.parent().map(PathBuf::from))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let file_input = self
+            .script_path
+            .as_ref()
+            .and_then(|p| p.file_name().and_then(|n| n.to_str()))
+            .unwrap_or("Untitled.tnv")
+            .to_string();
+        self.file_modal = Some(FileModalState::SaveAs {
+            directory,
+            file_input,
+            follow_up,
+            just_opened: true,
+        });
+    }
+
+    /// Opens the file modal in Open mode.
+    fn open_file_modal(&mut self) {
+        let directory = self
+            .script_path
+            .as_ref()
+            .and_then(|p| p.parent().map(PathBuf::from))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        self.file_modal = Some(FileModalState::Open {
+            directory,
+            file_input: String::new(),
+            just_opened: true,
+        });
+    }
+
+    /// Called when the user triggers Quit or the OS window close. Respects the
+    /// dirty guard.
+    fn request_close(&mut self, action: PendingUnsavedAction, ctx: &egui::Context) {
+        if self.is_dirty && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_unsaved = Some(action);
+        } else if matches!(action, PendingUnsavedAction::QuitApp) {
+            self.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Renders the in-app file browser modal using `take()` + `ModalOutcome`.
+    ///
+    /// `self.file_modal` is set to `None` at the start of the frame and only
+    /// restored to `Some` when the outcome is `KeepOpen`, so closing and
+    /// chained follow-up modals never collide.
+    fn draw_file_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.file_modal.take() else {
+            return;
+        };
+        let is_save_as = matches!(modal, FileModalState::SaveAs { .. });
+        let title = if is_save_as { "Save As" } else { "Open Script" };
+
+        let mut window_open = true;
+        let mut outcome = ModalOutcome::KeepOpen;
+
+        // Extract follow_up from SaveAs mode before the window borrows modal.
+        // Clone so modal retains it for the KeepOpen case.
+        let follow_up: Option<PendingUnsavedAction> = match &modal {
+            FileModalState::SaveAs { follow_up, .. } => follow_up.clone(),
+            _ => None,
+        };
+
+        // Snapshot any pre-existing error so the modal can display it.
+        let last_script_error = self.last_script_error.clone();
+
+        egui::Window::new(title)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .open(&mut window_open)
+            .show(ctx, |ui| {
+                match &mut modal {
+                    FileModalState::Open {
+                        directory,
+                        file_input,
+                        just_opened,
+                    }
+                    | FileModalState::SaveAs {
+                        directory,
+                        file_input,
+                        just_opened,
+                        ..
+                    } => {
+                        ui.label(format!("Directory: {}", directory.display()));
+                        ui.separator();
+
+                        // Read directory entries, skipping hidden dot-entries.
+                        let mut entries: Vec<std::path::PathBuf> =
+                            std::fs::read_dir(&mut *directory)
+                                .ok()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|e| e.ok())
+                                .map(|e| e.path())
+                                .collect();
+                        entries.retain(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|n| !n.starts_with('.'))
+                        });
+
+                        // Parent Directory button.
+                        if directory.parent().is_some_and(|parent| parent != directory) {
+                            if ui.button("[..] Parent Directory").clicked() {
+                                if let Some(parent) = directory.parent() {
+                                    *directory = parent.to_path_buf();
+                                    self.last_script_error = None;
+                                }
+                                outcome = ModalOutcome::KeepOpen;
+                            }
+                            ui.separator();
+                        }
+
+                        egui::ScrollArea::vertical()
+                            .max_height(300.0)
+                            .show(ui, |ui| {
+                                let mut sorted: Vec<_> = entries;
+                                sorted.sort_by_key(|p| {
+                                    p.file_name().unwrap_or_default().to_os_string()
+                                });
+                                for path in sorted {
+                                    let name = path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("")
+                                        .to_string();
+
+                                    if path.is_dir() {
+                                        if ui.button(format!("[DIR] {}", name)).clicked() {
+                                            *directory = path.clone();
+                                            self.last_script_error = None;
+                                            // Do not overwrite file_input with a
+                                            // folder name in SaveAs mode.
+                                            outcome = ModalOutcome::KeepOpen;
+                                        }
+                                    } else if is_supported_script_file(&path) {
+                                        let label = if path
+                                            .extension()
+                                            .is_some_and(|e| e.eq_ignore_ascii_case("tnv"))
+                                        {
+                                            format!("[TNV] {}", name)
+                                        } else {
+                                            format!("[NK] {}", name)
+                                        };
+                                        let resp = ui.button(label);
+                                        if resp.clicked() {
+                                            *file_input = name;
+                                            self.last_script_error = None;
+                                            outcome = ModalOutcome::KeepOpen;
+                                        }
+                                        // Double-click immediately opens in Open mode.
+                                        if !is_save_as && resp.double_clicked() {
+                                            outcome =
+                                                ModalOutcome::ConfirmOpen { path: path.clone() };
+                                        }
+                                    }
+                                }
+                            });
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("File:");
+                            let text_edit_resp =
+                                ui.add(egui::TextEdit::singleline(file_input).desired_width(200.0));
+                            // Auto-focus and select-all on first frame so
+                            // typing or Ctrl+V immediately replaces the
+                            // default filename.
+                            if *just_opened {
+                                text_edit_resp.request_focus();
+                                if let Some(mut state) =
+                                    egui::TextEdit::load_state(ctx, text_edit_resp.id)
+                                {
+                                    let ccursor_range = egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(0),
+                                        egui::text::CCursor::new(file_input.chars().count()),
+                                    );
+                                    state.cursor.set_char_range(Some(ccursor_range));
+                                    state.store(ctx, text_edit_resp.id);
+                                }
+                                *just_opened = false;
+                            }
+                            if text_edit_resp.lost_focus()
+                                || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            {
+                                // The user typed a path/name directly.
+                            }
+                            // [Paste] button beside the File: input.
+                            if ui
+                                .button("[Paste]")
+                                .on_hover_text("Paste filename from clipboard")
+                                .clicked()
+                            {
+                                if let Some(pasted) = self.read_clipboard_text() {
+                                    *file_input = pasted.trim().to_string();
+                                }
+                            }
+                        });
+
+                        // Sanitize pasted newlines so they never corrupt a
+                        // filename.
+                        file_input.retain(|c| c != '\n' && c != '\r');
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            // Confirm button.
+                            let confirm_clicked = if is_save_as {
+                                ui.button("Save").clicked()
+                            } else {
+                                ui.button("Open").clicked()
+                            };
+                            let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                && !file_input.trim().is_empty();
+                            if confirm_clicked || enter_pressed {
+                                let trimmed = file_input.trim();
+                                let full_path = if PathBuf::from(trimmed).is_relative() {
+                                    directory.join(trimmed)
+                                } else {
+                                    PathBuf::from(trimmed)
+                                };
+                                if is_save_as {
+                                    outcome = ModalOutcome::ConfirmSave {
+                                        path: full_path,
+                                        follow_up,
+                                    };
+                                } else {
+                                    outcome = ModalOutcome::ConfirmOpen { path: full_path };
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                outcome = ModalOutcome::Cancel;
+                            }
+                        });
+
+                        // Display any script error inside the modal.
+                        if let Some(err) = &last_script_error {
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(235, 90, 90),
+                                format!("Error: {err}"),
+                            );
+                        }
+                    }
+                }
+
+                // Escape key closes the modal.
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                    outcome = ModalOutcome::Cancel;
+                }
+            });
+
+        // If the window X was clicked and no confirm/cancel happened, cancel.
+        if !window_open && matches!(outcome, ModalOutcome::KeepOpen) {
+            outcome = ModalOutcome::Cancel;
+        }
+
+        match outcome {
+            ModalOutcome::KeepOpen => {
+                self.file_modal = Some(modal);
+            }
+            ModalOutcome::Cancel => {
+                // Leave self.file_modal = None.
+                self.last_script_error = None;
+            }
+            ModalOutcome::ConfirmSave { path, follow_up } => {
+                self.execute_save_to_path(path);
+                if let Some(action) = follow_up {
+                    match action {
+                        PendingUnsavedAction::NewScript => self.execute_new_script(),
+                        PendingUnsavedAction::OpenScript => self.open_file_modal(),
+                        PendingUnsavedAction::QuitApp => {
+                            self.allow_close = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
+            }
+            ModalOutcome::ConfirmOpen { path } => {
+                if self.execute_open_path(path).is_err() {
+                    self.file_modal = Some(modal);
+                }
+            }
+        }
+    }
+
+    /// Renders the unsaved-changes confirmation modal.
+    fn draw_unsaved_changes_modal(&mut self, ctx: &egui::Context, action: PendingUnsavedAction) {
+        let script_name = self.script_display_name();
+        let mut close = false;
+        let mut do_save = false;
+        let mut do_discard = false;
+
+        egui::Window::new("Unsaved Changes")
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("Save changes to {script_name} before continuing?"));
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        do_save = true;
+                        close = true;
+                    }
+                    if ui.button("Discard Changes").clicked() {
+                        do_discard = true;
+                        close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.pending_unsaved = None;
+                        close = true;
+                    }
+                });
+            });
+
+        if close {
+            self.pending_unsaved = None;
+        }
+        if do_save {
+            match &self.script_path {
+                Some(path) => {
+                    self.execute_save_to_path(path.clone());
+                    // Complete the pending action after save.
+                    match action.clone() {
+                        PendingUnsavedAction::NewScript => self.execute_new_script(),
+                        PendingUnsavedAction::OpenScript => self.open_file_modal(),
+                        PendingUnsavedAction::QuitApp => {
+                            self.allow_close = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
+                None => {
+                    // Save As first, then complete the action.
+                    self.request_save_as(ctx, Some(action.clone()));
+                }
+            }
+        }
+        if do_discard {
+            match action {
+                PendingUnsavedAction::NewScript => self.execute_new_script(),
+                PendingUnsavedAction::OpenScript => self.open_file_modal(),
+                PendingUnsavedAction::QuitApp => {
+                    self.allow_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// Reads clipboard text, preferring the test override when set.
+    pub fn read_clipboard_text(&mut self) -> Option<String> {
+        if let Some(ref s) = self.test_clipboard {
+            return Some(s.clone());
+        }
+        arboard::Clipboard::new()
+            .ok()
+            .and_then(|mut c| c.get_text().ok())
+    }
+
+    /// Bridges Ctrl+V into `egui::Event::Paste` on backends (e.g. Linux
+    /// X11/Wayland) that don't emit `Event::Paste` automatically for `Ctrl+V`.
+    ///
+    /// Called at the top of `draw()` before any panel or modal so the paste
+    /// reaches the focused text input. We only inject `Event::Paste` when it
+    /// is absent from the event queue; `egui::TextEdit` does not consume
+    /// `Event::Paste`, so injecting both an event and manually mutating the
+    /// text would double-paste.
+    pub fn bridge_clipboard_paste(&mut self, ctx: &egui::Context) {
+        let should_paste = ctx.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::V,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl || modifiers.command
+                )
+            }) && !i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
+        });
+        if should_paste {
+            if let Some(text) = self.read_clipboard_text() {
+                if !text.is_empty() {
+                    ctx.input_mut(|i| i.events.push(egui::Event::Paste(text)));
+                }
+            }
+        }
     }
 }
 
@@ -696,6 +1395,36 @@ fn kernel_error(error: std::io::Error) -> AppError {
 
 fn check_failed(message: impl Into<String>) -> AppError {
     Box::new(std::io::Error::other(message.into()))
+}
+
+/// Ensures a script path carries a `.tnv` or `.nk` extension, preserving any
+/// existing version-style suffixes (e.g. `shot_010.v01` -> `shot_010.v01.tnv`).
+///
+/// `Path::set_extension` would *replace* an existing extension like `.v01`,
+/// so we instead append `.tnv` to the file stem when no recognized extension
+/// is present.
+pub fn ensure_script_extension(path: PathBuf) -> PathBuf {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("tnv") || ext.eq_ignore_ascii_case("nk") => path,
+        _ => {
+            let mut p = path;
+            let file_name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            p.set_file_name(format!("{}.tnv", file_name));
+            p
+        }
+    }
+}
+
+/// Returns `true` when `path` has a `.tnv` or `.nk` extension (case-insensitive).
+pub fn is_supported_script_file(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some(ext) if ext.eq_ignore_ascii_case("tnv") || ext.eq_ignore_ascii_case("nk")
+    )
 }
 
 #[cfg(test)]
@@ -1389,5 +2118,589 @@ mod tests {
             (laid_out.x - start.0).abs() < 1e-3 && (laid_out.y - start.1).abs() < 1e-3,
             "the canvas must redraw node #1 at {start:?}, got {laid_out:?}"
         );
+    }
+
+    /// End-to-end: save a modified script to .tnv, clear with New Script, then
+    /// open it back and verify positions and knobs round-trip.
+    #[test]
+    fn end_to_end_save_new_script_and_open_tnv_round_trip() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Pump until starter comp is loaded.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "starter comp must reach mirror");
+        assert!(!app.is_dirty, "fresh app must start clean");
+
+        // Modify Grade #2: mix = 0.35, move to (320, 280).
+        app.dispatch(vec![
+            KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: GRADE,
+                knob: "mix".to_string(),
+                value: KnobValue::Float(0.35),
+                previous: KnobValue::Float(1.0),
+            }),
+            KernelMessage::Execute(UndoableCommand::MoveNode {
+                id: GRADE,
+                from_x: 40.0,
+                from_y: 164.0,
+                to_x: 320.0,
+                to_y: 280.0,
+            }),
+        ]);
+        // Pump until dirty state is confirmed.
+        let dirty_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < dirty_deadline && !app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.is_dirty, "after edits, app must be dirty");
+
+        // Save to a temp .tnv file.
+        let temp_path = std::env::temp_dir().join("tanova_test_comp.tnv");
+        app.execute_save_to_path(temp_path.clone());
+        // Wait for the kernel to process SaveScript and write the file.
+        let save_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < save_deadline && !temp_path.exists() {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(temp_path.exists(), "saved file must exist on disk");
+        // Pump until clean state is confirmed.
+        let clean_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < clean_deadline && app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.is_dirty, "after save, app must be clean");
+
+        // New Script: clears everything.
+        app.execute_new_script();
+        // Pump until clean state is confirmed.
+        let new_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < new_deadline && app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            0,
+            "mirror must be empty after new script"
+        );
+        assert!(!app.is_dirty, "after new script, app must be clean");
+
+        // Open the saved .tnv file.
+        app.execute_open_path(temp_path.clone())
+            .expect("open should succeed");
+        // Pump until open is processed.
+        let open_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < open_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "must load 3 nodes");
+
+        // Verify Grade #2 position and mix knob round-trip.
+        let grade = app.graph.node(GRADE).expect("Grade #2 must exist");
+        assert!((grade.x - 320.0).abs() < 1e-4, "Grade x: {:?}", grade.x);
+        assert!((grade.y - 280.0).abs() < 1e-4, "Grade y: {:?}", grade.y);
+        assert_eq!(
+            grade.knobs.get("mix"),
+            Some(&KnobValue::Float(0.35)),
+            "Grade mix must be 0.35"
+        );
+        assert!(!app.is_dirty, "after open, app must be clean");
+
+        // Clean up.
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    /// End-to-end: save a modified script to .nk (Nuke compatibility), clear
+    /// with New Script, then open it back and verify positions and knobs
+    /// round-trip.
+    #[test]
+    fn end_to_end_save_new_script_and_open_nk_round_trip() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Pump until starter comp is loaded.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "starter comp must reach mirror");
+        assert!(!app.is_dirty, "fresh app must start clean");
+
+        // Modify Grade #2: mix = 0.35, move to (320, 280).
+        app.dispatch(vec![
+            KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: GRADE,
+                knob: "mix".to_string(),
+                value: KnobValue::Float(0.35),
+                previous: KnobValue::Float(1.0),
+            }),
+            KernelMessage::Execute(UndoableCommand::MoveNode {
+                id: GRADE,
+                from_x: 40.0,
+                from_y: 164.0,
+                to_x: 320.0,
+                to_y: 280.0,
+            }),
+        ]);
+        // Pump until dirty state is confirmed.
+        let dirty_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < dirty_deadline && !app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.is_dirty, "after edits, app must be dirty");
+
+        // Save to a temp .nk file.
+        let temp_path = std::env::temp_dir().join("tanova_test_comp.nk");
+        app.execute_save_to_path(temp_path.clone());
+        // Wait for the kernel to process SaveScript and write the file.
+        let save_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < save_deadline && !temp_path.exists() {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(temp_path.exists(), "saved file must exist on disk");
+        // Pump until clean state is confirmed.
+        let clean_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < clean_deadline && app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.is_dirty, "after save, app must be clean");
+
+        // New Script: clears everything.
+        app.execute_new_script();
+        // Pump until clean state is confirmed.
+        let new_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < new_deadline && app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            0,
+            "mirror must be empty after new script"
+        );
+        assert!(!app.is_dirty, "after new script, app must be clean");
+
+        // Open the saved .nk file.
+        app.execute_open_path(temp_path.clone())
+            .expect("open should succeed");
+        // Pump until open is processed.
+        let open_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < open_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "must load 3 nodes");
+
+        // Verify Grade #2 position and mix knob round-trip.
+        let grade = app.graph.node(GRADE).expect("Grade #2 must exist");
+        assert!((grade.x - 320.0).abs() < 1e-4, "Grade x: {:?}", grade.x);
+        assert!((grade.y - 280.0).abs() < 1e-4, "Grade y: {:?}", grade.y);
+        assert_eq!(
+            grade.knobs.get("mix"),
+            Some(&KnobValue::Float(0.35)),
+            "Grade mix must be 0.35"
+        );
+        assert!(!app.is_dirty, "after open, app must be clean");
+
+        // Clean up.
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    /// Unit tests for `ensure_script_extension`.
+    #[test]
+    fn ensure_script_extension_appends_tnv() {
+        assert_eq!(
+            ensure_script_extension(std::path::PathBuf::from("my_comp")),
+            std::path::PathBuf::from("my_comp.tnv")
+        );
+        // Preserves version-style suffixes: `.v02` is kept, `.tnv` appended.
+        assert_eq!(
+            ensure_script_extension(std::path::PathBuf::from("shot_010.v02")),
+            std::path::PathBuf::from("shot_010.v02.tnv")
+        );
+        // Recognized extensions are preserved unchanged.
+        assert_eq!(
+            ensure_script_extension(std::path::PathBuf::from("scene.tnv")),
+            std::path::PathBuf::from("scene.tnv")
+        );
+        assert_eq!(
+            ensure_script_extension(std::path::PathBuf::from("legacy_nuke.nk")),
+            std::path::PathBuf::from("legacy_nuke.nk")
+        );
+        // Case-insensitive extension matching.
+        assert_eq!(
+            ensure_script_extension(std::path::PathBuf::from("clip.TNV")),
+            std::path::PathBuf::from("clip.TNV")
+        );
+        assert_eq!(
+            ensure_script_extension(std::path::PathBuf::from("clip.NK")),
+            std::path::PathBuf::from("clip.NK")
+        );
+    }
+
+    /// Unit tests for `is_supported_script_file`.
+    #[test]
+    fn is_supported_script_file_accepts_tnv_and_nk() {
+        assert!(is_supported_script_file(std::path::Path::new("foo.tnv")));
+        assert!(is_supported_script_file(std::path::Path::new("foo.TNV")));
+        assert!(is_supported_script_file(std::path::Path::new("foo.tNv")));
+        assert!(is_supported_script_file(std::path::Path::new("foo.nk")));
+        assert!(is_supported_script_file(std::path::Path::new("foo.NK")));
+        assert!(is_supported_script_file(std::path::Path::new("foo.nK")));
+        assert!(!is_supported_script_file(std::path::Path::new("foo.exr")));
+        assert!(!is_supported_script_file(std::path::Path::new("foo.txt")));
+        assert!(!is_supported_script_file(std::path::Path::new("foo")));
+        assert!(!is_supported_script_file(std::path::Path::new("foo.")));
+    }
+
+    /// When the app is dirty and the user triggers Quit, the pending unsaved
+    /// action is set and close is not allowed.
+    #[test]
+    fn unsaved_changes_close_guard_sets_pending() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        // Make the app dirty by editing a knob.
+        app.dispatch(vec![KernelMessage::Execute(UndoableCommand::SetKnob {
+            node: CONSTANT,
+            knob: "color".to_string(),
+            value: KnobValue::Color([1.0, 0.0, 0.0, 1.0]),
+            previous: KnobValue::Color(STARTER_COLOR),
+        })]);
+        // Pump until dirty state is confirmed (MarkClean event from seed may
+        // arrive asynchronously and reset the optimistic dirty flag).
+        let dirty_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < dirty_deadline && !app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.is_dirty, "app must be dirty after edit");
+
+        // Trigger QuitApp while dirty.
+        let ctx = egui::Context::default();
+        app.request_close(PendingUnsavedAction::QuitApp, &ctx);
+
+        assert_eq!(
+            app.pending_unsaved,
+            Some(PendingUnsavedAction::QuitApp),
+            "pending unsaved must be set"
+        );
+        assert!(!app.allow_close, "app must not allow close while dirty");
+    }
+
+    /// Pressing Escape while the file modal is open closes it (`file_modal` ->
+    /// `None`).
+    #[test]
+    fn file_modal_cancel_and_escape_close_modal() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Open the SaveAs modal.
+        app.request_save_as(&ctx, None);
+        assert!(app.file_modal.is_some(), "file modal should be open");
+
+        // Press Escape while the modal is open.
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: Some(egui::Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                app.draw_file_modal(ctx);
+            },
+        )
+        .drop_without_applying_deltas();
+
+        assert!(
+            app.file_modal.is_none(),
+            "file modal should be closed after Escape"
+        );
+        assert!(
+            app.last_script_error.is_none(),
+            "error should be cleared on cancel"
+        );
+    }
+
+    /// SaveAs confirm closes the modal and writes the file; Open confirm
+    /// re-opens it and closes again on success.
+    #[test]
+    fn file_modal_save_and_open_close_modal_on_success() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        let temp_dir = std::env::temp_dir();
+        let temp_path = temp_dir.join("tanova_modal_test.tnv");
+
+        // --- SaveAs path ---
+        app.request_save_as(&ctx, None);
+        assert!(app.file_modal.is_some(), "SaveAs modal should be open");
+
+        // Set the file_input to the temp path.
+        if let Some(FileModalState::SaveAs { file_input, .. }) = &mut app.file_modal {
+            *file_input = temp_path.to_string_lossy().to_string();
+        }
+
+        // Press Enter to confirm Save.
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                app.draw_file_modal(ctx);
+            },
+        )
+        .drop_without_applying_deltas();
+
+        assert!(
+            app.file_modal.is_none(),
+            "SaveAs modal should close on successful save"
+        );
+
+        // Wait for the kernel to write the file.
+        let save_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < save_deadline && !temp_path.exists() {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(temp_path.exists(), "saved .tnv file must exist on disk");
+
+        // --- Open path ---
+        app.request_open_script(&ctx);
+        assert!(app.file_modal.is_some(), "Open modal should be open");
+
+        // Set directory and file_input to the saved file.
+        if let Some(FileModalState::Open {
+            directory,
+            file_input,
+            ..
+        }) = &mut app.file_modal
+        {
+            *directory = temp_dir.clone();
+            *file_input = temp_path.file_name().unwrap().to_string_lossy().to_string();
+        }
+
+        // Press Enter to confirm Open.
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                app.draw_file_modal(ctx);
+            },
+        )
+        .drop_without_applying_deltas();
+
+        assert!(
+            app.file_modal.is_none(),
+            "Open modal should close on successful open"
+        );
+
+        // Clean up.
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    /// All badge and file-browser labels are pure ASCII (no missing-glyph
+    /// `▯` boxes from non-ASCII symbols).
+    #[test]
+    fn project_badge_and_file_modal_labels_are_pure_ascii() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        // Clean badge: "Untitled.tnv" is pure ASCII.
+        let clean_name = app.script_display_name();
+        assert_eq!(clean_name, "Untitled.tnv");
+        assert!(clean_name.is_ascii());
+
+        // Dirty badge: "Untitled.tnv *" is pure ASCII.
+        app.is_dirty = true;
+        let dirty_name = format!("{} *", app.script_display_name());
+        assert_eq!(dirty_name, "Untitled.tnv *");
+        assert!(dirty_name.is_ascii());
+
+        // File browser labels are all pure ASCII.
+        assert!("[..] Parent Directory".is_ascii());
+        assert!("[DIR] some_folder".is_ascii());
+        assert!("[TNV] project.tnv".is_ascii());
+        assert!("[NK] legacy.nk".is_ascii());
+
+        // `is_supported_script_file` only matches ASCII extensions.
+        assert!(is_supported_script_file(std::path::Path::new("foo.tnv")));
+        assert!(is_supported_script_file(std::path::Path::new("foo.nk")));
+        assert!(!is_supported_script_file(std::path::Path::new("foo.exr")));
+        assert!(!is_supported_script_file(std::path::Path::new("foo.txt")));
+    }
+
+    /// Modal windows are anchored to the center of the viewport, not the
+    /// top-left corner, and `just_opened` is consumed on the first render.
+    #[test]
+    fn modals_are_centered_in_viewport() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Open the SaveAs modal.
+        app.request_save_as(&ctx, None);
+        assert!(app.file_modal.is_some(), "file modal should be open");
+        if let Some(FileModalState::SaveAs { just_opened, .. }) = &app.file_modal {
+            assert!(*just_opened, "just_opened should be true initially");
+        }
+
+        // Run a frame with the modal rendered.
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                app.draw_file_modal(ctx);
+            },
+        )
+        .drop_without_applying_deltas();
+
+        // just_opened should be false after the first render frame.
+        if let Some(FileModalState::SaveAs { just_opened, .. }) = &app.file_modal {
+            assert!(!*just_opened, "just_opened should be false after render");
+        } else {
+            panic!("file modal should still be open");
+        }
+    }
+
+    /// Ctrl+V replaces the default filename exactly once, without double-pasting.
+    #[test]
+    fn ctrl_v_replaces_default_filename_once_without_double_paste() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Open the SaveAs modal; file_input starts as "Untitled.tnv".
+        app.request_save_as(&ctx, None);
+        assert!(app.file_modal.is_some(), "SaveAs modal should be open");
+        if let Some(FileModalState::SaveAs { file_input, .. }) = &app.file_modal {
+            assert_eq!(file_input, "Untitled.tnv");
+        }
+
+        // Set the test clipboard override.
+        app.test_clipboard = Some("shot_01.tnv".to_string());
+
+        // Frame 1: render the modal so the TextEdit acquires focus and selects
+        // "Untitled.tnv".
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                app.draw_file_modal(ctx);
+            },
+        )
+        .drop_without_applying_deltas();
+
+        // Frame 2: send a raw Ctrl+V key event (without Event::Paste) through
+        // the clipboard bridge and modal UI.
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::V,
+                    physical_key: Some(egui::Key::V),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                app.bridge_clipboard_paste(ctx);
+                app.draw_file_modal(ctx);
+            },
+        )
+        .drop_without_applying_deltas();
+
+        // The clipboard text should have replaced "Untitled.tnv" exactly once.
+        if let Some(FileModalState::SaveAs { file_input, .. }) = &app.file_modal {
+            assert_eq!(
+                file_input, "shot_01.tnv",
+                "Ctrl+V should replace the default filename once, got {:?}",
+                file_input
+            );
+        } else {
+            panic!("file modal should still be open");
+        }
     }
 }
