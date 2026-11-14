@@ -57,6 +57,8 @@ pub enum UndoableCommand {
         x: f32,
         /// Canvas-space Y position, kept so undo restores the layout.
         y: f32,
+        /// Bypass state, kept so undo restores a disabled node disabled.
+        disabled: bool,
         /// Full knob table captured at removal time.
         ///
         /// Boxed so the command enum (and every message on the bus) stays
@@ -75,6 +77,8 @@ pub enum UndoableCommand {
         x: f32,
         /// Canvas-space Y position.
         y: f32,
+        /// Bypass state to restore.
+        disabled: bool,
         /// Knob values to restore verbatim (boxed for the same reason).
         knobs: Box<KnobTable>,
         /// Edges to reconnect (best effort, since peers may restore later).
@@ -126,6 +130,16 @@ pub enum UndoableCommand {
         /// Canvas-space Y after the move.
         to_y: f32,
     },
+    /// Bypass (`disabled: true`) or re-enable a node.
+    ///
+    /// A bypassed node never runs its cartridge: the DAG hands its `B` input
+    /// straight through. `inverse()` flips the flag back.
+    SetDisabled {
+        /// Node whose bypass state changes.
+        node: NodeId,
+        /// New bypass state.
+        disabled: bool,
+    },
     /// A batch of commands applied atomically as one undo step.
     ///
     /// All sub-commands succeed together or none do. Inverse applies each
@@ -152,6 +166,8 @@ impl UndoableCommand {
                 kind: kind.clone(),
                 x: *x,
                 y: *y,
+                // A freshly added node is never bypassed.
+                disabled: false,
                 // A freshly added node still has its registry defaults and no
                 // wires, so that is the exact state undo must restore to.
                 knobs: Box::new(
@@ -166,6 +182,7 @@ impl UndoableCommand {
                 kind,
                 x,
                 y,
+                disabled,
                 knobs,
                 edges,
             } => Self::RestoreNode {
@@ -173,6 +190,7 @@ impl UndoableCommand {
                 kind: kind.clone(),
                 x: *x,
                 y: *y,
+                disabled: *disabled,
                 knobs: knobs.clone(),
                 edges: edges.clone(),
             },
@@ -181,6 +199,7 @@ impl UndoableCommand {
                 kind,
                 x,
                 y,
+                disabled,
                 knobs,
                 edges,
             } => Self::RemoveNode {
@@ -188,6 +207,7 @@ impl UndoableCommand {
                 kind: kind.clone(),
                 x: *x,
                 y: *y,
+                disabled: *disabled,
                 knobs: knobs.clone(),
                 edges: edges.clone(),
             },
@@ -223,6 +243,10 @@ impl UndoableCommand {
                 knob: knob.clone(),
                 value: previous.clone(),
                 previous: value.clone(),
+            },
+            Self::SetDisabled { node, disabled } => Self::SetDisabled {
+                node: *node,
+                disabled: !disabled,
             },
             Self::MoveNode {
                 id,
@@ -851,11 +875,17 @@ fn kernel_loop(
         for message in coalesce_batch(batch) {
             match message {
                 KernelMessage::Execute(command) => {
-                    // Invalidate downstream cache entries for knob changes so
-                    // stale rendered pixels don't linger. Upstream caches
-                    // (e.g. Constant) are preserved by op-hash keying.
-                    if let UndoableCommand::SetKnob { node, .. } = &command {
-                        dag.invalidate_downstream(*node);
+                    // Invalidate downstream cache entries for knob changes and
+                    // bypass toggles so stale rendered pixels don't linger.
+                    // Upstream caches (e.g. Constant) are preserved by op-hash
+                    // keying, so toggling a Grade re-renders immediately
+                    // without re-evaluating its sources.
+                    match &command {
+                        UndoableCommand::SetKnob { node, .. }
+                        | UndoableCommand::SetDisabled { node, .. } => {
+                            dag.invalidate_downstream(*node);
+                        }
+                        _ => {}
                     }
                     if apply_and_record(&mut dag, &mut undo, &events, command) {
                         render_dirty = true;
@@ -1128,7 +1158,7 @@ fn apply_and_record(
     }
 }
 
-/// `true` for commands that add, remove, or rewire nodes.
+/// `true` for commands that add, remove, rewire, or bypass nodes.
 ///
 /// These invalidate every cached op hash downstream of the change, so the
 /// worker drops the packet cache before the next render.
@@ -1143,6 +1173,7 @@ fn changes_topology(command: &UndoableCommand) -> bool {
                 | UndoableCommand::RestoreNode { .. }
                 | UndoableCommand::ConnectEdge { .. }
                 | UndoableCommand::DisconnectEdge { .. }
+                | UndoableCommand::SetDisabled { .. }
         ),
     }
 }
@@ -1607,6 +1638,7 @@ mod tests {
             kind: kind.to_string(),
             x: 0.0,
             y: 0.0,
+            disabled: false,
             knobs: Box::new(KnobTable::new()),
             edges: Vec::new(),
         }

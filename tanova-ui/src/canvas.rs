@@ -49,6 +49,11 @@ const NODE_HEADER: Color32 = Color32::from_rgb(64, 64, 74);
 const CRASH_BORDER: Color32 = Color32::from_rgb(230, 70, 70);
 const CRASH_FILL: Color32 = Color32::from_rgb(58, 22, 24);
 const CRASH_HEADER: Color32 = Color32::from_rgb(92, 30, 34);
+/// Muted card colours for a bypassed node.
+const DISABLED_FILL: Color32 = Color32::from_rgb(30, 31, 35);
+const DISABLED_HEADER: Color32 = Color32::from_rgb(44, 45, 50);
+/// The bold red `X` drawn across a bypassed node.
+const BYPASS_X: Color32 = Color32::from_rgb(230, 95, 70);
 const SELECTED: Color32 = Color32::from_rgb(90, 190, 255);
 const VIEWER: Color32 = Color32::from_rgb(255, 190, 40);
 
@@ -67,6 +72,9 @@ pub struct CanvasNode {
     pub x: f32,
     /// Canvas-space Y position carried by the `AddNode` command.
     pub y: f32,
+    /// `true` when the node is bypassed (`D` key) and passes its input
+    /// straight through.
+    pub disabled: bool,
 }
 
 /// One connection as the UI knows it.
@@ -128,6 +136,7 @@ impl GraphMirror {
                 knobs: node.knobs.clone(),
                 x: node.x,
                 y: node.y,
+                disabled: node.disabled,
             })
             .collect();
         let edges: Vec<CanvasEdge> = dag
@@ -220,6 +229,7 @@ impl GraphMirror {
             kind: node.kind.clone(),
             x: node.x,
             y: node.y,
+            disabled: node.disabled,
             knobs: Box::new(node.knobs.clone()),
             edges,
         })
@@ -276,6 +286,7 @@ impl GraphMirror {
                         knobs,
                         x: *x,
                         y: *y,
+                        disabled: false,
                     });
                 }
             }
@@ -289,6 +300,7 @@ impl GraphMirror {
                 kind,
                 x,
                 y,
+                disabled,
                 knobs,
                 edges,
             } => {
@@ -300,6 +312,7 @@ impl GraphMirror {
                         knobs: knobs.as_ref().clone(),
                         x: *x,
                         y: *y,
+                        disabled: *disabled,
                     });
                 }
                 for edge in edges {
@@ -355,6 +368,15 @@ impl GraphMirror {
                     node.knobs.insert(knob.clone(), value.clone());
                 }
             }
+            UndoableCommand::SetDisabled { node, disabled } => {
+                if let Some(node) = self
+                    .nodes
+                    .iter_mut()
+                    .find(|candidate| candidate.id == *node)
+                {
+                    node.disabled = *disabled;
+                }
+            }
             UndoableCommand::MoveNode { id, to_x, to_y, .. } => {
                 if let Some(node) = self.nodes.iter_mut().find(|n| n.id == *id) {
                     node.x = *to_x;
@@ -407,6 +429,7 @@ pub enum WireDrag {
 #[derive(Debug, Clone, Copy)]
 enum NodeMenuAction {
     DisconnectInputs(NodeId),
+    ToggleBypass(NodeId),
     Delete(NodeId),
 }
 
@@ -563,6 +586,74 @@ impl NodeCanvasState {
     /// `true` while the `Tab` quick-search popup owns the keyboard.
     pub fn is_search_open(&self) -> bool {
         self.tab_search.is_some()
+    }
+
+    /// Raises the node-id high-water mark so externally allocated ids can never
+    /// collide with the ids the canvas will hand out next.
+    pub fn sync_next_node_id(&mut self, floor: u64) {
+        self.next_node_id = self.next_node_id.max(floor);
+    }
+
+    /// Hands out the next never-reused node id.
+    ///
+    /// Used by sub-graph paste, which allocates ids on the UI thread so it can
+    /// build one atomic `Batch` of `AddNode`/`SetKnob`/`ConnectEdge` commands.
+    pub fn allocate_node_id(&mut self) -> NodeId {
+        let id = NodeId(self.next_node_id);
+        self.next_node_id = self.next_node_id.saturating_add(1);
+        id
+    }
+
+    /// Frames the selection (or every node when nothing is selected) inside
+    /// `viewport_rect`, Nuke's `F` key.
+    ///
+    /// Zoom is clamped to `0.25..=1.5` so a two-node selection never zooms to
+    /// a comical 800% and a huge graph stays legible.
+    pub fn frame_nodes(&mut self, mirror: &GraphMirror, viewport_rect: Rect) {
+        let mut targets: Vec<NodeId> = if self.selected_nodes.is_empty() {
+            mirror.nodes().iter().map(|node| node.id).collect()
+        } else {
+            mirror
+                .nodes()
+                .iter()
+                .filter(|node| self.selected_nodes.contains(&node.id))
+                .map(|node| node.id)
+                .collect()
+        };
+        targets.sort();
+
+        let mut bounds: Option<Rect> = None;
+        for id in targets {
+            let Some(position) = self
+                .positions
+                .get(&id)
+                .copied()
+                .or_else(|| mirror.node(id).map(|node| Pos2::new(node.x, node.y)))
+            else {
+                continue;
+            };
+            let card = Rect::from_min_size(position, Vec2::new(NODE_W, NODE_H));
+            bounds = Some(bounds.map_or(card, |current| current.union(card)));
+        }
+
+        let Some(bounds) = bounds else {
+            self.pan = Vec2::ZERO;
+            self.zoom = 1.0;
+            return;
+        };
+
+        const MARGIN: f32 = 40.0;
+        let available = Vec2::new(
+            (viewport_rect.width() - MARGIN * 2.0).max(1.0),
+            (viewport_rect.height() - MARGIN * 2.0).max(1.0),
+        );
+        let fit = (available.x / bounds.width().max(1.0))
+            .min(available.y / bounds.height().max(1.0))
+            .clamp(0.25, 1.5);
+        self.zoom = fit;
+
+        // Solve `world_to_screen(bounds.center()) == viewport.center()`.
+        self.pan = viewport_rect.center() - viewport_rect.min - bounds.center().to_vec2() * fit;
     }
 
     /// Canvas-space position of a node.
@@ -1046,6 +1137,14 @@ impl NodeCanvas {
                             action = Some(NodeMenuAction::DisconnectInputs(node_id));
                             ui.close();
                         }
+                        // The Viewer is a physical binding, never bypassable.
+                        let is_viewer = graph
+                            .node(node_id)
+                            .is_some_and(|node| node.kind == "Viewer");
+                        if !is_viewer && ui.button("Toggle Bypass (D)").clicked() {
+                            action = Some(NodeMenuAction::ToggleBypass(node_id));
+                            ui.close();
+                        }
                         if ui.button("Delete Node").clicked() {
                             action = Some(NodeMenuAction::Delete(node_id));
                             ui.close();
@@ -1066,6 +1165,17 @@ impl NodeCanvas {
                     }
                     if let Some(batch) = UndoableCommand::from_vec(disconnects) {
                         messages.push(KernelMessage::Execute(batch));
+                    }
+                    state.node_menu_open = false;
+                    state.node_menu_pos = None;
+                    state.node_menu_node = None;
+                }
+                Some(NodeMenuAction::ToggleBypass(id)) => {
+                    if let Some(node) = graph.node(id) {
+                        messages.push(KernelMessage::Execute(UndoableCommand::SetDisabled {
+                            node: id,
+                            disabled: !node.disabled,
+                        }));
                     }
                     state.node_menu_open = false;
                     state.node_menu_pos = None;
@@ -1165,6 +1275,51 @@ impl NodeCanvas {
             state.primary_selected = None;
         }
 
+        // Nuke's `D` toggles bypass on every selected node. Strictly
+        // `Modifiers::NONE` so `Ctrl+D` (duplicate) is never consumed here.
+        if !keyboard_busy
+            && !search_open
+            && !modal_open
+            && state.active_wire_drag.is_none()
+            && state.box_selection.is_none()
+        {
+            let bypass_pressed = ui
+                .ctx()
+                .input_mut(|input| input.consume_key(Modifiers::NONE, Key::D));
+            if bypass_pressed {
+                let mut ids: Vec<NodeId> = state.selected_nodes.iter().copied().collect();
+                ids.sort();
+                let mut toggles: Vec<UndoableCommand> = Vec::new();
+                for id in ids {
+                    let Some(node) = graph.node(id) else {
+                        continue;
+                    };
+                    // The physical Viewer is a binding, not an operator.
+                    if node.kind == "Viewer" {
+                        continue;
+                    }
+                    toggles.push(UndoableCommand::SetDisabled {
+                        node: id,
+                        disabled: !node.disabled,
+                    });
+                }
+                // One `from_vec` batch means one `Ctrl+Z` restores the whole
+                // multi-node bypass toggle.
+                if let Some(batch) = UndoableCommand::from_vec(toggles) {
+                    messages.push(KernelMessage::Execute(batch));
+                }
+            }
+
+            // `F` frames the selection, or the whole graph when nothing is
+            // selected.
+            let frame_pressed = ui
+                .ctx()
+                .input_mut(|input| input.consume_key(Modifiers::NONE, Key::F));
+            if frame_pressed {
+                state.frame_nodes(graph, rect);
+            }
+        }
+
         draw_grid(&painter, rect, state.pan, state.zoom);
 
         // A detaching wire hides its committed edge until release.
@@ -1255,7 +1410,7 @@ impl NodeCanvas {
         painter.text(
             rect.left_bottom() + Vec2::new(12.0, -10.0),
             Align2::LEFT_BOTTOM,
-            "Tab: search  •  MMB: pan  •  Wheel: zoom  •  Shift: multi-select  •  Drag wire: connect/rip  •  RMB: menu  •  Del: remove",
+            "Tab: search  •  MMB: pan  •  Wheel: zoom  •  Shift: multi-select  •  Drag wire: connect/rip  •  RMB: menu  •  Del: remove  •  D: bypass  •  F: frame  •  Ctrl+C/V/D: copy/paste/dup",
             FontId::proportional(11.0),
             Color32::from_gray(110),
         );
@@ -1755,10 +1910,19 @@ fn draw_node(
     active_port: Option<PortId>,
 ) {
     let crashed = node.crashed.is_some();
+    let disabled = node.disabled;
     let (fill, header, border) = if crashed {
         (CRASH_FILL, CRASH_HEADER, CRASH_BORDER)
+    } else if disabled {
+        (DISABLED_FILL, DISABLED_HEADER, NODE_BORDER)
     } else {
         (NODE_FILL, NODE_HEADER, NODE_BORDER)
+    };
+    // Bypassed nodes read as "muted" so the eye skips them.
+    let text_tint = if disabled {
+        Color32::from_gray(150)
+    } else {
+        Color32::from_gray(235)
     };
     let radius = CornerRadius::same((4.0 * zoom).clamp(1.0, 8.0) as u8);
 
@@ -1814,7 +1978,7 @@ fn draw_node(
         Align2::LEFT_TOP,
         node.kind.as_str(),
         header_font,
-        Color32::from_gray(235),
+        text_tint,
     );
 
     let body_font = FontId::proportional((12.0 * zoom).clamp(9.0, 16.0));
@@ -1823,7 +1987,11 @@ fn draw_node(
         Align2::LEFT_BOTTOM,
         format!("#{}", node.id.0),
         body_font,
-        Color32::from_gray(190),
+        if disabled {
+            Color32::from_gray(130)
+        } else {
+            Color32::from_gray(190)
+        },
     );
 
     if crashed {
@@ -1837,6 +2005,13 @@ fn draw_node(
     }
 
     painter.rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
+
+    // Nuke's bypass marker: a bold diagonal `X` across the whole card.
+    if disabled {
+        let stroke = Stroke::new(2.0 * zoom, BYPASS_X);
+        painter.line_segment([rect.left_top(), rect.right_bottom()], stroke);
+        painter.line_segment([rect.left_bottom(), rect.right_top()], stroke);
+    }
 
     if selected {
         painter.rect_stroke(

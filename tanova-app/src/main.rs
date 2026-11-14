@@ -5,6 +5,7 @@
 //! The kernel thread evaluates the viewer target and delivers frames
 //! off-screen through [`FrameNotification`]s.
 
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,8 +14,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use tanova_io::DiskCache;
 use tanova_kernel::{
-    Dag, EvalContext, FrameNotification, KernelEvent, KernelHandle, KernelMessage, KnobValue,
-    NodeId, Packet, PortId, ProjectFormat, UndoableCommand,
+    Dag, Edge, EvalContext, FrameNotification, KernelEvent, KernelHandle, KernelMessage, KnobValue,
+    NodeId, Packet, PortId, ProjectFormat, UndoableCommand, find_cartridge,
 };
 use tanova_parse::load_nk_into_dag;
 use tanova_render::{GpuComputeEngine, Raster2D};
@@ -345,6 +346,15 @@ struct TanovaApp {
     /// Optional clipboard override for headless unit tests (avoids requiring
     /// an X11/Wayland display server).
     pub test_clipboard: Option<String>,
+    /// In-app fallback clipboard buffer that always stores the latest copied
+    /// text inside Tanova. Survives frames and never depends on the OS clipboard.
+    pub internal_clipboard: Option<String>,
+    /// Persistent OS clipboard handle, kept alive across frames so X11/Wayland
+    /// never drops clipboard ownership when a temporary `Clipboard` is dropped.
+    pub os_clipboard: Option<arboard::Clipboard>,
+    /// Paste offset cascade: each `Ctrl+V` shifts the next paste by `40pt`.
+    /// Resets to `0` on every `Ctrl+C`.
+    pub paste_cascade: u32,
 }
 
 impl TanovaApp {
@@ -368,6 +378,9 @@ impl TanovaApp {
             pending_unsaved: None,
             allow_close: false,
             test_clipboard: None,
+            internal_clipboard: None,
+            os_clipboard: arboard::Clipboard::new().ok(),
+            paste_cascade: 0,
         };
         app.seed_graph();
         app
@@ -558,10 +571,15 @@ impl TanovaApp {
         }
     }
 
-    /// Applies global undo/redo shortcuts.
+    /// Applies global undo/redo shortcuts plus canvas copy/paste/duplicate.
     ///
     /// Text fields keep their own editing shortcuts, and an open canvas quick
     /// search owns the keyboard, so both suppress the global binding.
+    ///
+    /// Both `egui::Event::Copy` / `egui::Event::Paste` (emitted by eframe on
+    /// Linux for `Ctrl+C` / `Ctrl+V`) and plain `Key::C` / `Key::V` with
+    /// Ctrl/Command modifiers are handled, so copy/paste works on every
+    /// backend.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input()
             || self.canvas.is_search_open()
@@ -572,6 +590,11 @@ impl TanovaApp {
         }
 
         let mut messages = Vec::new();
+        let mut do_copy = false;
+        let mut do_paste = false;
+        let mut do_duplicate = false;
+
+        // Consume undo/redo key events first.
         ctx.input(|input| {
             for event in &input.events {
                 if let egui::Event::Key {
@@ -581,12 +604,107 @@ impl TanovaApp {
                     ..
                 } = event
                 {
-                    if let Some(message) = shortcut_message(*modifiers, *key) {
-                        messages.push(message);
+                    if !(modifiers.command || modifiers.ctrl) {
+                        continue;
+                    }
+                    match key {
+                        egui::Key::Z => {
+                            if modifiers.shift {
+                                messages.push(KernelMessage::Redo);
+                            } else {
+                                messages.push(KernelMessage::Undo);
+                            }
+                        }
+                        egui::Key::Y => messages.push(KernelMessage::Redo),
+                        _ => {}
                     }
                 }
             }
         });
+
+        // --- Copy: Ctrl+C / Cmd+C, either as a key event or as egui's
+        // --- native `Event::Copy` (Linux eframe translates Ctrl+C into this).
+        let copy_triggered = ctx.input_mut(|i| {
+            let key_copy = i.consume_key(egui::Modifiers::COMMAND, egui::Key::C)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::C);
+            let mut event_copy = false;
+            i.events.retain(|e| {
+                if matches!(e, egui::Event::Copy) {
+                    event_copy = true;
+                    false
+                } else {
+                    true
+                }
+            });
+            key_copy || event_copy
+        });
+
+        if copy_triggered {
+            do_copy = true;
+        }
+
+        // --- Paste: Ctrl+V / Cmd+V, either as a key event or as egui's
+        // --- native `Event::Paste(String)` (Linux eframe translates Ctrl+V
+        // --- into this). Drain any `Event::Paste` from the queue so it is
+        // --- not processed twice.
+        let pasted_event_text = ctx.input_mut(|i| {
+            let mut pasted = None;
+            i.events.retain(|e| {
+                if let egui::Event::Paste(s) = e {
+                    if pasted.is_none() {
+                        pasted = Some(s.clone());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            pasted
+        });
+        let key_v_pressed = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::V)
+        });
+
+        if pasted_event_text.is_some() || key_v_pressed {
+            do_paste = true;
+        }
+
+        // --- Duplicate: Ctrl+D / Cmd+D. Checked here so it never collides
+        // --- with the canvas `D` bypass toggle.
+        let key_d_pressed = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::D)
+        });
+        if key_d_pressed {
+            do_duplicate = true;
+        }
+
+        if do_copy {
+            if let Some(tcl) = self.export_selection_to_tcl() {
+                self.write_clipboard_text(ctx, tcl);
+                self.paste_cascade = 0;
+            }
+        }
+        if do_paste {
+            // Resolve the TCL string to paste: prefer the non-empty native
+            // `Event::Paste` text, otherwise fall back to the in-app / test
+            // clipboard (which holds whatever was last copied inside Tanova).
+            let tcl = pasted_event_text
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| self.read_clipboard_text());
+            if let Some(tcl) = tcl {
+                self.paste_cascade += 1;
+                let off = 40.0 * self.paste_cascade as f32;
+                let _ = self.paste_tcl_snippet(&tcl, (off, off));
+            }
+        }
+        if do_duplicate {
+            if let Some(tcl) = self.export_selection_to_tcl() {
+                let _ = self.paste_tcl_snippet(&tcl, (40.0, 40.0));
+            }
+        }
+
         self.dispatch(messages);
     }
 
@@ -626,13 +744,17 @@ impl TanovaApp {
     /// round-trips.
     fn apply_optimistic_mirror_update(&mut self, command: &UndoableCommand) {
         match command {
-            UndoableCommand::SetKnob { .. } | UndoableCommand::MoveNode { .. } => {
-                self.graph.apply_command(command);
-            }
             UndoableCommand::Batch(cmds) => {
                 for cmd in cmds {
                     self.apply_optimistic_mirror_update(cmd);
                 }
+            }
+            UndoableCommand::SetKnob { .. }
+            | UndoableCommand::MoveNode { .. }
+            | UndoableCommand::SetDisabled { .. }
+            | UndoableCommand::AddNode { .. }
+            | UndoableCommand::ConnectEdge { .. } => {
+                self.graph.apply_command(command);
             }
             _ => {}
         }
@@ -733,10 +855,15 @@ impl TanovaApp {
     fn draw(&mut self, ui: &mut egui::Ui) {
         self.pump();
 
-        // Bridge Ctrl+V into egui::Event::Paste on backends (e.g. Linux)
-        // that don't emit it automatically. Must run before any modal or
-        // panel so the paste reaches the focused text input.
-        self.bridge_clipboard_paste(ui.ctx());
+        // Bridge Ctrl+V into egui::Event::Paste for focused text inputs
+        // (the file modal's `File:` field) on backends that don't emit it
+        // automatically. On the plain canvas we do not inject `Event::Paste`:
+        // `Ctrl+V` on the canvas is handled directly by `handle_shortcuts`
+        // via `read_clipboard_text()`, so bridging here would only risk a
+        // stray text event.
+        if self.file_modal.is_some() || ui.ctx().egui_wants_keyboard_input() {
+            self.bridge_clipboard_paste(ui.ctx());
+        }
 
         // Handle OS window close request (the "X" button) with the dirty
         // guard.
@@ -1348,13 +1475,37 @@ impl TanovaApp {
     }
 
     /// Reads clipboard text, preferring the test override when set.
+    ///
+    /// Resolution order: test override, live OS clipboard, in-app fallback.
     pub fn read_clipboard_text(&mut self) -> Option<String> {
         if let Some(ref s) = self.test_clipboard {
             return Some(s.clone());
         }
-        arboard::Clipboard::new()
-            .ok()
-            .and_then(|mut c| c.get_text().ok())
+        if let Some(ref mut cb) = self.os_clipboard {
+            if let Ok(s) = cb.get_text() {
+                if !s.trim().is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+        self.internal_clipboard.clone()
+    }
+
+    /// Writes clipboard text, preferring the test override when set.
+    ///
+    /// Keeps the OS `arboard::Clipboard` alive on `self` across frames so
+    /// X11/Wayland never drops clipboard ownership when a temporary
+    /// `Clipboard` is created and dropped. Also notifies `egui` via
+    /// `ctx.copy_text()` so the native window clipboard stays synchronized.
+    pub fn write_clipboard_text(&mut self, ctx: &egui::Context, text: String) {
+        self.internal_clipboard = Some(text.clone());
+        if self.test_clipboard.is_some() {
+            self.test_clipboard = Some(text.clone());
+        }
+        if let Some(ref mut cb) = self.os_clipboard {
+            let _ = cb.set_text(text.clone());
+        }
+        ctx.copy_text(text);
     }
 
     /// Bridges Ctrl+V into `egui::Event::Paste` on backends (e.g. Linux
@@ -1386,6 +1537,157 @@ impl TanovaApp {
                 }
             }
         }
+    }
+
+    /// Serialises the currently selected sub-graph (excluding `Viewer`) to a
+    /// `.tk`/`.nk` TCL snippet suitable for the clipboard.
+    ///
+    /// Selected nodes are written at their live canvas positions with their
+    /// edited knobs and bypass state; only edges whose both endpoints are
+    /// selected are preserved, so pasting reproduces a self-contained chunk
+    /// of the graph.
+    pub fn export_selection_to_tcl(&self) -> Option<String> {
+        let mut ids: Vec<NodeId> = self.canvas.selected_nodes.iter().copied().collect();
+        ids.sort();
+        // The physical Viewer is a binding, never part of a copied sub-graph.
+        let ids: Vec<NodeId> = ids
+            .into_iter()
+            .filter(|id| {
+                self.graph
+                    .node(*id)
+                    .is_none_or(|node| node.kind != "Viewer")
+            })
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        let selected: HashSet<NodeId> = ids.iter().copied().collect();
+
+        let mut temp_dag = Dag::new();
+        for id in &ids {
+            let node = self.graph.node(*id)?;
+            temp_dag
+                .add_node_at(*id, node.kind.clone(), node.x, node.y)
+                .ok()?;
+            for (name, value) in node.knobs.iter() {
+                temp_dag
+                    .set_knob(*id, name.to_string(), (*value).clone())
+                    .ok()?;
+            }
+            if node.disabled {
+                temp_dag.set_disabled(*id, true).ok()?;
+            }
+        }
+        for edge in self.graph.edges() {
+            if selected.contains(&edge.from_node) && selected.contains(&edge.to_node) {
+                let _ = temp_dag.connect_edge(Edge::new(
+                    edge.from_node,
+                    edge.from_port,
+                    edge.to_node,
+                    edge.to_port,
+                ));
+            }
+        }
+        Some(temp_dag.export_to_tcl())
+    }
+
+    /// Parses a TCL snippet, remaps its `NodeId`s to fresh never-reused ids,
+    /// applies it as one atomic `UndoableCommand::Batch`, and selects the
+    /// newly created nodes.
+    ///
+    /// `offset` shifts every pasted node so repeated pastes cascade down the
+    /// canvas instead of stacking exactly on top of each other.
+    pub fn paste_tcl_snippet(
+        &mut self,
+        tcl: &str,
+        offset: (f32, f32),
+    ) -> Result<Vec<NodeId>, String> {
+        let mut clip_dag = Dag::new();
+        tanova_parse::load_nk_into_dag(tcl, &mut clip_dag).map_err(|e| e.to_string())?;
+
+        let mut clip_nodes: Vec<&tanova_kernel::DagNode> = clip_dag
+            .nodes()
+            .filter(|node| node.kind != "Viewer" && node.kind != "Root")
+            .collect();
+        clip_nodes.sort_by_key(|node| node.id);
+        if clip_nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Never reuse an id the mirror still knows about.
+        let mirror_max = self
+            .graph
+            .nodes()
+            .iter()
+            .map(|node| node.id.0)
+            .max()
+            .unwrap_or(0);
+        self.canvas.sync_next_node_id(mirror_max + 1);
+
+        let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+        let mut cmds: Vec<UndoableCommand> = Vec::new();
+        let mut new_ids: Vec<NodeId> = Vec::new();
+
+        for old_node in clip_nodes {
+            let new_id = self.canvas.allocate_node_id();
+            id_map.insert(old_node.id, new_id);
+            new_ids.push(new_id);
+
+            cmds.push(UndoableCommand::AddNode {
+                id: new_id,
+                kind: old_node.kind.clone(),
+                x: old_node.x + offset.0,
+                y: old_node.y + offset.1,
+            });
+
+            let defaults = find_cartridge(&old_node.kind)
+                .map(|descriptor| (descriptor.default_knobs)())
+                .unwrap_or_default();
+            for (knob_name, knob_val) in old_node.knobs.iter() {
+                if knob_name == "name" {
+                    continue;
+                }
+                let previous = defaults
+                    .get(knob_name)
+                    .cloned()
+                    .unwrap_or(KnobValue::Float(0.0));
+                cmds.push(UndoableCommand::SetKnob {
+                    node: new_id,
+                    knob: knob_name.to_string(),
+                    value: (*knob_val).clone(),
+                    previous,
+                });
+            }
+            if old_node.disabled {
+                cmds.push(UndoableCommand::SetDisabled {
+                    node: new_id,
+                    disabled: true,
+                });
+            }
+        }
+
+        for edge in clip_dag.edges() {
+            let Some((&new_from, &new_to)) =
+                id_map.get(&edge.from_node).zip(id_map.get(&edge.to_node))
+            else {
+                continue;
+            };
+            cmds.push(UndoableCommand::ConnectEdge {
+                from_node: new_from,
+                from_port: edge.from_port,
+                to_node: new_to,
+                to_port: edge.to_port,
+            });
+        }
+
+        if let Some(batch_cmd) = UndoableCommand::from_vec(cmds) {
+            self.dispatch(vec![KernelMessage::Execute(batch_cmd)]);
+        }
+
+        self.canvas.selected_nodes = new_ids.iter().copied().collect();
+        self.canvas.primary_selected = new_ids.first().copied();
+
+        Ok(new_ids)
     }
 }
 
@@ -2702,5 +3004,403 @@ mod tests {
         } else {
             panic!("file modal should still be open");
         }
+    }
+
+    /// Copy a sub-graph (Constant #1 + disabled Grade #2) to TCL, paste it at
+    /// an offset, then undo in a single step — the whole paste vanishes while
+    /// the originals stay untouched.
+    #[test]
+    fn sub_graph_copy_paste_and_single_step_undo() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        // Let the seeded starter comp (Constant #1 -> Grade #2 -> Viewer #3)
+        // round-trip into the mirror (the kernel works on a background thread).
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        // Edit Grade #2's mix to 0.25 and disable it.
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: GRADE,
+                knob: "mix".to_string(),
+                value: KnobValue::Float(0.25),
+                previous: KnobValue::Float(1.0),
+            }))
+            .expect("set Grade #2 mix to 0.25");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetDisabled {
+                node: GRADE,
+                disabled: true,
+            }))
+            .expect("disable Grade #2");
+        // Pump until the mirror reflects the edit.
+        let edit_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.pump();
+            let grade = app.graph.node(GRADE);
+            if grade
+                .is_some_and(|g| g.disabled && g.knobs.get("mix") == Some(&KnobValue::Float(0.25)))
+            {
+                break;
+            }
+            if Instant::now() >= edit_deadline {
+                panic!("mirror did not reflect Grade #2 edit");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let grade = app.graph.node(GRADE).expect("Grade #2");
+        assert_eq!(
+            grade.knobs.get("mix"),
+            Some(&KnobValue::Float(0.25)),
+            "Grade #2 mix must be 0.25"
+        );
+        assert!(grade.disabled, "Grade #2 must be disabled");
+
+        // Select Constant #1 and Grade #2 (Viewer #3 is never part of a copy).
+        app.canvas.selected_nodes = HashSet::from([CONSTANT, GRADE]);
+
+        // Copy selection to a TCL snippet.
+        let tcl = app
+            .export_selection_to_tcl()
+            .expect("selection should export to TCL");
+        assert!(
+            tcl.contains("Constant"),
+            "export must contain Constant: {tcl}"
+        );
+        assert!(tcl.contains("Grade"), "export must contain Grade: {tcl}");
+        assert!(
+            tcl.contains("disable true"),
+            "export must carry disable true: {tcl}"
+        );
+        assert!(!tcl.contains("Viewer"), "export must exclude Viewer: {tcl}");
+
+        // Paste at (+40, +40): expects new nodes #4 and #5 plus edge #4 -> #5.
+        let new_ids = app
+            .paste_tcl_snippet(&tcl, (40.0, 40.0))
+            .expect("paste should succeed");
+        assert_eq!(new_ids, vec![NodeId(4), NodeId(5)]);
+        assert_eq!(
+            app.canvas.selected_nodes,
+            HashSet::from([NodeId(4), NodeId(5)])
+        );
+        assert_eq!(app.canvas.primary_selected, Some(NodeId(4)));
+
+        let const4 = app.graph.node(NodeId(4)).expect("Constant #4");
+        let grade5 = app.graph.node(NodeId(5)).expect("Grade #5");
+        assert!(
+            (const4.x - 80.0).abs() < 1e-4,
+            "Constant #4 at x=80, got {}",
+            const4.x
+        );
+        assert!(
+            (const4.y - 80.0).abs() < 1e-4,
+            "Constant #4 at y=80, got {}",
+            const4.y
+        );
+        assert!(
+            (grade5.x - 80.0).abs() < 1e-4,
+            "Grade #5 at x=80, got {}",
+            grade5.x
+        );
+        assert!(
+            (grade5.y - 204.0).abs() < 1e-4,
+            "Grade #5 at y=204, got {}",
+            grade5.y
+        );
+        assert_eq!(
+            grade5.knobs.get("mix"),
+            Some(&KnobValue::Float(0.25)),
+            "pasted Grade #5 must keep mix 0.25"
+        );
+        assert!(grade5.disabled, "pasted Grade #5 must be disabled");
+
+        // Edge #4 -> #5 must exist.
+        assert_eq!(
+            app.graph
+                .incoming_edge(NodeId(5), PortId(0))
+                .map(|e| e.from_node),
+            Some(NodeId(4)),
+            "edge #4 -> #5 must exist"
+        );
+
+        // Original nodes untouched.
+        assert!(app.graph.node(CONSTANT).is_some());
+        assert!(app.graph.node(GRADE).is_some());
+        assert_eq!(app.graph.node_count(), 5);
+
+        // One Undo must remove the whole pasted sub-graph in a single step.
+        app.kernel.send(KernelMessage::Undo).expect("undo");
+        let undo_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < undo_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "paste must be undone in one step"
+        );
+        assert!(
+            !app.graph.node(NodeId(4)).is_some(),
+            "Constant #4 must be undone"
+        );
+        assert!(
+            !app.graph.node(NodeId(5)).is_some(),
+            "Grade #5 must be undone"
+        );
+        assert!(
+            app.graph.incoming_edge(NodeId(5), PortId(0)).is_none(),
+            "edge #4 -> #5 must be undone"
+        );
+        assert!(
+            app.graph.node(CONSTANT).is_some(),
+            "Constant #1 must remain"
+        );
+        assert!(app.graph.node(GRADE).is_some(), "Grade #2 must remain");
+        assert_eq!(app.graph.node_count(), 3);
+    }
+
+    /// Duplicate (`Ctrl+D`) creates a remapped copy at a fixed offset without
+    /// touching the clipboard, and canvas `F` frames the result on screen.
+    #[test]
+    fn duplicate_and_frame_nodes() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+        // Let the seeded starter comp round-trip into the mirror.
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        app.canvas.selected_nodes = HashSet::from([GRADE]);
+
+        // Sentinel clipboard must survive duplicate untouched.
+        app.test_clipboard = Some("sentinel".to_string());
+
+        // Ctrl+D: export + paste at (40, 40) without touching the clipboard.
+        let tcl = app
+            .export_selection_to_tcl()
+            .expect("Grade #2 should export to TCL");
+        let _ = app.paste_tcl_snippet(&tcl, (40.0, 40.0));
+
+        assert_eq!(
+            app.test_clipboard,
+            Some("sentinel".to_string()),
+            "duplicate must not touch the clipboard"
+        );
+        let new_grade = app.graph.node(NodeId(4)).expect("new Grade #4");
+        assert_eq!(new_grade.kind, "Grade");
+        assert!((new_grade.x - 80.0).abs() < 1e-4, "Grade #4 at x=80");
+        assert!((new_grade.y - 204.0).abs() < 1e-4, "Grade #4 at y=204");
+        assert_eq!(app.canvas.primary_selected, Some(NodeId(4)));
+        assert_eq!(app.canvas.selected_nodes, HashSet::from([NodeId(4)]));
+
+        // Canvas `F` frames the single node dead-center of the viewport.
+        //
+        // `frame_nodes` centers the node's bounds center; the card is
+        // 168x72 so its center is 84px right and 36px down from its top-left.
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        app.canvas.frame_nodes(&app.graph, viewport);
+        assert_ne!(app.canvas.zoom, 1.0, "frame should zoom to fit the node");
+        let card_center = Pos2::new(new_grade.x + 84.0, new_grade.y + 36.0);
+        let screen_pos = app.canvas.world_to_screen(viewport, card_center);
+        assert!(
+            (screen_pos.x - viewport.center().x).abs() < 2.0,
+            "node x must frame to viewport center"
+        );
+        assert!(
+            (screen_pos.y - viewport.center().y).abs() < 2.0,
+            "node y must frame to viewport center"
+        );
+    }
+
+    /// Copy/paste via egui's native `Event::Copy` / `Event::Paste` events
+    /// (no `Key::C` / `Key::V`), exactly as eframe emits them on Linux.
+    #[test]
+    fn canvas_copy_and_paste_via_egui_copy_and_paste_events() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        // Let the seeded starter comp round-trip into the mirror.
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        // Select Constant #1 and Grade #2 (Viewer #3 is never copied).
+        app.canvas.selected_nodes = HashSet::from([CONSTANT, GRADE]);
+
+        // Frame 1: emit an egui `Event::Copy` (no `Key::C`).
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Copy],
+                ..Default::default()
+            },
+            |ctx| {
+                app.handle_shortcuts(ctx);
+            },
+        )
+        .drop_without_applying_deltas();
+
+        assert!(
+            app.internal_clipboard.is_some(),
+            "internal_clipboard must hold the copied TCL"
+        );
+        let copied = app.internal_clipboard.clone().unwrap();
+        assert!(copied.contains("Constant"), "copy must contain Constant");
+        assert!(copied.contains("Grade"), "copy must contain Grade");
+
+        // Frame 2: emit an egui `Event::Paste` carrying the copied text
+        // (no `Key::V`).
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Paste(copied.clone())],
+                ..Default::default()
+            },
+            |ctx| {
+                app.handle_shortcuts(ctx);
+            },
+        )
+        .drop_without_applying_deltas();
+
+        // Pump until the kernel applies the pasted sub-graph.
+        let paste_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < paste_deadline && app.graph.node_count() != 5 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 5, "paste must spawn two new nodes");
+        assert!(
+            app.graph.node(NodeId(4)).is_some(),
+            "Constant #4 must exist"
+        );
+        assert!(app.graph.node(NodeId(5)).is_some(), "Grade #5 must exist");
+        assert_eq!(
+            app.graph
+                .incoming_edge(NodeId(5), PortId(0))
+                .map(|e| e.from_node),
+            Some(NodeId(4)),
+            "edge #4 -> #5 must exist"
+        );
+    }
+
+    /// Copy/paste via `Key::C` / `Key::V` key events (no egui `Event::Copy` /
+    /// `Event::Paste`), using the in-app `internal_clipboard` fallback.
+    #[test]
+    fn canvas_copy_and_paste_via_ctrl_c_and_ctrl_v_key_events() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        // Let the seeded starter comp round-trip into the mirror.
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        // Select Grade #2 only.
+        app.canvas.selected_nodes = HashSet::from([GRADE]);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Frame 1: Ctrl+C key event (no `Event::Copy`).
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::C,
+                    physical_key: Some(egui::Key::C),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                app.handle_shortcuts(ctx);
+            },
+        )
+        .drop_without_applying_deltas();
+
+        // The in-app clipboard must now hold the copied TCL.
+        assert!(
+            app.internal_clipboard.is_some(),
+            "internal_clipboard must hold the copied TCL after Ctrl+C"
+        );
+
+        // Frame 2: Ctrl+V key event (no `Event::Paste`).
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::V,
+                    physical_key: Some(egui::Key::V),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                app.handle_shortcuts(ctx);
+            },
+        )
+        .drop_without_applying_deltas();
+
+        // Pump until the kernel applies the pasted duplicate.
+        let paste_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < paste_deadline && app.graph.node_count() != 4 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 4, "paste must spawn one new node");
+        let dup = app.graph.node(NodeId(4)).expect("duplicate Grade #4");
+        assert_eq!(dup.kind, "Grade");
+        assert!((dup.x - 80.0).abs() < 1e-4, "Grade #4 at x=80");
+        assert!((dup.y - 204.0).abs() < 1e-4, "Grade #4 at y=204");
     }
 }

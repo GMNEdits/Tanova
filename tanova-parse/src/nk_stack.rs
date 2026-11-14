@@ -44,6 +44,11 @@ pub struct ParsedNode {
     pub xpos: Option<f32>,
     /// Canvas-space Y position, when the script declared one.
     pub ypos: Option<f32>,
+    /// `true` when the block carried Nuke's `disable true` line.
+    ///
+    /// Bypass state is graph state, not a knob, so it never enters
+    /// [`ParsedNode::knobs`].
+    pub disabled: bool,
     /// Knobs explicitly present in the script.
     pub knobs: KnobTable,
     /// Declared input count (ports `0..inputs`).
@@ -244,6 +249,7 @@ impl<'a> Machine<'a> {
         let mut explicit_inputs = None;
         let mut xpos: Option<f32> = None;
         let mut ypos: Option<f32> = None;
+        let mut disabled = false;
 
         for (body_line, raw) in body {
             let trimmed = raw.trim();
@@ -280,6 +286,17 @@ impl<'a> Machine<'a> {
                 continue;
             }
 
+            // `disable` is Nuke's bypass flag — graph state, never a knob.
+            // Accept the truthy spellings Nuke and hand-written scripts use.
+            if let Some(rest) = trimmed.strip_prefix("disable ") {
+                disabled = match rest.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    _ => disabled,
+                };
+                continue;
+            }
+
             let Some((knob, raw_value)) = split_knob(trimmed) else {
                 return Err(self.syntax(*body_line, format!("invalid knob line `{trimmed}`")));
             };
@@ -293,9 +310,10 @@ impl<'a> Machine<'a> {
         }
 
         let total_inputs = explicit_inputs.unwrap_or_else(|| default_input_count(class));
-        self.create_node(class, total_inputs, knobs, name, xpos, ypos)
+        self.create_node(class, total_inputs, knobs, name, xpos, ypos, disabled)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_node(
         &mut self,
         class: &str,
@@ -304,6 +322,7 @@ impl<'a> Machine<'a> {
         name: Option<String>,
         xpos: Option<f32>,
         ypos: Option<f32>,
+        disabled: bool,
     ) -> Result<(), ParseError> {
         let id = NodeId(self.next_id);
         self.next_id += 1;
@@ -335,6 +354,10 @@ impl<'a> Machine<'a> {
                 dag.set_knob(id, knob, value.clone())
                     .map_err(|error| ParseError::Kernel(error.to_string()))?;
             }
+            if disabled {
+                dag.set_disabled(id, true)
+                    .map_err(|error| ParseError::Kernel(error.to_string()))?;
+            }
             for (port, from) in input_nodes.iter().enumerate() {
                 let Some(from) = from else {
                     continue;
@@ -350,6 +373,7 @@ impl<'a> Machine<'a> {
             name: name.clone(),
             xpos,
             ypos,
+            disabled,
             knobs,
             inputs: total_inputs,
             input_nodes: input_nodes.clone(),
@@ -716,5 +740,49 @@ mod tests {
         let node = dag2.node(NodeId(1)).expect("node #1");
         assert!((node.x - 0.0).abs() < 1e-4);
         assert!((node.y - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn disable_true_round_trips_without_knob_collision() {
+        // Build a graph: Constant(1) -> Grade(2), then bypass Grade.
+        let mut dag = Dag::new();
+        dag.add_node_at(NodeId(1), "Constant", 0.0, 0.0).unwrap();
+        dag.add_node_at(NodeId(2), "Grade", 0.0, 0.0).unwrap();
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .unwrap();
+        dag.set_disabled(NodeId(2), true).unwrap();
+
+        // Export to .nk TCL: `disable true` must appear, and `disable` must
+        // never live inside `node.knobs`.
+        let tcl = dag.export_to_tcl();
+        assert!(
+            tcl.contains("disable true"),
+            "missing disable true in export: {tcl}"
+        );
+        let grade_node = dag.node(NodeId(2)).expect("Grade #2");
+        assert!(
+            !grade_node.knobs.contains_key("disable"),
+            "disable must not be a knob"
+        );
+
+        // Load back into a fresh Dag: bypass state must round-trip.
+        let mut dag2 = Dag::new();
+        let parsed = load_nk_into_dag(&tcl, &mut dag2).expect("parse should succeed");
+        let grade_parsed = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == NodeId(2))
+            .expect("Grade #2 parsed");
+        assert!(
+            grade_parsed.disabled,
+            "parsed node must carry disabled=true"
+        );
+        assert!(
+            !grade_parsed.knobs.contains_key("disable"),
+            "disable must not be a parsed knob"
+        );
+
+        let reloaded = dag2.node(NodeId(2)).expect("Grade #2 in reloaded dag");
+        assert!(reloaded.disabled, "reloaded node must be disabled");
     }
 }

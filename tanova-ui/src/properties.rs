@@ -460,11 +460,12 @@ mod tests {
             kind: "Grade".to_string(),
             x: 0.0,
             y: 0.0,
+            disabled: false,
             knobs: Box::new(knobs.clone()),
             edges: Vec::new(),
         }));
         let mut dag = Dag::new();
-        dag.restore_node(NODE, "Grade", 0.0, 0.0, &knobs, &[])
+        dag.restore_node(NODE, "Grade", 0.0, 0.0, false, &knobs, &[])
             .expect("dag node #2");
         let mut undo = UndoStack::new();
 

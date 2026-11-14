@@ -85,6 +85,9 @@ pub struct DagNode {
     pub x: f32,
     /// Canvas-space Y position of the node.
     pub y: f32,
+    /// Bypass flag: a disabled node passes its `B` input straight through and
+    /// never runs its cartridge.
+    pub disabled: bool,
 }
 
 impl DagNode {
@@ -98,6 +101,7 @@ impl DagNode {
             crashed: None,
             x: 0.0,
             y: 0.0,
+            disabled: false,
         }
     }
 
@@ -118,6 +122,7 @@ impl fmt::Debug for DagNode {
             .field("crashed", &self.crashed)
             .field("x", &self.x)
             .field("y", &self.y)
+            .field("disabled", &self.disabled)
             .finish()
     }
 }
@@ -439,10 +444,17 @@ impl Dag {
             if node.y.abs() > 1e-4 {
                 let _ = writeln!(out, " ypos {}", node.y.round() as i32);
             }
+            // Bypass state round-trips as Nuke's own `disable true` line.
+            // Omitted when false so existing scripts and export tests are
+            // byte-for-byte unchanged.
+            if node.disabled {
+                out.push_str(" disable true\n");
+            }
             for (name, value) in node.knobs.iter() {
                 // Skip xpos/ypos knobs if present (they are layout data, not
-                // user parameters).
-                if name == "xpos" || name == "ypos" {
+                // user parameters), and never let a stray `disable` knob
+                // shadow the real bypass flag.
+                if name == "xpos" || name == "ypos" || name == "disable" {
                     continue;
                 }
                 let _ = writeln!(out, " {name} {}", format_knob_value(value));
@@ -541,6 +553,24 @@ impl Dag {
         Ok(())
     }
 
+    /// Bypasses (`true`) or re-enables (`false`) a node.
+    ///
+    /// A disabled node never runs its cartridge: [`Dag::pull`] hands its `B`
+    /// input straight through, exactly like Nuke's `D` hotkey.
+    pub fn set_disabled(&mut self, id: NodeId, disabled: bool) -> Result<(), NodeError> {
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .ok_or(NodeError::UnknownNode(id.0))?;
+        node.disabled = disabled;
+        Ok(())
+    }
+
+    /// Returns a node's bypass state, or `None` when it does not exist.
+    pub fn is_disabled(&self, id: NodeId) -> Option<bool> {
+        self.nodes.get(&id).map(|node| node.disabled)
+    }
+
     /// Stamps the active project format onto a freshly added source node.
     ///
     /// Only a node whose `format_width`/`format_height` knobs still sit at the
@@ -617,6 +647,7 @@ impl Dag {
             kind: node.kind.clone(),
             x: node.x,
             y: node.y,
+            disabled: node.disabled,
             knobs: node.knobs.clone(),
             edges,
         })
@@ -630,6 +661,7 @@ impl Dag {
             kind: snapshot.kind,
             x: snapshot.x,
             y: snapshot.y,
+            disabled: snapshot.disabled,
             knobs: Box::new(snapshot.knobs),
             edges: snapshot.edges,
         })
@@ -653,12 +685,14 @@ impl Dag {
     /// Edges are restored best-effort: when several connected nodes are undone
     /// one at a time, a peer may not exist yet. The edge is present in both
     /// endpoints' snapshots, so the later restore reconnects it.
+    #[allow(clippy::too_many_arguments)]
     pub fn restore_node(
         &mut self,
         id: NodeId,
         kind: &str,
         x: f32,
         y: f32,
+        disabled: bool,
         knobs: &KnobTable,
         edges: &[EdgeSnapshot],
     ) -> Result<(), NodeError> {
@@ -670,6 +704,7 @@ impl Dag {
         node.knobs = knobs.clone();
         node.x = x;
         node.y = y;
+        node.disabled = disabled;
         node.implementation = Some(match find_cartridge(kind) {
             Some(descriptor) => (descriptor.factory)(),
             None => Arc::new(PassthroughNode) as Arc<dyn NodeTrait>,
@@ -825,15 +860,17 @@ impl Dag {
                 kind,
                 x,
                 y,
+                disabled,
                 knobs,
                 edges,
             } => {
-                self.restore_node(id, &kind, x, y, &knobs, &edges)?;
+                self.restore_node(id, &kind, x, y, disabled, &knobs, &edges)?;
                 Ok(UndoableCommand::RestoreNode {
                     id,
                     kind,
                     x,
                     y,
+                    disabled,
                     knobs,
                     edges,
                 })
@@ -880,6 +917,10 @@ impl Dag {
                 } else {
                     Ok(command)
                 }
+            }
+            UndoableCommand::SetDisabled { node, disabled } => {
+                self.set_disabled(node, disabled)?;
+                Ok(UndoableCommand::SetDisabled { node, disabled })
             }
             UndoableCommand::MoveNode {
                 id,
@@ -974,11 +1015,20 @@ impl Dag {
             return Ok(cached);
         }
 
-        let implementation = self
-            .nodes
-            .get(&id)
-            .and_then(|node| node.implementation.clone())
-            .ok_or(NodeError::NoImplementation(id.0))?;
+        // A bypassed node is a pure wire: it never runs its cartridge, so it
+        // does not even need one attached. `B` (`PortId(0)`) is handed through
+        // by Arc clone; an unconnected `B` yields an empty packet.
+        let disabled = self.nodes.get(&id).is_some_and(|node| node.disabled);
+        let implementation = if disabled {
+            None
+        } else {
+            Some(
+                self.nodes
+                    .get(&id)
+                    .and_then(|node| node.implementation.clone())
+                    .ok_or(NodeError::NoImplementation(id.0))?,
+            )
+        };
 
         // Pixel allocations will reserve permits from the governor when the
         // render milestone lands; the handle is part of the pull contract.
@@ -1001,7 +1051,9 @@ impl Dag {
             inputs[edge.to_port.0 as usize] = (*packet).clone();
         }
 
-        let evaluated = {
+        let evaluated = if disabled {
+            Ok(inputs.first().cloned().unwrap_or_default())
+        } else {
             // Knobs live on the DagNode; inject them into a per-node context so
             // cartridges can read live values without changing `evaluate`'s
             // signature. The governor rides along so tile allocations reserve
@@ -1011,7 +1063,12 @@ impl Dag {
                 node_ctx.insert(node.knobs.clone());
             }
             node_ctx.insert(governor.clone());
-            evaluate_with_airbag(implementation.as_ref(), &node_ctx, &inputs)
+            match implementation {
+                Some(implementation) => {
+                    evaluate_with_airbag(implementation.as_ref(), &node_ctx, &inputs)
+                }
+                None => Err(NodeError::NoImplementation(id.0)),
+            }
         };
 
         if !epoch.is_current(target_epoch) {
@@ -1065,6 +1122,10 @@ impl Dag {
         hasher.update(b"tanova-op-v1");
         hasher.update(&(node.kind.len() as u64).to_le_bytes());
         hasher.update(node.kind.as_bytes());
+        // Bypass state is part of the operation: a disabled node passes its
+        // input through instead of evaluating, so it must never share a cache
+        // entry with the enabled node it replaced.
+        hasher.update(&[u8::from(node.disabled)]);
         node.knobs.feed_hash(&mut hasher);
         feed_eval_context(&mut hasher, ctx);
 
@@ -1876,6 +1937,84 @@ mod tests {
             *value, 11,
             "result should still be correct after downstream invalidation"
         );
+    }
+
+    #[test]
+    fn set_disabled_bypasses_cartridge_and_invalidates_cache() {
+        let mut dag = Dag::new();
+
+        // Chain: Constant(1) -> Transform(+10) -> Merge2(pick first).
+        dag.add_node(NodeId(1), "Constant").unwrap();
+        dag.node_mut(NodeId(1)).unwrap().implementation = Some(offset_factory(1));
+        dag.add_node(NodeId(2), "Transform").unwrap();
+        dag.node_mut(NodeId(2)).unwrap().implementation = Some(offset_factory(10));
+        dag.add_node(NodeId(3), "Merge2").unwrap();
+        dag.node_mut(NodeId(3)).unwrap().implementation = Some(Arc::new(MergePickNode));
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .unwrap();
+        dag.connect_edge(Edge::new(NodeId(2), PortId(0), NodeId(3), PortId(0)))
+            .unwrap();
+
+        let ctx = EvalContext::new();
+        let governor = MemoryGovernor::new(usize::MAX);
+        let epoch = RenderEpoch::new();
+        let target_epoch = epoch.bump();
+
+        // Enabled: Transform runs, 1 + 10 = 11.
+        let packet = dag
+            .evaluate_pull(NodeId(3), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+        assert_eq!(*packet.get::<u32>().unwrap(), 11);
+
+        // Bypass Transform: it must pass Constant(1) straight through and the
+        // cache must not serve the stale enabled packet (11).
+        let applied = dag
+            .apply_command(UndoableCommand::SetDisabled {
+                node: NodeId(2),
+                disabled: true,
+            })
+            .unwrap();
+        let packet = dag
+            .evaluate_pull(NodeId(3), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+        assert_eq!(
+            *packet.get::<u32>().unwrap(),
+            1,
+            "bypassed Transform must pass Constant through, cache must not collide"
+        );
+
+        // Undo restores Transform: back to 11.
+        dag.undo_command(&applied).unwrap();
+        let packet = dag
+            .evaluate_pull(NodeId(3), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+        assert_eq!(*packet.get::<u32>().unwrap(), 11);
+
+        // OpHash differentiation: disabled and enabled states never collide.
+        let hash_enabled = dag.compute_op_hash(NodeId(2), &ctx).unwrap();
+        dag.apply_command(UndoableCommand::SetDisabled {
+            node: NodeId(2),
+            disabled: true,
+        })
+        .unwrap();
+        let hash_disabled = dag.compute_op_hash(NodeId(2), &ctx).unwrap();
+        assert_ne!(hash_enabled, hash_disabled);
+
+        // Disabled state survives Delete + Ctrl+Z: remove the disabled node,
+        // then undo, and it comes back disabled.
+        let remove_cmd = dag.enrich(UndoableCommand::RemoveNode {
+            id: NodeId(2),
+            kind: "Transform".to_string(),
+            x: 0.0,
+            y: 0.0,
+            disabled: true,
+            knobs: Box::new(KnobTable::new()),
+            edges: Vec::new(),
+        });
+        dag.apply_command(remove_cmd.clone()).unwrap();
+        assert!(!dag.contains_node(NodeId(2)));
+        dag.undo_command(&remove_cmd).unwrap();
+        assert_eq!(dag.is_disabled(NodeId(2)), Some(true));
     }
 
     #[test]
