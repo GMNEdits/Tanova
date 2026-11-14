@@ -5,6 +5,7 @@
 //! artist view the `Write` node's output without writing files. File output
 //! only happens when the kernel processes `KernelMessage::ExecuteWriteNode`.
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -88,9 +89,11 @@ impl NodeTrait for WriteNode {
 
 /// Exports a single evaluated frame to disk using the `Write` node's knobs.
 ///
-/// Resolves the `"file"` pattern via [`resolve_sequence_path`] for `frame`,
-/// appends `.exr` if the resolved path has no extension, and writes via
-/// [`write_exr_to_path`].
+/// Resolves the `"file"` pattern via [`resolve_sequence_path`] for `frame`
+/// when it contains `%` or `#` tokens. For plain filenames (e.g. `shot.exr`),
+/// auto-numbers each frame as `{base_stem}.{:04}.{ext}` so rendering frames
+/// `1..=3` produces distinct files (`shot.0001.exr`, `shot.0002.exr`,
+/// `shot.0003.exr`) instead of overwriting the same file.
 pub fn export_packet_with_write_knobs(
     packet: &Packet,
     knobs: &KnobTable,
@@ -108,14 +111,56 @@ pub fn export_packet_with_write_knobs(
     }
     let channels = text_knob(knobs, "channels", DEFAULT_CHANNELS);
 
-    let resolved_str = resolve_sequence_path(&file, frame);
-    let mut resolved_path = PathBuf::from(resolved_str);
-    if resolved_path.extension().is_none() {
-        resolved_path.set_extension("exr");
-    }
+    let resolved_path = if file.contains('%') || file.contains('#') {
+        // Nuke-style sequence token: resolve via the standard resolver.
+        let resolved_str = resolve_sequence_path(&file, frame);
+        let mut resolved_path = PathBuf::from(resolved_str);
+        if resolved_path.extension().is_none() {
+            resolved_path.set_extension("exr");
+        }
+        resolved_path
+    } else {
+        // Plain filename: auto-number each frame as {base_stem}.{:04}.{ext}.
+        let path = Path::new(&file);
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("exr");
+
+        // Strip trailing frame suffix (dot+digits or underscore+digits) from
+        // the stem so the user can select an existing frame and still get
+        // clean auto-numbering.
+        let base_stem = strip_trailing_frame_suffix(&stem);
+
+        parent.join(format!("{base_stem}.{:04}.{ext}", frame as i32))
+    };
 
     write_exr_to_path(&resolved_path, raster, &channels)?;
     Ok(resolved_path)
+}
+
+/// Strips a trailing frame suffix from a stem: either `.<digits>` or
+/// `_<digits>` at the end. Returns the stem unchanged if no such suffix
+/// exists.
+fn strip_trailing_frame_suffix(stem: &str) -> String {
+    // Check for `_<digits>` suffix first (e.g. `shot_001` -> `shot`).
+    if let Some(underscore_pos) = stem.rfind('_') {
+        let after = &stem[underscore_pos + 1..];
+        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+            return stem[..underscore_pos].to_string();
+        }
+    }
+    // Check for `.<digits>` suffix (e.g. `shot.0001` -> `shot`).
+    if let Some(dot_pos) = stem.rfind('.') {
+        let after = &stem[dot_pos + 1..];
+        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+            return stem[..dot_pos].to_string();
+        }
+    }
+    stem.to_string()
 }
 
 fn factory() -> Arc<dyn NodeTrait> {

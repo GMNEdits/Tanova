@@ -1120,6 +1120,12 @@ impl TanovaApp {
             .get("file")
             .cloned()
             .unwrap_or(KnobValue::Text(String::new()));
+        let previous_first = node
+            .knobs
+            .get("first")
+            .cloned()
+            .unwrap_or(KnobValue::Int(1));
+        let previous_last = node.knobs.get("last").cloned().unwrap_or(KnobValue::Int(1));
 
         if detect_sequence {
             if let Some((pattern_path, first, last)) = Self::detect_exr_sequence_in_dir(&path) {
@@ -1134,17 +1140,13 @@ impl TanovaApp {
                         node: node_id,
                         knob: "first".to_string(),
                         value: KnobValue::Int(first as i64),
-                        previous: node
-                            .knobs
-                            .get("first")
-                            .cloned()
-                            .unwrap_or(KnobValue::Int(1)),
+                        previous: previous_first.clone(),
                     },
                     UndoableCommand::SetKnob {
                         node: node_id,
                         knob: "last".to_string(),
                         value: KnobValue::Int(last as i64),
-                        previous: node.knobs.get("last").cloned().unwrap_or(KnobValue::Int(1)),
+                        previous: previous_last.clone(),
                     },
                 ];
                 if let Some(batch) = UndoableCommand::from_vec(cmds) {
@@ -1154,13 +1156,48 @@ impl TanovaApp {
             }
         }
 
-        // Single file: just set the `"file"` knob.
-        self.dispatch(vec![KernelMessage::Execute(UndoableCommand::SetKnob {
-            node: node_id,
-            knob: "file".to_string(),
-            value: KnobValue::Text(path.to_string_lossy().into_owned()),
-            previous: previous_file,
-        })]);
+        // Single file: extract a trailing frame integer from the stem if
+        // present, else default to 1. Always set first == last so the read
+        // range never stays stuck at the default (1, 100).
+        let frame_num = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|stem| {
+                stem.chars()
+                    .rev()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+                    .parse::<i64>()
+                    .unwrap_or(1)
+            })
+            .unwrap_or(1);
+
+        self.dispatch(vec![KernelMessage::Execute(
+            UndoableCommand::from_vec(vec![
+                UndoableCommand::SetKnob {
+                    node: node_id,
+                    knob: "file".to_string(),
+                    value: KnobValue::Text(path.to_string_lossy().into_owned()),
+                    previous: previous_file,
+                },
+                UndoableCommand::SetKnob {
+                    node: node_id,
+                    knob: "first".to_string(),
+                    value: KnobValue::Int(frame_num),
+                    previous: previous_first,
+                },
+                UndoableCommand::SetKnob {
+                    node: node_id,
+                    knob: "last".to_string(),
+                    value: KnobValue::Int(frame_num),
+                    previous: previous_last,
+                },
+            ])
+            .unwrap(),
+        )]);
     }
 
     /// Handles `ConfirmWriteExr`: applies `"file"` as a `SetKnob` command on
@@ -1190,34 +1227,52 @@ impl TanovaApp {
     /// Returns `(pattern_path, first_frame, last_frame)` where `pattern_path`
     /// uses a printf-style token (`%04d` or `%d`). Returns `None` when no
     /// sequence is detected.
+    ///
+    /// If `path` is a directory, the first `.exr` file inside (sorted
+    /// alphabetically) is inspected. If `path` is an `.exr` file whose stem
+    /// does not end with digits (e.g. `shot.exr`), the parent directory is
+    /// scanned for `<stem>.<digits>.{ext}` files to detect the sequence.
     pub fn detect_exr_sequence_in_dir(path: &std::path::Path) -> Option<(PathBuf, i32, i32)> {
-        if !is_supported_exr_file(path) {
+        // If `path` is a directory, inspect the first `.exr` file inside.
+        let path = if path.is_dir() {
+            let mut exr_files: Vec<_> = std::fs::read_dir(path)
+                .ok()?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| is_supported_exr_file(p))
+                .collect();
+            exr_files.sort();
+            exr_files.into_iter().next()?
+        } else {
+            path.to_path_buf()
+        };
+
+        if !is_supported_exr_file(&path) {
             return None;
         }
         let parent = path.parent()?;
         let ext = path.extension()?.to_str()?;
         let stem = path.file_stem()?.to_str()?;
 
-        // Find trailing ASCII digit slice at the end of stem.
+        // Find trailing ASCII digit slice at end of stem.
         let digit_count = stem
             .chars()
             .rev()
             .take_while(|c| c.is_ascii_digit())
             .count();
-        if digit_count == 0 {
-            return None;
-        }
-        let split_at = stem.len() - digit_count;
-        let (prefix, digits_str) = stem.split_at(split_at);
-        let token = if digit_count > 1 && digits_str.starts_with('0') {
-            format!("%0{digit_count}d")
+
+        let prefix: String = if digit_count > 0 {
+            let split_at = stem.len() - digit_count;
+            stem[..split_at].to_string()
         } else {
-            "%d".to_string()
+            // No trailing digits: look for `<stem>.<digits>.{ext}`.
+            format!("{stem}.")
         };
 
         // Scan parent directory for matching .exr files.
         let mut min_frame: Option<i32> = None;
         let mut max_frame: Option<i32> = None;
+        let mut max_digit_len: usize = digit_count;
         for entry in std::fs::read_dir(parent).ok()? {
             let entry = entry.ok()?;
             let file_name = entry.file_name();
@@ -1227,7 +1282,7 @@ impl TanovaApp {
             }
             let entry_path = entry.path();
             let entry_stem = entry_path.file_stem()?.to_str()?;
-            if !entry_stem.starts_with(prefix) {
+            if !entry_stem.starts_with(&prefix) {
                 continue;
             }
             let remainder = &entry_stem[prefix.len()..];
@@ -1238,10 +1293,7 @@ impl TanovaApp {
             if !remainder_digits {
                 continue;
             }
-            // If the original had zero-padding, require same digit count.
-            if digits_str.starts_with('0') && remainder.len() != digit_count {
-                continue;
-            }
+            max_digit_len = max_digit_len.max(remainder.len());
             let frame: i32 = remainder.parse().ok()?;
             min_frame = Some(min_frame.unwrap_or(frame).min(frame));
             max_frame = Some(max_frame.unwrap_or(frame).max(frame));
@@ -1249,6 +1301,11 @@ impl TanovaApp {
 
         let min_frame = min_frame?;
         let max_frame = max_frame?;
+        let token = if max_digit_len > 1 {
+            format!("%0{max_digit_len}d")
+        } else {
+            "%d".to_string()
+        };
         let pattern_path = parent.join(format!("{prefix}{token}.{ext}"));
         Some((pattern_path, min_frame, max_frame))
     }
@@ -1394,8 +1451,10 @@ impl TanovaApp {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        let file_input = if req.node_kind == "Write" && file_input.is_empty() {
-            "render.%04d.exr".to_string()
+        let file_input = if req.node_kind == "Write" && req.current_path == "render.%04d.exr" {
+            // The Write default carries a sequence token; use a clean plain
+            // name so the kernel auto-numbers each frame on render.
+            "render.exr".to_string()
         } else {
             file_input
         };
@@ -4203,6 +4262,7 @@ mod tests {
         let write_path = temp_dir.join("renders").join("comp.%04d.exr");
         app.handle_confirm_write_exr(NodeId(4), write_path.clone());
         app.file_modal = None;
+        app.pump();
         assert!(
             app.file_modal.is_none(),
             "browse modal should be consumed after confirm"
@@ -4380,6 +4440,346 @@ mod tests {
         );
 
         // Clean up.
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        app.kernel.shutdown();
+    }
+
+    /// Writing with a plain filename (no `%04d`) auto-numbers each frame into
+    /// distinct files.
+    #[test]
+    fn write_with_plain_filename_renders_distinct_numbered_sequence_files() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        // Let the seeded starter comp round-trip into the mirror.
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        let temp_dir = std::env::temp_dir().join("tanova_write_plain_test");
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Add Write #4 connected to Grade #2 with first=1, last=3.
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(4),
+                kind: "Write".to_string(),
+                x: 40.0,
+                y: 288.0,
+            }))
+            .expect("add Write #4");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::ConnectEdge {
+                from_node: GRADE,
+                from_port: PortId(0),
+                to_node: NodeId(4),
+                to_port: PortId(0),
+            }))
+            .expect("connect Grade -> Write");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(4),
+                knob: "first".to_string(),
+                value: KnobValue::Int(1),
+                previous: KnobValue::Int(1),
+            }))
+            .expect("set Write #4 first");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(4),
+                knob: "last".to_string(),
+                value: KnobValue::Int(3),
+                previous: KnobValue::Int(1),
+            }))
+            .expect("set Write #4 last");
+        app.pump();
+
+        // Wait for Write #4 to appear in the mirror (kernel round-trip).
+        let node4_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < node4_deadline && app.graph.node(NodeId(4)).is_none() {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.graph.node(NodeId(4)).is_some(),
+            "Write #4 must appear in mirror"
+        );
+
+        // Confirm BrowseWriteExr with a plain filename (no %04d).
+        app.properties.pending_file_browse = Some(tanova_ui::FileBrowseRequest {
+            node_id: NodeId(4),
+            node_kind: "Write".to_string(),
+            current_path: "my_shot.exr".to_string(),
+        });
+        if let Some(req) = app.properties.take_pending_file_browse() {
+            app.open_exr_browse_modal(req);
+        }
+        assert!(app.file_modal.is_some(), "browse modal should be open");
+        assert!(
+            app.graph.node(NodeId(4)).is_some(),
+            "Write #4 must appear in mirror before handle_confirm_write_exr"
+        );
+
+        // Set directory to temp_dir.
+        if let Some(FileModalState::BrowseWriteExr { directory, .. }) = &mut app.file_modal {
+            *directory = temp_dir.clone();
+        }
+
+        // Confirm Save directly (file_input already "my_shot.exr").
+        let write_path = temp_dir.join("my_shot.exr");
+        app.handle_confirm_write_exr(NodeId(4), write_path.clone());
+        app.file_modal = None;
+        app.pump();
+
+        // Verify Write #4's file knob stays clean (no %04d forced).
+        let write_node = app.graph.node(NodeId(4)).expect("Write #4 must exist");
+        assert_eq!(
+            write_node.knobs.get("file"),
+            Some(&KnobValue::Text(
+                temp_dir.join("my_shot.exr").to_string_lossy().into_owned()
+            )),
+            "Write #4 file knob must stay clean (my_shot.exr)"
+        );
+
+        // Render frames 1..=3 via ExecuteWriteNode.
+        app.kernel
+            .send(KernelMessage::MarkClean)
+            .expect("mark clean");
+        app.kernel
+            .send(KernelMessage::ExecuteWriteNode { node: NodeId(4) })
+            .expect("execute write node");
+        let complete_deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < complete_deadline {
+            app.pump();
+            if temp_dir.join("my_shot.0001.exr").exists()
+                && temp_dir.join("my_shot.0002.exr").exists()
+                && temp_dir.join("my_shot.0003.exr").exists()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Wait for MarkClean's DirtyStateChanged to be processed.
+        let clean_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < clean_deadline && app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.last_script_error.is_none(),
+            "kernel script error: {:?}",
+            app.last_script_error
+        );
+        assert!(app.failure.is_none(), "kernel failure: {:?}", app.failure);
+        assert!(
+            temp_dir.join("my_shot.0001.exr").exists(),
+            "my_shot.0001.exr must exist"
+        );
+        assert!(
+            temp_dir.join("my_shot.0002.exr").exists(),
+            "my_shot.0002.exr must exist"
+        );
+        assert!(
+            temp_dir.join("my_shot.0003.exr").exists(),
+            "my_shot.0003.exr must exist"
+        );
+        assert!(!app.is_dirty, "render must not dirty the project");
+
+        // Clean up.
+        for f in [
+            "my_shot.exr",
+            "my_shot.0001.exr",
+            "my_shot.0002.exr",
+            "my_shot.0003.exr",
+        ] {
+            let _ = std::fs::remove_file(temp_dir.join(f));
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        app.kernel.shutdown();
+    }
+
+    /// Read browse always updates first/last, never leaving last at 100.
+    #[test]
+    fn read_browse_updates_first_and_last_without_leaving_default_100() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        // Let the seeded starter comp round-trip into the mirror.
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        let temp_dir = std::env::temp_dir().join("tanova_read_browse_test");
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Create sequence files: my_shot.0001.exr .. my_shot.0003.exr
+        for i in 1..=3 {
+            let _ = std::fs::File::create(temp_dir.join(format!("my_shot.{i:04}.exr")));
+        }
+        // Also create a single still image.
+        let _ = std::fs::File::create(temp_dir.join("still_image.exr"));
+
+        // Add Read #5 (defaults: first=1, last=100).
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(5),
+                kind: "Read".to_string(),
+                x: 200.0,
+                y: 288.0,
+            }))
+            .expect("add Read #5");
+        app.pump();
+        let node5_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < node5_deadline && app.graph.node(NodeId(5)).is_none() {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.graph.node(NodeId(5)).is_some(),
+            "Read #5 must appear in mirror"
+        );
+
+        // --- Case 1: BrowseReadExr selecting my_shot.0001.exr with detect_sequence ---
+        app.properties.pending_file_browse = Some(tanova_ui::FileBrowseRequest {
+            node_id: NodeId(5),
+            node_kind: "Read".to_string(),
+            current_path: temp_dir
+                .join("my_shot.0001.exr")
+                .to_string_lossy()
+                .into_owned(),
+        });
+        if let Some(req) = app.properties.take_pending_file_browse() {
+            app.open_exr_browse_modal(req);
+        }
+        assert!(app.file_modal.is_some(), "read browse modal should be open");
+        if let Some(FileModalState::BrowseReadExr {
+            detect_sequence, ..
+        }) = &mut app.file_modal
+        {
+            *detect_sequence = true;
+        }
+        if let Some(FileModalState::BrowseReadExr {
+            directory,
+            file_input,
+            ..
+        }) = &app.file_modal
+        {
+            let path = if PathBuf::from(file_input).is_relative() {
+                directory.join(file_input)
+            } else {
+                PathBuf::from(file_input)
+            };
+            app.handle_confirm_read_exr(NodeId(5), path, true);
+        }
+        app.file_modal = None;
+
+        // Verify Read #5 has first=1, last=3 (not 100).
+        let knob_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < knob_deadline {
+            app.pump();
+            if app.graph.node(NodeId(5)).is_some_and(|n| {
+                n.knobs.get("first") == Some(&KnobValue::Int(1))
+                    && n.knobs.get("last") == Some(&KnobValue::Int(3))
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let read_node = app.graph.node(NodeId(5)).expect("Read #5 must exist");
+        assert_eq!(
+            read_node.knobs.get("first"),
+            Some(&KnobValue::Int(1)),
+            "Read #5 first knob must be 1 (sequence detected)"
+        );
+        assert_eq!(
+            read_node.knobs.get("last"),
+            Some(&KnobValue::Int(3)),
+            "Read #5 last knob must be 3 (sequence detected)"
+        );
+
+        // --- Case 2: BrowseReadExr selecting a single unnumbered still image ---
+        app.properties.pending_file_browse = Some(tanova_ui::FileBrowseRequest {
+            node_id: NodeId(5),
+            node_kind: "Read".to_string(),
+            current_path: temp_dir
+                .join("still_image.exr")
+                .to_string_lossy()
+                .into_owned(),
+        });
+        if let Some(req) = app.properties.take_pending_file_browse() {
+            app.open_exr_browse_modal(req);
+        }
+        assert!(app.file_modal.is_some(), "read browse modal should be open");
+        if let Some(FileModalState::BrowseReadExr {
+            directory,
+            file_input,
+            ..
+        }) = &app.file_modal
+        {
+            let path = if PathBuf::from(file_input).is_relative() {
+                directory.join(file_input)
+            } else {
+                PathBuf::from(file_input)
+            };
+            app.handle_confirm_read_exr(NodeId(5), path, true);
+        }
+        app.file_modal = None;
+
+        // Verify Read #5 has first=1, last=1 (never 100).
+        let knob_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < knob_deadline {
+            app.pump();
+            if app.graph.node(NodeId(5)).is_some_and(|n| {
+                n.knobs.get("first") == Some(&KnobValue::Int(1))
+                    && n.knobs.get("last") == Some(&KnobValue::Int(1))
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let read_node = app.graph.node(NodeId(5)).expect("Read #5 must exist");
+        assert_eq!(
+            read_node.knobs.get("first"),
+            Some(&KnobValue::Int(1)),
+            "Read #5 first knob must be 1 (single still)"
+        );
+        assert_eq!(
+            read_node.knobs.get("last"),
+            Some(&KnobValue::Int(1)),
+            "Read #5 last knob must be 1 (never 100)"
+        );
+
+        // Clean up.
+        for f in [
+            "my_shot.0001.exr",
+            "my_shot.0002.exr",
+            "my_shot.0003.exr",
+            "still_image.exr",
+        ] {
+            let _ = std::fs::remove_file(temp_dir.join(f));
+        }
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         app.kernel.shutdown();
