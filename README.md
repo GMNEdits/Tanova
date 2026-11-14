@@ -26,10 +26,11 @@ Whether you want to explore the project, try the desktop app, or render a suppor
 - **Live viewer:** Preview frames from the graph in the desktop app.
 - **Editable settings:** Adjust the selected node in the properties panel.
 - **Undo and redo:** Reverse graph edits as you work.
-- **Command-line rendering:** Render a frame from a Nuke `.nk` script and optionally save it as a PPM image.
+- **File lifecycle:** New/Open/Save/Save As scripts with `.tnv` as the native extension and full `.nk` compatibility; unsaved-changes close guard.
+- **Command-line rendering:** Render a frame from a Nuke `.nk` script and optionally save it as a PPM or multi-channel OpenEXR image.
 - **GPU-based rendering:** Uses `wgpu` for GPU compute and the desktop viewer.
 
-Available node types include **Constant**, **Read**, **Grade**, **Merge2**, **Transform**, **Blur**, and **Viewer**.
+Available node types include **Constant**, **Read**, **Grade**, **Merge2**, **Transform**, **Blur**, **Write**, and **Viewer**.
 
 ## Get started
 
@@ -64,6 +65,15 @@ cargo run -p tanova-cli -- \
   --script path/to/project.nk \
   --node Viewer1 \
   --out-ppm frame.ppm
+```
+
+To export a multi-channel OpenEXR sequence, add `--out-exr`:
+
+```bash
+cargo run -p tanova-cli -- \
+  --script path/to/project.nk \
+  --frame 1 \
+  --out-exr path/to/render.%04d.exr
 ```
 
 See all command-line options with:
