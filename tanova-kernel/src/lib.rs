@@ -13,8 +13,8 @@ pub mod registry;
 pub mod types;
 
 pub use bus::{
-    FrameNotification, KernelEvent, KernelHandle, KernelMessage, NodeId, PortId, UndoStack,
-    UndoableCommand,
+    FrameExporter, FrameNotification, KernelEvent, KernelHandle, KernelMessage, NodeId, PortId,
+    UndoStack, UndoableCommand,
 };
 pub use command::{EdgeSnapshot, NodeSnapshot};
 pub use dag::{Dag, DagNode, Edge, OpHash, RamCache};
@@ -42,10 +42,18 @@ mod tests {
     }
 
     fn next_event(kernel: &KernelHandle) -> KernelEvent {
-        kernel
-            .events()
-            .recv_timeout(Duration::from_secs(5))
-            .expect("kernel thread should emit an event")
+        loop {
+            let event = kernel
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("kernel thread should emit an event");
+            match &event {
+                KernelEvent::DirtyStateChanged { .. }
+                | KernelEvent::ScriptSaved { .. }
+                | KernelEvent::ScriptError { .. } => continue,
+                _ => return event,
+            }
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 
@@ -24,6 +24,18 @@ pub struct NodeId(pub u64);
 /// Identifies one input or output port on a node.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PortId(pub u16);
+
+/// A callback registered by the UI (e.g. `tanova-app`) that exports a single
+/// evaluated frame to disk. Kept in `tanova-kernel` so the kernel thread can
+/// invoke it without depending on `tanova-io` or `tanova-render`.
+pub type FrameExporterFn = std::sync::Arc<
+    dyn Fn(&Packet, &KnobTable, f64) -> Result<std::path::PathBuf, NodeError> + Send + Sync,
+>;
+
+/// Wraps [`FrameExporterFn`] so it can be stored in `EvalContext`'s `TypeMap`
+/// (which requires `Clone + Send + Sync`).
+#[derive(Clone)]
+pub struct FrameExporter(pub FrameExporterFn);
 
 /// A state change the UI asks the kernel to perform.
 ///
@@ -57,6 +69,8 @@ pub enum UndoableCommand {
         x: f32,
         /// Canvas-space Y position, kept so undo restores the layout.
         y: f32,
+        /// Bypass state, kept so undo restores a disabled node disabled.
+        disabled: bool,
         /// Full knob table captured at removal time.
         ///
         /// Boxed so the command enum (and every message on the bus) stays
@@ -75,6 +89,8 @@ pub enum UndoableCommand {
         x: f32,
         /// Canvas-space Y position.
         y: f32,
+        /// Bypass state to restore.
+        disabled: bool,
         /// Knob values to restore verbatim (boxed for the same reason).
         knobs: Box<KnobTable>,
         /// Edges to reconnect (best effort, since peers may restore later).
@@ -126,6 +142,16 @@ pub enum UndoableCommand {
         /// Canvas-space Y after the move.
         to_y: f32,
     },
+    /// Bypass (`disabled: true`) or re-enable a node.
+    ///
+    /// A bypassed node never runs its cartridge: the DAG hands its `B` input
+    /// straight through. `inverse()` flips the flag back.
+    SetDisabled {
+        /// Node whose bypass state changes.
+        node: NodeId,
+        /// New bypass state.
+        disabled: bool,
+    },
     /// A batch of commands applied atomically as one undo step.
     ///
     /// All sub-commands succeed together or none do. Inverse applies each
@@ -152,6 +178,8 @@ impl UndoableCommand {
                 kind: kind.clone(),
                 x: *x,
                 y: *y,
+                // A freshly added node is never bypassed.
+                disabled: false,
                 // A freshly added node still has its registry defaults and no
                 // wires, so that is the exact state undo must restore to.
                 knobs: Box::new(
@@ -166,6 +194,7 @@ impl UndoableCommand {
                 kind,
                 x,
                 y,
+                disabled,
                 knobs,
                 edges,
             } => Self::RestoreNode {
@@ -173,6 +202,7 @@ impl UndoableCommand {
                 kind: kind.clone(),
                 x: *x,
                 y: *y,
+                disabled: *disabled,
                 knobs: knobs.clone(),
                 edges: edges.clone(),
             },
@@ -181,6 +211,7 @@ impl UndoableCommand {
                 kind,
                 x,
                 y,
+                disabled,
                 knobs,
                 edges,
             } => Self::RemoveNode {
@@ -188,6 +219,7 @@ impl UndoableCommand {
                 kind: kind.clone(),
                 x: *x,
                 y: *y,
+                disabled: *disabled,
                 knobs: knobs.clone(),
                 edges: edges.clone(),
             },
@@ -224,6 +256,10 @@ impl UndoableCommand {
                 value: previous.clone(),
                 previous: value.clone(),
             },
+            Self::SetDisabled { node, disabled } => Self::SetDisabled {
+                node: *node,
+                disabled: !disabled,
+            },
             Self::MoveNode {
                 id,
                 from_x,
@@ -247,7 +283,7 @@ impl UndoableCommand {
 }
 
 /// Work sent from the UI thread to the kernel thread.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum KernelMessage {
     /// Apply a reversible command.
     Execute(UndoableCommand),
@@ -278,6 +314,20 @@ pub enum KernelMessage {
     TriggerRender,
     /// Change the frame time used by time-dependent cartridges.
     SetTime(f64),
+    /// Reset the dirty flag and clear the undo/redo stacks.
+    MarkClean,
+    /// Start a fresh empty script.
+    NewScript,
+    /// Replace the worker's entire DAG and viewer binding.
+    ReplaceDag {
+        dag: Box<Dag>,
+        viewer_target: Option<NodeId>,
+    },
+    /// Persist the current DAG to a `.nk` file.
+    SaveScript { path: std::path::PathBuf },
+    /// Render a `Write` node's frame sequence to disk via the registered
+    /// `FrameExporter`. Does not mark the project dirty.
+    ExecuteWriteNode { node: NodeId },
     /// Ask the kernel thread to exit.
     Shutdown,
 }
@@ -309,6 +359,34 @@ pub enum KernelEvent {
         node: NodeId,
         /// Captured panic message.
         message: String,
+    },
+    /// The dirty-state flag flipped; `is_dirty` reflects `UndoStack::is_dirty()`.
+    DirtyStateChanged { is_dirty: bool },
+    /// A script was saved successfully to `path`.
+    ScriptSaved { path: std::path::PathBuf },
+    /// A script save or load failed.
+    ScriptError { message: String },
+    /// A `Write` node rendered one frame to disk.
+    WriteFrameRendered {
+        /// Node being written.
+        node: NodeId,
+        /// Frame that was written.
+        frame: i32,
+        /// First frame of the sequence.
+        first: i32,
+        /// Last frame of the sequence.
+        last: i32,
+        /// Path the frame was written to.
+        path: std::path::PathBuf,
+    },
+    /// A `Write` node sequence render completed.
+    WriteCompleted {
+        /// Node that was written.
+        node: NodeId,
+        /// Number of frames successfully written.
+        frames_written: usize,
+        /// Path of the last written frame, if any.
+        last_path: Option<std::path::PathBuf>,
     },
 }
 
@@ -359,10 +437,14 @@ impl FrameNotification {
 /// Linear undo/redo history of applied commands.
 #[derive(Debug, Default)]
 pub struct UndoStack {
-    undo: Vec<UndoableCommand>,
-    redo: Vec<UndoableCommand>,
-    /// Time of the last `push`, used for time-bounded gesture coalescing.
+    undo: Vec<(u64, UndoableCommand)>,
+    redo: Vec<(u64, UndoableCommand)>,
+    /// Strictly monotonic id assigned to every push or coalesced update.
+    next_op_id: u64,
+    /// Time of the last `push`, used for time-bounded gesture coalesing.
     last_push_time: Option<std::time::Instant>,
+    /// High-water op_id at the last save; `is_dirty` compares against this.
+    saved_op_id: u64,
 }
 
 /// Maximum time between pushes for gestures to be coalesced.
@@ -444,7 +526,13 @@ fn batches_share_gesture(
 impl UndoStack {
     /// Creates an empty history.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            next_op_id: 1,
+            last_push_time: None,
+            saved_op_id: 0,
+        }
     }
 
     /// Breaks the coalescing window so the next push starts a new gesture.
@@ -452,6 +540,31 @@ impl UndoStack {
     /// release) ends a drag.
     pub fn break_coalescing(&mut self) {
         self.last_push_time = None;
+    }
+
+    /// Returns the top undo entry's `op_id`, or `0` when the undo stack is
+    /// empty.
+    pub fn current_op_id(&self) -> u64 {
+        self.undo.last().map(|(op_id, _)| *op_id).unwrap_or(0)
+    }
+
+    /// Marks the current state as saved, clearing the dirty flag.
+    pub fn mark_saved(&mut self) {
+        self.saved_op_id = self.current_op_id();
+    }
+
+    /// Clears undo and redo, resets the coalescing timer, and marks the stack
+    /// as clean at the current op id.
+    pub fn clear_and_mark_clean(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.last_push_time = None;
+        self.saved_op_id = self.current_op_id();
+    }
+
+    /// Returns `true` when the graph has unsaved changes since the last save.
+    pub fn is_dirty(&self) -> bool {
+        self.current_op_id() != self.saved_op_id
     }
 
     /// Records a newly applied command and drops any redo branch.
@@ -479,7 +592,9 @@ impl UndoStack {
             return;
         }
 
-        self.undo.push(command);
+        let op_id = self.next_op_id;
+        self.next_op_id = self.next_op_id.saturating_add(1);
+        self.undo.push((op_id, command));
     }
 
     /// Attempts to coalesce `command` with the top of the undo stack.
@@ -493,7 +608,7 @@ impl UndoStack {
     fn try_coalesce(&mut self, command: &UndoableCommand, within_window: bool) -> Option<()> {
         let last = self.undo.last_mut()?;
 
-        match (last, command) {
+        match (&mut last.1, command) {
             // Coalesce consecutive SetKnob on the same (node, knob).
             (
                 UndoableCommand::SetKnob {
@@ -510,12 +625,15 @@ impl UndoStack {
                     previous,
                     ..
                 },
-            ) if last_node == node
-                && last_knob == knob
+            ) if *last_node == *node
+                && *last_knob == *knob
                 && knobs_share_session(last_value, last_previous, previous, within_window) =>
             {
                 *last_value = value.clone();
                 // Keep the earliest `previous` for correct undo semantics.
+                // A coalesced update still advances the monotonic op id.
+                last.0 = self.next_op_id;
+                self.next_op_id = self.next_op_id.saturating_add(1);
                 Some(())
             }
             // Coalesce consecutive MoveNode on the same id and drag origin.
@@ -536,13 +654,16 @@ impl UndoStack {
                     to_y,
                     ..
                 },
-            ) if last_id == id
+            ) if *last_id == *id
                 && (within_window
                     || same_origin((*last_from_x, *last_from_y), (*from_x, *from_y))) =>
             {
                 *last_to_x = *to_x;
                 *last_to_y = *to_y;
                 // Keep the earliest from_x/from_y.
+                // A coalesced update still advances the monotonic op id.
+                last.0 = self.next_op_id;
+                self.next_op_id = self.next_op_id.saturating_add(1);
                 Some(())
             }
             // Coalesce consecutive Batch of MoveNodes for the same node sequence.
@@ -563,6 +684,9 @@ impl UndoStack {
                         *last_to_y = *to_y;
                     }
                 }
+                // A coalesced update still advances the monotonic op id.
+                last.0 = self.next_op_id;
+                self.next_op_id = self.next_op_id.saturating_add(1);
                 Some(())
             }
             _ => None,
@@ -573,8 +697,8 @@ impl UndoStack {
     ///
     /// The caller applies `command.inverse()` to the world.
     pub fn undo(&mut self) -> Option<UndoableCommand> {
-        let command = self.undo.pop()?;
-        self.redo.push(command.clone());
+        let (op_id, command) = self.undo.pop()?;
+        self.redo.push((op_id, command.clone()));
         Some(command)
     }
 
@@ -582,8 +706,8 @@ impl UndoStack {
     ///
     /// The caller re-applies the returned command to the world.
     pub fn redo(&mut self) -> Option<UndoableCommand> {
-        let command = self.redo.pop()?;
-        self.undo.push(command.clone());
+        let (op_id, command) = self.redo.pop()?;
+        self.undo.push((op_id, command.clone()));
         Some(command)
     }
 
@@ -788,11 +912,17 @@ fn kernel_loop(
         for message in coalesce_batch(batch) {
             match message {
                 KernelMessage::Execute(command) => {
-                    // Invalidate downstream cache entries for knob changes so
-                    // stale rendered pixels don't linger. Upstream caches
-                    // (e.g. Constant) are preserved by op-hash keying.
-                    if let UndoableCommand::SetKnob { node, .. } = &command {
-                        dag.invalidate_downstream(*node);
+                    // Invalidate downstream cache entries for knob changes and
+                    // bypass toggles so stale rendered pixels don't linger.
+                    // Upstream caches (e.g. Constant) are preserved by op-hash
+                    // keying, so toggling a Grade re-renders immediately
+                    // without re-evaluating its sources.
+                    match &command {
+                        UndoableCommand::SetKnob { node, .. }
+                        | UndoableCommand::SetDisabled { node, .. } => {
+                            dag.invalidate_downstream(*node);
+                        }
+                        _ => {}
                     }
                     if apply_and_record(&mut dag, &mut undo, &events, command) {
                         render_dirty = true;
@@ -807,6 +937,9 @@ fn kernel_loop(
                                 dag.cache_mut().clear();
                                 render_dirty = true;
                                 let _ = events.send(KernelEvent::Undone(command));
+                                let _ = events.send(KernelEvent::DirtyStateChanged {
+                                    is_dirty: undo.is_dirty(),
+                                });
                             }
                             Err(error) => {
                                 let _ = events.send(KernelEvent::CommandFailed {
@@ -824,6 +957,9 @@ fn kernel_loop(
                                 dag.cache_mut().clear();
                                 render_dirty = true;
                                 let _ = events.send(KernelEvent::Redone(command));
+                                let _ = events.send(KernelEvent::DirtyStateChanged {
+                                    is_dirty: undo.is_dirty(),
+                                });
                             }
                             Err(error) => {
                                 let _ = events.send(KernelEvent::CommandFailed {
@@ -857,6 +993,9 @@ fn kernel_loop(
                         viewer_node = Some(viewer);
                         let _ = events.send(KernelEvent::ViewerChanged(Some(viewer)));
                         let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+                        let _ = events.send(KernelEvent::DirtyStateChanged {
+                            is_dirty: undo.is_dirty(),
+                        });
                         render_dirty = true;
                     }
                 }
@@ -875,7 +1014,138 @@ fn kernel_loop(
                     let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
                     render_dirty = true;
                 }
+                KernelMessage::MarkClean => {
+                    undo.clear_and_mark_clean();
+                    let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
+                }
+                KernelMessage::NewScript => {
+                    dag = Dag::new();
+                    undo.clear_and_mark_clean();
+                    viewer_node = None;
+                    let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+                    let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
+                    let _ = frames.send(FrameNotification::cleared(None, epoch.current()));
+                    render_dirty = true;
+                }
+                KernelMessage::ReplaceDag {
+                    dag: new_dag,
+                    viewer_target,
+                } => {
+                    dag = *new_dag;
+                    undo.clear_and_mark_clean();
+                    viewer_node = viewer_target;
+                    let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+                    let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
+                    render_dirty = true;
+                }
+                KernelMessage::SaveScript { path } => {
+                    let tcl = dag.export_to_tcl();
+                    match std::fs::write(&path, &tcl) {
+                        Ok(()) => {
+                            undo.mark_saved();
+                            let _ = events.send(KernelEvent::ScriptSaved { path: path.clone() });
+                            let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
+                        }
+                        Err(e) => {
+                            let _ = events.send(KernelEvent::ScriptError {
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                }
                 KernelMessage::Shutdown => shutdown = true,
+                KernelMessage::ExecuteWriteNode { node } => {
+                    // Rendering to disk must not mark the project dirty:
+                    // do not touch `undo` or emit `DirtyStateChanged`.
+                    let Some(dag_node) = dag.node(node) else {
+                        let _ = events.send(KernelEvent::ScriptError {
+                            message: format!("Write node #{} not found in graph", node.0),
+                        });
+                        continue;
+                    };
+                    let knobs = dag_node.knobs.clone();
+
+                    let Some(exporter) = base_ctx.get::<FrameExporter>().cloned() else {
+                        let _ = events.send(KernelEvent::ScriptError {
+                            message: "no FrameExporter registered in EvalContext".to_string(),
+                        });
+                        continue;
+                    };
+
+                    let first = knobs
+                        .get("first")
+                        .and_then(|v| match v {
+                            KnobValue::Int(i) => Some(*i as i32),
+                            _ => None,
+                        })
+                        .unwrap_or(1);
+                    let mut last = knobs
+                        .get("last")
+                        .and_then(|v| match v {
+                            KnobValue::Int(i) => Some(*i as i32),
+                            _ => None,
+                        })
+                        .unwrap_or(1);
+                    if last < first {
+                        last = first;
+                    }
+
+                    let saved_time = base_ctx.time();
+                    let mut frames_written = 0usize;
+                    let mut last_path: Option<std::path::PathBuf> = None;
+                    let mut aborted = false;
+
+                    for f in first..=last {
+                        dag.cache_mut().clear();
+                        base_ctx.insert(Time(f as f64));
+                        let current_epoch = epoch.bump();
+                        match dag.evaluate_pull(node, &base_ctx, &governor, &epoch, current_epoch) {
+                            Ok(packet) => match (exporter.0)(&packet, &knobs, f as f64) {
+                                Ok(path) => {
+                                    frames_written += 1;
+                                    last_path = Some(path.clone());
+                                    let _ = events.send(KernelEvent::WriteFrameRendered {
+                                        node,
+                                        frame: f,
+                                        first,
+                                        last,
+                                        path,
+                                    });
+                                }
+                                Err(e) => {
+                                    aborted = true;
+                                    let _ = events.send(KernelEvent::ScriptError {
+                                        message: format!("Write failed at frame {f}: {e}"),
+                                    });
+                                    break;
+                                }
+                            },
+                            Err(e) => {
+                                aborted = true;
+                                let _ = events.send(KernelEvent::ScriptError {
+                                    message: format!("Write failed at frame {f}: {e}"),
+                                });
+                                break;
+                            }
+                        }
+                    }
+
+                    // Restore the original time and clear the cache so the next
+                    // viewer render is unaffected by the sequence evaluation.
+                    if let Some(t) = saved_time {
+                        base_ctx.insert(Time(t));
+                    }
+                    dag.cache_mut().clear();
+
+                    let _ = events.send(KernelEvent::WriteCompleted {
+                        node,
+                        frames_written,
+                        last_path,
+                    });
+                    if aborted {
+                        continue;
+                    }
+                }
             }
         }
 
@@ -890,6 +1160,7 @@ fn kernel_loop(
 
         // A node can disappear through Execute, Undo, or Redo; `render_viewer`
         // unbinds a dead target and clears the image instead of freezing it.
+        let render_start = Instant::now();
         if let Some(notification) = render_viewer(
             &mut dag,
             &mut viewer_node,
@@ -901,12 +1172,17 @@ fn kernel_loop(
         ) {
             let _ = frames.send(notification);
         }
+        let render_time = render_start.elapsed();
 
         // GPU queue contention: on integrated GPUs the render holds the device
         // queue while downloading pixels, starving the UI thread. Yielding for
         // one 60 FPS frame releases the queue so egui can redraw between
-        // renders.
-        thread::sleep(Duration::from_millis(16));
+        // renders. Fast renders yield the full 16 ms slice; renders taking
+        // longer than 16 ms only pause for a 2 ms floor.
+        let sleep_dur = Duration::from_millis(16)
+            .saturating_sub(render_time)
+            .max(Duration::from_millis(2));
+        thread::sleep(sleep_dur);
     }
 }
 
@@ -994,6 +1270,11 @@ fn apply_and_record(
             }
             undo.push(enriched_command.clone());
             let _ = events.send(KernelEvent::Applied(enriched_command));
+            // Every graph edit mutates the undo stack, so the dirty flag must
+            // be reported to the UI.
+            let _ = events.send(KernelEvent::DirtyStateChanged {
+                is_dirty: undo.is_dirty(),
+            });
             true
         }
         Err(error) => {
@@ -1006,7 +1287,7 @@ fn apply_and_record(
     }
 }
 
-/// `true` for commands that add, remove, or rewire nodes.
+/// `true` for commands that add, remove, rewire, or bypass nodes.
 ///
 /// These invalidate every cached op hash downstream of the change, so the
 /// worker drops the packet cache before the next render.
@@ -1021,6 +1302,7 @@ fn changes_topology(command: &UndoableCommand) -> bool {
                 | UndoableCommand::RestoreNode { .. }
                 | UndoableCommand::ConnectEdge { .. }
                 | UndoableCommand::DisconnectEdge { .. }
+                | UndoableCommand::SetDisabled { .. }
         ),
     }
 }
@@ -1198,10 +1480,20 @@ mod tests {
     }
 
     fn next_event(kernel: &KernelHandle) -> KernelEvent {
-        kernel
-            .events()
-            .recv_timeout(Duration::from_secs(5))
-            .expect("kernel thread should emit an event")
+        loop {
+            let event = kernel
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("kernel thread should emit an event");
+            // Skip infrastructure events emitted as side effects of commands;
+            // callers interested in those can inspect them separately.
+            match &event {
+                KernelEvent::DirtyStateChanged { .. }
+                | KernelEvent::ScriptSaved { .. }
+                | KernelEvent::ScriptError { .. } => continue,
+                _ => return event,
+            }
+        }
     }
 
     inventory::submit! {
@@ -1475,6 +1767,7 @@ mod tests {
             kind: kind.to_string(),
             x: 0.0,
             y: 0.0,
+            disabled: false,
             knobs: Box::new(KnobTable::new()),
             edges: Vec::new(),
         }
@@ -1888,5 +2181,55 @@ mod tests {
         assert_eq!(frame.packet.get::<u32>(), Some(&20));
 
         kernel.shutdown();
+    }
+
+    /// Monotonic op_id dirty tracking: push, mark_saved, undo, redo, branch.
+    #[test]
+    fn undo_stack_dirty_tracking_monotonic_op_id() {
+        let mut stack = UndoStack::new();
+
+        // Fresh stack is clean.
+        assert!(!stack.is_dirty(), "fresh stack must be clean");
+        assert_eq!(stack.current_op_id(), 0);
+
+        // Push cmd A: becomes dirty.
+        stack.push(set_knob("gain", 1.0, 0.0));
+        assert!(stack.is_dirty(), "after push, stack is dirty");
+        assert_eq!(stack.current_op_id(), 1);
+
+        // Mark saved: becomes clean.
+        stack.mark_saved();
+        assert!(!stack.is_dirty(), "after mark_saved, stack is clean");
+
+        // Undo: becomes dirty again.
+        stack.undo();
+        assert!(stack.is_dirty(), "after undo, stack is dirty");
+
+        // Redo: becomes clean again.
+        stack.redo();
+        assert!(!stack.is_dirty(), "after redo, stack is clean");
+
+        // Undo then push a different cmd B: same depth (1), new op_id, dirty.
+        stack.undo();
+        stack.push(set_knob("gamma", 2.0, 1.0));
+        assert!(stack.is_dirty(), "after branch push, stack is dirty");
+        assert_eq!(stack.current_op_id(), 2, "op_id must be monotonic");
+    }
+
+    /// clear_and_mark_clean resets the stack and dirty flag.
+    #[test]
+    fn undo_stack_clear_and_mark_clean() {
+        let mut stack = UndoStack::new();
+        stack.push(set_knob("gain", 1.0, 0.0));
+        assert!(stack.is_dirty());
+
+        stack.clear_and_mark_clean();
+        assert!(
+            !stack.is_dirty(),
+            "after clear_and_mark_clean, stack is clean"
+        );
+        assert!(!stack.can_undo(), "undo stack is empty");
+        assert!(!stack.can_redo(), "redo stack is empty");
+        assert_eq!(stack.current_op_id(), 0);
     }
 }

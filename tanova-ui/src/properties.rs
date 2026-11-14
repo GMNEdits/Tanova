@@ -11,6 +11,15 @@ use crate::canvas::GraphMirror;
 
 const VIEWER: Color32 = Color32::from_rgb(255, 190, 40);
 
+/// A request from the properties panel to open the EXR file browse modal
+/// for a `Read` or `Write` node's `file` knob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileBrowseRequest {
+    pub node_id: NodeId,
+    pub node_kind: String,
+    pub current_path: String,
+}
+
 /// One knob edit session, latched in `egui` memory for as long as the artist is
 /// typing into or dragging one knob.
 ///
@@ -44,13 +53,34 @@ const OPERATIONS: &[&str] = &[
     "over", "under", "plus", "from", "minus", "multiply", "stencil", "mask",
 ];
 const BBOX_MODES: &[&str] = &["union", "B", "A", "intersection"];
+/// Channel export modes for the `Write` node's `channels` knob.
+const CHANNELS_MODES: &[&str] = &["rgba", "all"];
 
 /// Draws controls for every knob on the selected node.
-pub struct PropertiesPanel;
+#[derive(Default)]
+pub struct PropertiesPanel {
+    /// A `Write` node waiting to render its sequence to disk, set when the
+    /// artist clicks `[Render Sequence to Disk]` and consumed by the app.
+    pub pending_write_render: Option<NodeId>,
+    /// A `Read`/`Write` node waiting for an EXR file browse, set when the
+    /// artist clicks `Browse...` on the `file` knob and consumed by the app.
+    pub pending_file_browse: Option<FileBrowseRequest>,
+}
 
 impl PropertiesPanel {
+    /// Consumes and returns the pending write-render node, if any.
+    pub fn take_pending_write_render(&mut self) -> Option<NodeId> {
+        self.pending_write_render.take()
+    }
+
+    /// Consumes and returns the pending file-browse request, if any.
+    pub fn take_pending_file_browse(&mut self) -> Option<FileBrowseRequest> {
+        self.pending_file_browse.take()
+    }
+
     /// Renders the panel and returns the commands the user requested.
     pub fn show(
+        &mut self,
         ui: &mut Ui,
         graph: &GraphMirror,
         selected: Option<NodeId>,
@@ -160,6 +190,7 @@ impl PropertiesPanel {
                                     let presets = match name {
                                         "operation" => Some(OPERATIONS),
                                         "bbox" => Some(BBOX_MODES),
+                                        "channels" if node.kind == "Write" => Some(CHANNELS_MODES),
                                         _ => None,
                                     };
                                     if let Some(presets) = presets {
@@ -185,6 +216,17 @@ impl PropertiesPanel {
                                         TextEdit::singleline(&mut edited).desired_width(150.0),
                                     );
                                     note(&edit);
+                                    // Browse... button for the `file` knob on Read/Write nodes.
+                                    if name == "file"
+                                        && (node.kind == "Read" || node.kind == "Write")
+                                        && ui.button("Browse...").clicked()
+                                    {
+                                        self.pending_file_browse = Some(FileBrowseRequest {
+                                            node_id,
+                                            node_kind: node.kind.clone(),
+                                            current_path: edited.clone(),
+                                        });
+                                    }
                                     if combo_changed || edit.changed() {
                                         next = KnobValue::Text(edited);
                                         changed = true;
@@ -312,6 +354,14 @@ impl PropertiesPanel {
             });
         });
 
+        // A `Write` node offers a one-click render to disk.
+        if node.kind == "Write" {
+            ui.separator();
+            if ui.button("[Render Sequence to Disk]").clicked() {
+                self.pending_write_render = Some(node_id);
+            }
+        }
+
         messages
     }
 }
@@ -348,7 +398,7 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        messages = PropertiesPanel::show(ui, mirror, Some(NODE), None);
+                        messages = PropertiesPanel::default().show(ui, mirror, Some(NODE), None);
                     });
                 });
             },
@@ -460,11 +510,12 @@ mod tests {
             kind: "Grade".to_string(),
             x: 0.0,
             y: 0.0,
+            disabled: false,
             knobs: Box::new(knobs.clone()),
             edges: Vec::new(),
         }));
         let mut dag = Dag::new();
-        dag.restore_node(NODE, "Grade", 0.0, 0.0, &knobs, &[])
+        dag.restore_node(NODE, "Grade", 0.0, 0.0, false, &knobs, &[])
             .expect("dag node #2");
         let mut undo = UndoStack::new();
 

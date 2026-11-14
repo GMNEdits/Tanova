@@ -5,6 +5,54 @@ All notable changes to Tanova are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.4.0-studio-pipeline] - 2026-11-14
+
+### Added
+
+- **Milestone 14 — Project File Lifecycle, `.tnv` Format & Unsaved-Changes Guard:**
+  - Top-bar `File` menu (`New Script`, `Open Script...`, `Save`, `Save As...`, `Quit`) and global shortcuts (`Ctrl+N`, `Ctrl+O`, `Ctrl+S`, `Ctrl+Shift+S`, `Ctrl+Q`).
+  - Native `.tnv` project file extension (`Untitled.tnv`) with version-safe extension normalization (`ensure_script_extension`, preserving version dots such as `shot_010.v02.tnv`) alongside full `.nk` Nuke script compatibility (`is_supported_script_file`).
+  - Node `(x, y)` coordinate persistence via `xpos` and `ypos` in `Dag::export_to_tcl()` and `tanova-parse` (`ParsedNode.xpos` / `ypos`) without polluting node `KnobTable` sliders.
+  - Monotonic `op_id` revision dirty-state tracking on `UndoStack` (`current_op_id`, `mark_saved`, `clear_and_mark_clean`, `is_dirty`) with `KernelMessage::{MarkClean, NewScript, ReplaceDag, SaveScript}` and `KernelEvent::{DirtyStateChanged, ScriptSaved, ScriptError}`.
+  - `GraphMirror::clear()`, `GraphMirror::from_dag()`, and `NodeCanvasState::reset_for_script()` for full UI/canvas synchronization on script load and reset.
+  - High-contrast top-bar project pill badge (slate `Untitled.tnv` when clean, amber `Untitled.tnv *` when dirty) with hover tooltip displaying full path and `epoch`.
+  - In-app `FileModalState` (`Open`, `SaveAs`) with directory navigation, `[Paste]` filename button, and `arboard` cross-platform clipboard bridge (`bridge_clipboard_paste`).
+  - `PendingUnsavedAction` state machine and `"Unsaved Changes"` confirmation dialog (`Save`, `Discard Changes`, `Cancel`) intercepting OS window close requests (`ViewportCommand::CancelClose`).
+  - Added Section 8 to `ARCHITECTURE.md` documenting zero-copy GPU residency (`TileStorage::GpuResident`), demand-driven temporal input hooks, and Blackboard state sharing.
+- **Milestone 15 — Node Bypass (`D`), Sub-Graph TCL Clipboard & Canvas Framing:**
+  - Node bypass state (`disabled: bool`) across `DagNode`, `NodeSnapshot`, `CanvasNode`, and `RemoveNode`/`RestoreNode` with `UndoableCommand::SetDisabled { node, disabled }`, `OpHash` differentiation, and zero-copy `PortId(0)` passthrough in `Dag::pull`.
+  - `.tnv` / `.nk` persistence for `disable true` in `Dag::export_to_tcl()` and `tanova-parse`.
+  - Nuke-style dimmed node card and diagonal red `X` overlay on bypassed nodes, plain `D` shortcut (supporting multi-node `Batch` undo), and `"Toggle Bypass (D)"` context menu item.
+  - Canvas `F` shortcut (`NodeCanvasState::frame_nodes`) to center and fit selected or all nodes in the viewport (`zoom` clamped to `0.25..=1.5`).
+  - Sub-graph TCL clipboard serialization (`export_selection_to_tcl`) and remapped atomic paste (`paste_tcl_snippet`) supporting `Ctrl+C` (Copy), cascading `(+40, +40)` `Ctrl+V` (Paste), and `Ctrl+D` (Duplicate without modifying clipboard) in a single `UndoableCommand::Batch` undo step.
+- **Milestone 16 — Multi-Channel OpenEXR `Write`, Sequence Renderer & EXR Browser:**
+  - 32-bit float OpenEXR file exporter (`tanova_io::write_exr_to_path`) with symmetric Bottom-Left to Top-Left Y-inversion, automatic parent directory creation (`create_dir_all`), and `"rgba"` / `"all"` multi-channel AOV export (`DepthZ` and custom layers sorted lexically).
+  - `"Write"` cartridge (`tanova-nodes`) operating as a zero-copy interactive passthrough during viewport scrubbing and exporting frame sequences via `export_packet_with_write_knobs`.
+  - Decoupled `FrameExporter` callback in `EvalContext` and `KernelMessage::ExecuteWriteNode` sequence render loop (`first..=last`) with per-frame cache clearing, playhead `Time` restoration, and non-dirtying execution.
+  - `"Write"` node `channels` dropdown (`rgba` / `all`), `[Render Sequence to Disk]` button (`pending_write_render`), and pure-ASCII render progress/completion status in the top bar (`WriteFrameRendered`, `WriteCompleted`).
+  - Headless `--out-exr <path>` CLI render flag in `tanova-cli`.
+  - Nuke/Natron-style `Browse...` button (`FileBrowseRequest`) beside `"file"` knobs on `"Read"` and `"Write"` nodes opening `BrowseReadExr` / `BrowseWriteExr` modals with `[EXR]` file filtering, inline `+ Create Folder` directory creation, and automatic frame-sequence detection (`detect_exr_sequence_in_dir`).
+
+### Changed
+
+- Replaced flat 16 ms worker thread sleep in `kernel_loop` (`tanova-kernel/src/bus.rs`) with an adaptive 2–16 ms GPU yield scaled by render duration.
+
+### Fixed
+
+- **Modal Close State Machine:** Fixed `draw_file_modal` bug where `self.file_modal` remained open after clicking `Save`, `Open`, `Cancel`, or pressing `Escape` by taking ownership via `self.file_modal.take()` and resolving an explicit `ModalOutcome`.
+- **Linux Missing-Glyph Tofu Boxes:** Replaced Unicode symbols (`●`, `📁`, `📄`) with 100% printable ASCII (`Untitled.tnv *`, `[..] Parent Directory`, `[DIR]`, `[TNV]`, `[NK]`, `[EXR]`, `->`) and hidden dot-folder filtering (`.git`).
+- **Modal Centering & Single-Paste Replacement:** Anchored `FileModalState` and `Unsaved Changes` dialogs to `Align2::CENTER_CENTER`, and added auto-focus + full-text selection (`CCursorRange`) on `file_input` upon modal open so `Ctrl+V` replaces `"Untitled.tnv"` cleanly without double-pasting.
+- **Linux X11/Wayland Canvas Copy/Paste:** Fixed `Ctrl+C` and `Ctrl+V` on the Node Canvas by retaining a persistent `arboard::Clipboard` instance on `TanovaApp` (preventing Linux clipboard drop on scope exit), adding `internal_clipboard` fallback, and handling both `egui::Event::Copy`/`Paste` and `Key::C`/`Key::V`.
+- **`Write` Plain Filename Sequence Auto-Numbering:** Fixed `Write` sequence rendering overwriting a single file when given a plain filename without `%04d` or `#` (e.g., `my_shot.exr`) by automatically numbering exported frames as `{base_stem}.{:04}.{ext}` (`my_shot.0001.exr`, `my_shot.0002.exr`, etc.) while keeping the clean filename in the knob.
+- **`Read` Browser Frame-Range Synchronization:** Fixed `Read` file browser leaving default `first = 1, last = 100` untouched when selecting single frames or plain filenames by extending `detect_exr_sequence_in_dir` (supporting directories, stem-to-sequence lookup, and single-frame ranges) and updating `"file"`, `"first"`, and `"last"` together in an atomic `UndoableCommand::Batch`.
+
+### Known Limitations (v0.4.0)
+
+- **Cache Eviction:** No automatic LRU cache eviction during interactive scrubbing; long sessions may accumulate memory until the script is reloaded or a sequence render triggers a cache clear.
+- **Color Management:** Lacks OpenColorIO (OCIO) integration. OpenEXR files are read, processed, and displayed in the Viewer as raw linear data without display transforms (e.g., sRGB/ACES).
+- **Parameter Animation:** No keyframing or Curve Editor. Node knobs (e.g., `Grade` multiply) remain static across the timeline.
+- **Graph Parallelism:** Branch evaluation in `Dag::pull` is currently single-threaded.
+
 ## [v0.3.1-ux-hardening] - 2026-11-13
 
 ### Added

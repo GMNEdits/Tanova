@@ -35,3 +35,8 @@ Tanova uses an Open-Closed architecture. The `tanova-kernel` is blind to VFX mat
 * **Color Management:** `opencolorio-rs` must use GPU shader generation to bake ACES/Rec.709 display transforms directly into the Viewer's `wgpu` pipeline (Zero CPU copy).
 * **Parsing:** `.nk` parser (`tanova-parse`) is a TCL Stack Machine (push/pop).
 * **Rendering:** Spatial shaders use Tile Aprons (Halo padding) to prevent grid seams.
+
+## 8. Advanced Compositing Scalability (GPU Residency, Temporal Inputs & Shared State)
+* **Zero-Copy GPU Residency (`TileStorage::GpuResident`):** Chained GPU cartridges avoid PCIe round-trips by keeping intermediate tile buffers resident in VRAM (`Arc<wgpu::Buffer>`) inside `Packet`, downloading to CPU RAM only at terminal boundaries (`Viewer`, `Write`).
+* **Demand-Driven Input & Temporal Routing:** Nodes that selectively evaluate branches (`Switch`) or shift upstream evaluation time (`TimeOffset`, `FrameHold`) declare upstream port and `EvalContext` overrides via `NodeTrait` hooks before `Dag::pull` traverses inputs, keeping `evaluate(&self, ctx, inputs)` pure and unchanged.
+* **Blackboard State Sharing:** Concatenated spatial matrices (`Mat3x3`) travel bottom-up inside `Packet` (`TypeMap`), while cross-frame caches (`DiskCache`, `MemoryGovernor`) travel top-down inside `EvalContext`.

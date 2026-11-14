@@ -47,6 +47,11 @@ pub struct NodeSnapshot {
     pub x: f32,
     /// Canvas-space Y position.
     pub y: f32,
+    /// Whether the node was bypassed (`D` key) at capture time.
+    ///
+    /// Restoring this keeps a disabled node disabled through
+    /// `Delete` + `Ctrl+Z` instead of silently re-enabling it.
+    pub disabled: bool,
     /// Every knob value, including user edits.
     pub knobs: KnobTable,
     /// Every incoming and outgoing edge.
