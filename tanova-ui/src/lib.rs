@@ -13,6 +13,6 @@ pub use canvas::{
     CanvasEdge, CanvasNode, GraphMirror, NodeCanvas, NodeCanvasState, WireDrag,
     nuke_workflow_binding_message,
 };
-pub use properties::PropertiesPanel;
+pub use properties::{FileBrowseRequest, PropertiesPanel};
 pub use viewer::ViewerPanel;
 pub use workflow::ViewerWorkflow;

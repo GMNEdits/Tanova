@@ -81,6 +81,27 @@ pub enum FileModalState {
         /// and select-all the `File:` text input.
         just_opened: bool,
     },
+    /// Browse for an EXR file to read into a `Read` node.
+    BrowseReadExr {
+        node_id: NodeId,
+        directory: PathBuf,
+        file_input: String,
+        detect_sequence: bool,
+        new_folder_name: String,
+        /// True on the first frame the modal is shown; used to auto-focus
+        /// and select-all the `File:` text input.
+        just_opened: bool,
+    },
+    /// Browse for an EXR file to write from a `Write` node.
+    BrowseWriteExr {
+        node_id: NodeId,
+        directory: PathBuf,
+        file_input: String,
+        new_folder_name: String,
+        /// True on the first frame the modal is shown; used to auto-focus
+        /// and select-all the `File:` text input.
+        just_opened: bool,
+    },
 }
 
 /// Outcome of one file-modal frame, resolved after `egui::Window` closes.
@@ -97,6 +118,17 @@ enum ModalOutcome {
         follow_up: Option<PendingUnsavedAction>,
     },
     ConfirmOpen {
+        path: PathBuf,
+    },
+    /// Confirm reading an EXR file into a `Read` node.
+    ConfirmReadExr {
+        node_id: NodeId,
+        path: PathBuf,
+        detect_sequence: bool,
+    },
+    /// Confirm writing an EXR file from a `Write` node.
+    ConfirmWriteExr {
+        node_id: NodeId,
         path: PathBuf,
     },
 }
@@ -1039,6 +1071,10 @@ impl TanovaApp {
                         node: write_node_id,
                     }]);
                 }
+
+                if let Some(req) = self.properties.take_pending_file_browse() {
+                    self.open_exr_browse_modal(req);
+                }
             });
 
         let modal_open = self.file_modal.is_some() || self.pending_unsaved.is_some();
@@ -1071,6 +1107,150 @@ impl TanovaApp {
             ui.ctx().request_repaint();
         }
         ui.ctx().request_repaint_after(Duration::from_millis(16));
+    }
+
+    /// Handles `ConfirmReadExr`: applies `"file"` (and optionally `"first"` /
+    /// `"last"` via sequence detection) as `SetKnob` commands on the node.
+    fn handle_confirm_read_exr(&mut self, node_id: NodeId, path: PathBuf, detect_sequence: bool) {
+        let Some(node) = self.graph.node(node_id) else {
+            return;
+        };
+        let previous_file = node
+            .knobs
+            .get("file")
+            .cloned()
+            .unwrap_or(KnobValue::Text(String::new()));
+
+        if detect_sequence {
+            if let Some((pattern_path, first, last)) = Self::detect_exr_sequence_in_dir(&path) {
+                let cmds: Vec<UndoableCommand> = vec![
+                    UndoableCommand::SetKnob {
+                        node: node_id,
+                        knob: "file".to_string(),
+                        value: KnobValue::Text(pattern_path.to_string_lossy().into_owned()),
+                        previous: previous_file.clone(),
+                    },
+                    UndoableCommand::SetKnob {
+                        node: node_id,
+                        knob: "first".to_string(),
+                        value: KnobValue::Int(first as i64),
+                        previous: node
+                            .knobs
+                            .get("first")
+                            .cloned()
+                            .unwrap_or(KnobValue::Int(1)),
+                    },
+                    UndoableCommand::SetKnob {
+                        node: node_id,
+                        knob: "last".to_string(),
+                        value: KnobValue::Int(last as i64),
+                        previous: node.knobs.get("last").cloned().unwrap_or(KnobValue::Int(1)),
+                    },
+                ];
+                if let Some(batch) = UndoableCommand::from_vec(cmds) {
+                    self.dispatch(vec![KernelMessage::Execute(batch)]);
+                }
+                return;
+            }
+        }
+
+        // Single file: just set the `"file"` knob.
+        self.dispatch(vec![KernelMessage::Execute(UndoableCommand::SetKnob {
+            node: node_id,
+            knob: "file".to_string(),
+            value: KnobValue::Text(path.to_string_lossy().into_owned()),
+            previous: previous_file,
+        })]);
+    }
+
+    /// Handles `ConfirmWriteExr`: applies `"file"` as a `SetKnob` command on
+    /// the node, appending `.exr` if needed.
+    fn handle_confirm_write_exr(&mut self, node_id: NodeId, mut path: PathBuf) {
+        if !is_supported_exr_file(&path) {
+            path.set_extension("exr");
+        }
+        let Some(node) = self.graph.node(node_id) else {
+            return;
+        };
+        let previous_file = node
+            .knobs
+            .get("file")
+            .cloned()
+            .unwrap_or(KnobValue::Text(String::new()));
+        self.dispatch(vec![KernelMessage::Execute(UndoableCommand::SetKnob {
+            node: node_id,
+            knob: "file".to_string(),
+            value: KnobValue::Text(path.to_string_lossy().into_owned()),
+            previous: previous_file,
+        })]);
+    }
+
+    /// Detects a frame sequence in the directory containing `path`.
+    ///
+    /// Returns `(pattern_path, first_frame, last_frame)` where `pattern_path`
+    /// uses a printf-style token (`%04d` or `%d`). Returns `None` when no
+    /// sequence is detected.
+    pub fn detect_exr_sequence_in_dir(path: &std::path::Path) -> Option<(PathBuf, i32, i32)> {
+        if !is_supported_exr_file(path) {
+            return None;
+        }
+        let parent = path.parent()?;
+        let ext = path.extension()?.to_str()?;
+        let stem = path.file_stem()?.to_str()?;
+
+        // Find trailing ASCII digit slice at the end of stem.
+        let digit_count = stem
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if digit_count == 0 {
+            return None;
+        }
+        let split_at = stem.len() - digit_count;
+        let (prefix, digits_str) = stem.split_at(split_at);
+        let token = if digit_count > 1 && digits_str.starts_with('0') {
+            format!("%0{digit_count}d")
+        } else {
+            "%d".to_string()
+        };
+
+        // Scan parent directory for matching .exr files.
+        let mut min_frame: Option<i32> = None;
+        let mut max_frame: Option<i32> = None;
+        for entry in std::fs::read_dir(parent).ok()? {
+            let entry = entry.ok()?;
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_str()?;
+            if !file_name_str.ends_with(&format!(".{ext}")) {
+                continue;
+            }
+            let entry_path = entry.path();
+            let entry_stem = entry_path.file_stem()?.to_str()?;
+            if !entry_stem.starts_with(prefix) {
+                continue;
+            }
+            let remainder = &entry_stem[prefix.len()..];
+            if remainder.is_empty() {
+                continue;
+            }
+            let remainder_digits: bool = remainder.chars().all(|c| c.is_ascii_digit());
+            if !remainder_digits {
+                continue;
+            }
+            // If the original had zero-padding, require same digit count.
+            if digits_str.starts_with('0') && remainder.len() != digit_count {
+                continue;
+            }
+            let frame: i32 = remainder.parse().ok()?;
+            min_frame = Some(min_frame.unwrap_or(frame).min(frame));
+            max_frame = Some(max_frame.unwrap_or(frame).max(frame));
+        }
+
+        let min_frame = min_frame?;
+        let max_frame = max_frame?;
+        let pattern_path = parent.join(format!("{prefix}{token}.{ext}"));
+        Some((pattern_path, min_frame, max_frame))
     }
 
     /// Returns the display name for the current script: the file name, or
@@ -1199,6 +1379,51 @@ impl TanovaApp {
         });
     }
 
+    /// Opens an EXR file browse modal for a `Read` or `Write` node's `file`
+    /// knob, seeded with the current path.
+    fn open_exr_browse_modal(&mut self, req: tanova_ui::FileBrowseRequest) {
+        let directory = std::path::Path::new(&req.current_path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty() && parent.is_dir())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+        let file_input = std::path::Path::new(&req.current_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let file_input = if req.node_kind == "Write" && file_input.is_empty() {
+            "render.%04d.exr".to_string()
+        } else {
+            file_input
+        };
+        self.last_script_error = None;
+        match req.node_kind.as_str() {
+            "Read" => {
+                self.file_modal = Some(FileModalState::BrowseReadExr {
+                    node_id: req.node_id,
+                    directory,
+                    file_input,
+                    detect_sequence: true,
+                    new_folder_name: String::new(),
+                    just_opened: true,
+                });
+            }
+            "Write" => {
+                self.file_modal = Some(FileModalState::BrowseWriteExr {
+                    node_id: req.node_id,
+                    directory,
+                    file_input,
+                    new_folder_name: String::new(),
+                    just_opened: true,
+                });
+            }
+            _ => {}
+        }
+    }
+
     /// Called when the user triggers Quit or the OS window close. Respects the
     /// dirty guard.
     fn request_close(&mut self, action: PendingUnsavedAction, ctx: &egui::Context) {
@@ -1220,8 +1445,19 @@ impl TanovaApp {
         let Some(mut modal) = self.file_modal.take() else {
             return;
         };
+
+        let is_exr_read = matches!(modal, FileModalState::BrowseReadExr { .. });
+        let is_exr_write = matches!(modal, FileModalState::BrowseWriteExr { .. });
         let is_save_as = matches!(modal, FileModalState::SaveAs { .. });
-        let title = if is_save_as { "Save As" } else { "Open Script" };
+        let title = if is_exr_read {
+            "Open EXR"
+        } else if is_exr_write {
+            "Save EXR As"
+        } else if is_save_as {
+            "Save As"
+        } else {
+            "Open Script"
+        };
 
         let mut window_open = true;
         let mut outcome = ModalOutcome::KeepOpen;
@@ -1255,133 +1491,57 @@ impl TanovaApp {
                         just_opened,
                         ..
                     } => {
-                        ui.label(format!("Directory: {}", directory.display()));
+                        Self::draw_file_browser_rows(
+                            ui,
+                            ctx,
+                            directory,
+                            file_input,
+                            just_opened,
+                            &mut outcome,
+                            self,
+                            &last_script_error,
+                            is_save_as,
+                            follow_up,
+                            false,              // is_exr
+                            &mut false,         // detect_sequence
+                            &mut String::new(), // new_folder_name
+                        );
+                    }
+                    FileModalState::BrowseReadExr {
+                        node_id,
+                        directory,
+                        file_input,
+                        detect_sequence,
+                        new_folder_name,
+                        just_opened,
+                    } => {
+                        Self::draw_file_browser_rows(
+                            ui,
+                            ctx,
+                            directory,
+                            file_input,
+                            just_opened,
+                            &mut outcome,
+                            self,
+                            &last_script_error,
+                            false, // is_save_as
+                            None,  // follow_up
+                            true,  // is_exr
+                            detect_sequence,
+                            new_folder_name,
+                        );
+
+                        // Sequence checkbox (Read mode only).
                         ui.separator();
+                        ui.checkbox(detect_sequence, "Detect frame sequence (%04d)");
 
-                        // Read directory entries, skipping hidden dot-entries.
-                        let mut entries: Vec<std::path::PathBuf> =
-                            std::fs::read_dir(&mut *directory)
-                                .ok()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|e| e.ok())
-                                .map(|e| e.path())
-                                .collect();
-                        entries.retain(|p| {
-                            p.file_name()
-                                .and_then(|n| n.to_str())
-                                .is_some_and(|n| !n.starts_with('.'))
-                        });
+                        // File filter label for EXR mode.
+                        ui.label("OpenEXR Files (.exr)");
 
-                        // Parent Directory button.
-                        if directory.parent().is_some_and(|parent| parent != directory) {
-                            if ui.button("[..] Parent Directory").clicked() {
-                                if let Some(parent) = directory.parent() {
-                                    *directory = parent.to_path_buf();
-                                    self.last_script_error = None;
-                                }
-                                outcome = ModalOutcome::KeepOpen;
-                            }
-                            ui.separator();
-                        }
-
-                        egui::ScrollArea::vertical()
-                            .max_height(300.0)
-                            .show(ui, |ui| {
-                                let mut sorted: Vec<_> = entries;
-                                sorted.sort_by_key(|p| {
-                                    p.file_name().unwrap_or_default().to_os_string()
-                                });
-                                for path in sorted {
-                                    let name = path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("")
-                                        .to_string();
-
-                                    if path.is_dir() {
-                                        if ui.button(format!("[DIR] {}", name)).clicked() {
-                                            *directory = path.clone();
-                                            self.last_script_error = None;
-                                            // Do not overwrite file_input with a
-                                            // folder name in SaveAs mode.
-                                            outcome = ModalOutcome::KeepOpen;
-                                        }
-                                    } else if is_supported_script_file(&path) {
-                                        let label = if path
-                                            .extension()
-                                            .is_some_and(|e| e.eq_ignore_ascii_case("tnv"))
-                                        {
-                                            format!("[TNV] {}", name)
-                                        } else {
-                                            format!("[NK] {}", name)
-                                        };
-                                        let resp = ui.button(label);
-                                        if resp.clicked() {
-                                            *file_input = name;
-                                            self.last_script_error = None;
-                                            outcome = ModalOutcome::KeepOpen;
-                                        }
-                                        // Double-click immediately opens in Open mode.
-                                        if !is_save_as && resp.double_clicked() {
-                                            outcome =
-                                                ModalOutcome::ConfirmOpen { path: path.clone() };
-                                        }
-                                    }
-                                }
-                            });
-
+                        // Confirm button row for EXR modes.
                         ui.separator();
                         ui.horizontal(|ui| {
-                            ui.label("File:");
-                            let text_edit_resp =
-                                ui.add(egui::TextEdit::singleline(file_input).desired_width(200.0));
-                            // Auto-focus and select-all on first frame so
-                            // typing or Ctrl+V immediately replaces the
-                            // default filename.
-                            if *just_opened {
-                                text_edit_resp.request_focus();
-                                if let Some(mut state) =
-                                    egui::TextEdit::load_state(ctx, text_edit_resp.id)
-                                {
-                                    let ccursor_range = egui::text::CCursorRange::two(
-                                        egui::text::CCursor::new(0),
-                                        egui::text::CCursor::new(file_input.chars().count()),
-                                    );
-                                    state.cursor.set_char_range(Some(ccursor_range));
-                                    state.store(ctx, text_edit_resp.id);
-                                }
-                                *just_opened = false;
-                            }
-                            if text_edit_resp.lost_focus()
-                                || ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                // The user typed a path/name directly.
-                            }
-                            // [Paste] button beside the File: input.
-                            if ui
-                                .button("[Paste]")
-                                .on_hover_text("Paste filename from clipboard")
-                                .clicked()
-                            {
-                                if let Some(pasted) = self.read_clipboard_text() {
-                                    *file_input = pasted.trim().to_string();
-                                }
-                            }
-                        });
-
-                        // Sanitize pasted newlines so they never corrupt a
-                        // filename.
-                        file_input.retain(|c| c != '\n' && c != '\r');
-
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            // Confirm button.
-                            let confirm_clicked = if is_save_as {
-                                ui.button("Save").clicked()
-                            } else {
-                                ui.button("Open").clicked()
-                            };
+                            let confirm_clicked = ui.button("Open").clicked();
                             let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter))
                                 && !file_input.trim().is_empty();
                             if confirm_clicked || enter_pressed {
@@ -1391,14 +1551,69 @@ impl TanovaApp {
                                 } else {
                                     PathBuf::from(trimmed)
                                 };
-                                if is_save_as {
-                                    outcome = ModalOutcome::ConfirmSave {
-                                        path: full_path,
-                                        follow_up,
-                                    };
+                                outcome = ModalOutcome::ConfirmReadExr {
+                                    node_id: *node_id,
+                                    path: full_path,
+                                    detect_sequence: *detect_sequence,
+                                };
+                            }
+                            if ui.button("Cancel").clicked() {
+                                outcome = ModalOutcome::Cancel;
+                            }
+                        });
+
+                        // Display any script error inside the modal.
+                        if let Some(err) = &last_script_error {
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(235, 90, 90),
+                                format!("Error: {err}"),
+                            );
+                        }
+                    }
+                    FileModalState::BrowseWriteExr {
+                        node_id,
+                        directory,
+                        file_input,
+                        new_folder_name,
+                        just_opened,
+                    } => {
+                        Self::draw_file_browser_rows(
+                            ui,
+                            ctx,
+                            directory,
+                            file_input,
+                            just_opened,
+                            &mut outcome,
+                            self,
+                            &last_script_error,
+                            false,      // is_save_as
+                            None,       // follow_up
+                            true,       // is_exr
+                            &mut false, // detect_sequence
+                            new_folder_name,
+                        );
+
+                        // File filter label for EXR mode.
+                        ui.label("OpenEXR Files (.exr)");
+
+                        // Confirm button row for EXR modes.
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            let confirm_clicked = ui.button("Save").clicked();
+                            let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                && !file_input.trim().is_empty();
+                            if confirm_clicked || enter_pressed {
+                                let trimmed = file_input.trim();
+                                let full_path = if PathBuf::from(trimmed).is_relative() {
+                                    directory.join(trimmed)
                                 } else {
-                                    outcome = ModalOutcome::ConfirmOpen { path: full_path };
-                                }
+                                    PathBuf::from(trimmed)
+                                };
+                                outcome = ModalOutcome::ConfirmWriteExr {
+                                    node_id: *node_id,
+                                    path: full_path,
+                                };
                             }
                             if ui.button("Cancel").clicked() {
                                 outcome = ModalOutcome::Cancel;
@@ -1453,6 +1668,225 @@ impl TanovaApp {
                     self.file_modal = Some(modal);
                 }
             }
+            ModalOutcome::ConfirmReadExr {
+                node_id,
+                path,
+                detect_sequence,
+            } => {
+                self.handle_confirm_read_exr(node_id, path, detect_sequence);
+            }
+            ModalOutcome::ConfirmWriteExr { node_id, path } => {
+                self.handle_confirm_write_exr(node_id, path);
+            }
+        }
+    }
+
+    /// Shared rendering for the file-browser rows (directory label, file list,
+    /// parent directory, `+ Create Folder`, file input row, error display).
+    ///
+    /// `is_exr` selects `.exr` filtering and `[EXR]` labels; `is_save_as`
+    /// selects `.tnv`/`.nk` filtering and `[TNV]`/`[NK]` labels.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_file_browser_rows(
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        directory: &mut PathBuf,
+        file_input: &mut String,
+        just_opened: &mut bool,
+        outcome: &mut ModalOutcome,
+        app: &mut TanovaApp,
+        last_script_error: &Option<String>,
+        is_save_as: bool,
+        follow_up: Option<PendingUnsavedAction>,
+        is_exr: bool,
+        _detect_sequence: &mut bool,
+        new_folder_name: &mut String,
+    ) {
+        ui.label(format!("Directory: {}", directory.display()));
+        ui.separator();
+
+        // Read directory entries, skipping hidden dot-entries.
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&mut *directory)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        entries.retain(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !n.starts_with('.'))
+        });
+
+        // Parent Directory button.
+        if directory.parent().is_some_and(|parent| parent != directory) {
+            if ui.button("[..] Parent Directory").clicked() {
+                if let Some(parent) = directory.parent() {
+                    *directory = parent.to_path_buf();
+                    app.last_script_error = None;
+                }
+                *outcome = ModalOutcome::KeepOpen;
+            }
+            ui.separator();
+        }
+
+        egui::ScrollArea::vertical()
+            .max_height(300.0)
+            .show(ui, |ui| {
+                let mut sorted: Vec<_> = entries;
+                sorted.sort_by_key(|p| p.file_name().unwrap_or_default().to_os_string());
+                for path in sorted {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if path.is_dir() {
+                        if ui.button(format!("[DIR] {}", name)).clicked() {
+                            *directory = path.clone();
+                            app.last_script_error = None;
+                            *outcome = ModalOutcome::KeepOpen;
+                        }
+                    } else if is_exr {
+                        if is_supported_exr_file(&path) {
+                            let label = format!("[EXR] {}", name);
+                            let resp = ui.button(label);
+                            if resp.clicked() {
+                                *file_input = name;
+                                app.last_script_error = None;
+                                *outcome = ModalOutcome::KeepOpen;
+                            }
+                        }
+                    } else if is_supported_script_file(&path) {
+                        let label = if path
+                            .extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("tnv"))
+                        {
+                            format!("[TNV] {}", name)
+                        } else {
+                            format!("[NK] {}", name)
+                        };
+                        let resp = ui.button(label);
+                        if resp.clicked() {
+                            *file_input = name;
+                            app.last_script_error = None;
+                            *outcome = ModalOutcome::KeepOpen;
+                        }
+                        // Double-click immediately opens in Open mode.
+                        if !is_save_as && resp.double_clicked() {
+                            *outcome = ModalOutcome::ConfirmOpen { path: path.clone() };
+                        }
+                    }
+                }
+            });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("New Folder:");
+            let folder_edit =
+                ui.add(egui::TextEdit::singleline(new_folder_name).desired_width(180.0));
+            let create_clicked = ui
+                .button("+ Create Folder")
+                .on_hover_text("Create a new folder in this directory")
+                .clicked();
+            let enter_pressed =
+                folder_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (create_clicked || enter_pressed) && !new_folder_name.trim().is_empty() {
+                let sub = directory.join(new_folder_name.trim());
+                match std::fs::create_dir_all(&sub) {
+                    Ok(()) => {
+                        *directory = sub;
+                        new_folder_name.clear();
+                        app.last_script_error = None;
+                        *outcome = ModalOutcome::KeepOpen;
+                    }
+                    Err(e) => {
+                        app.last_script_error = Some(e.to_string());
+                        *outcome = ModalOutcome::KeepOpen;
+                    }
+                }
+            }
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("File:");
+            let text_edit_resp =
+                ui.add(egui::TextEdit::singleline(file_input).desired_width(200.0));
+            // Auto-focus and select-all on first frame so
+            // typing immediately replaces the default filename.
+            if *just_opened {
+                text_edit_resp.request_focus();
+                if let Some(mut state) = egui::TextEdit::load_state(ctx, text_edit_resp.id) {
+                    let ccursor_range = egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(file_input.chars().count()),
+                    );
+                    state.cursor.set_char_range(Some(ccursor_range));
+                    state.store(ctx, text_edit_resp.id);
+                }
+                *just_opened = false;
+            }
+            if text_edit_resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                // The user typed a path/name directly — handled by confirm below.
+            }
+            // [Paste] button beside the File: input.
+            if ui
+                .button("[Paste]")
+                .on_hover_text("Paste filename from clipboard")
+                .clicked()
+            {
+                if let Some(pasted) = app.read_clipboard_text() {
+                    *file_input = pasted.trim().to_string();
+                }
+            }
+        });
+
+        // Sanitize pasted newlines so they never corrupt a filename.
+        file_input.retain(|c| c != '\n' && c != '\r');
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            // Confirm button (non-EXR modes).
+            if !is_exr {
+                let confirm_clicked = if is_save_as {
+                    ui.button("Save").clicked()
+                } else {
+                    ui.button("Open").clicked()
+                };
+                let enter_pressed =
+                    ui.input(|i| i.key_pressed(egui::Key::Enter)) && !file_input.trim().is_empty();
+                if confirm_clicked || enter_pressed {
+                    let trimmed = file_input.trim();
+                    let full_path = if PathBuf::from(trimmed).is_relative() {
+                        directory.join(trimmed)
+                    } else {
+                        PathBuf::from(trimmed)
+                    };
+                    if is_save_as {
+                        *outcome = ModalOutcome::ConfirmSave {
+                            path: full_path,
+                            follow_up,
+                        };
+                    } else {
+                        *outcome = ModalOutcome::ConfirmOpen { path: full_path };
+                    }
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                *outcome = ModalOutcome::Cancel;
+            }
+        });
+
+        // Display any script error inside the modal.
+        if let Some(err) = last_script_error {
+            ui.separator();
+            ui.colored_label(
+                egui::Color32::from_rgb(235, 90, 90),
+                format!("Error: {err}"),
+            );
         }
     }
 
@@ -1773,6 +2207,14 @@ pub fn is_supported_script_file(path: &std::path::Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
         Some(ext) if ext.eq_ignore_ascii_case("tnv") || ext.eq_ignore_ascii_case("nk")
+    )
+}
+
+/// Returns `true` when `path` has a `.exr` extension (case-insensitive).
+pub fn is_supported_exr_file(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some(ext) if ext.eq_ignore_ascii_case("exr")
     )
 }
 
@@ -3606,6 +4048,339 @@ mod tests {
         let _ = std::fs::remove_file(&f1);
         let _ = std::fs::remove_file(&f2);
         let _ = std::fs::remove_file(&f3);
+
+        app.kernel.shutdown();
+    }
+
+    /// `detect_exr_sequence_in_dir` preserves the version prefix and finds
+    /// the correct frame range.
+    #[test]
+    fn detect_exr_sequence_preserves_version_prefix_and_finds_frame_range() {
+        tanova_nodes::ensure_linked();
+
+        let temp_dir = std::env::temp_dir();
+        let seq_dir = temp_dir.join("tanova_seq_test");
+        let _ = std::fs::create_dir_all(&seq_dir);
+
+        // Create sequence files: shot_v02.0001.exr, shot_v02.0002.exr, shot_v02.0003.exr
+        for frame in 1..=3 {
+            let path = seq_dir.join(format!("shot_v02.{frame:04}.exr"));
+            std::fs::write(&path, b"dummy exr content").unwrap();
+        }
+
+        let result = TanovaApp::detect_exr_sequence_in_dir(&seq_dir.join("shot_v02.0001.exr"));
+        assert!(result.is_some(), "sequence detection should succeed");
+        let (pattern, first, last) = result.unwrap();
+        assert_eq!(
+            pattern,
+            seq_dir.join("shot_v02.%04d.exr"),
+            "pattern must preserve v02 prefix and use %04d token"
+        );
+        assert_eq!(first, 1, "first frame must be 1");
+        assert_eq!(last, 3, "last frame must be 3");
+
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&seq_dir);
+    }
+
+    /// Write and Read browse modals: create folder, confirm path, render
+    /// frames, auto-detect sequence on read.
+    #[test]
+    fn write_and_read_exr_browse_modals_create_folder_and_auto_detect_sequence() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        // Let the seeded starter comp round-trip into the mirror.
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        let temp_dir = std::env::temp_dir().join("tanova_browse_test");
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Add Write #4 connected to Grade #2.
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(4),
+                kind: "Write".to_string(),
+                x: 40.0,
+                y: 288.0,
+            }))
+            .expect("add Write #4");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::ConnectEdge {
+                from_node: GRADE,
+                from_port: PortId(0),
+                to_node: NodeId(4),
+                to_port: PortId(0),
+            }))
+            .expect("connect Grade -> Write");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(4),
+                knob: "first".to_string(),
+                value: KnobValue::Int(1),
+                previous: KnobValue::Int(1),
+            }))
+            .expect("set Write #4 first");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(4),
+                knob: "last".to_string(),
+                value: KnobValue::Int(3),
+                previous: KnobValue::Int(1),
+            }))
+            .expect("set Write #4 last");
+        app.pump();
+        // Wait for Write #4 to appear in the mirror (kernel round-trip).
+        let node4_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < node4_deadline && app.graph.node(NodeId(4)).is_none() {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.graph.node(NodeId(4)).is_some(),
+            "Write #4 must appear in mirror"
+        );
+
+        // --- BrowseWriteExr: create a subfolder and confirm a path ---
+
+        // Open the browse modal for Write #4.
+        app.properties.pending_file_browse = Some(tanova_ui::FileBrowseRequest {
+            node_id: NodeId(4),
+            node_kind: "Write".to_string(),
+            current_path: "render.%04d.exr".to_string(),
+        });
+        if let Some(req) = app.properties.take_pending_file_browse() {
+            app.open_exr_browse_modal(req);
+        }
+        assert!(app.file_modal.is_some(), "browse modal should be open");
+
+        // Set directory to temp_dir.
+        if let Some(FileModalState::BrowseWriteExr { directory, .. }) = &mut app.file_modal {
+            *directory = temp_dir.clone();
+        }
+
+        // Create a new subfolder "renders" directly (simulating "+ Create Folder").
+        if let Some(FileModalState::BrowseWriteExr {
+            directory,
+            new_folder_name,
+            ..
+        }) = &mut app.file_modal
+        {
+            *new_folder_name = "renders".to_string();
+            let sub = directory.join(new_folder_name.trim());
+            std::fs::create_dir_all(&sub).unwrap();
+            *directory = sub;
+            new_folder_name.clear();
+        }
+        assert!(
+            app.file_modal.is_some(),
+            "browse modal should still be open"
+        );
+
+        // The folder should have been created.
+        let renders_dir = temp_dir.join("renders");
+        assert!(
+            renders_dir.is_dir(),
+            "renders folder should exist after create"
+        );
+
+        // Set file_input to "comp.%04d.exr" and confirm Save directly.
+        if let Some(FileModalState::BrowseWriteExr { file_input, .. }) = &mut app.file_modal {
+            *file_input = "comp.%04d.exr".to_string();
+        }
+        let write_path = temp_dir.join("renders").join("comp.%04d.exr");
+        app.handle_confirm_write_exr(NodeId(4), write_path.clone());
+        app.file_modal = None;
+        assert!(
+            app.file_modal.is_none(),
+            "browse modal should be consumed after confirm"
+        );
+
+        // Verify Write #4's file knob was updated (wait for kernel round-trip).
+        let knob_deadline = Instant::now() + Duration::from_secs(10);
+        let expected_file = KnobValue::Text(
+            renders_dir
+                .join("comp.%04d.exr")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        while Instant::now() < knob_deadline {
+            app.pump();
+            if app
+                .graph
+                .node(NodeId(4))
+                .is_some_and(|n| n.knobs.get("file") == Some(&expected_file))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let write_node = app.graph.node(NodeId(4)).expect("Write #4 must exist");
+        assert_eq!(
+            write_node.knobs.get("file"),
+            Some(&expected_file),
+            "Write #4 file knob must be comp.%04d.exr in renders/"
+        );
+
+        // --- Render frames 1..=3 via ExecuteWriteNode ---
+        app.kernel
+            .send(KernelMessage::MarkClean)
+            .expect("mark clean");
+        app.kernel
+            .send(KernelMessage::ExecuteWriteNode { node: NodeId(4) })
+            .expect("execute write node");
+        let complete_deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < complete_deadline {
+            app.pump();
+            if renders_dir.join("comp.0001.exr").exists()
+                && renders_dir.join("comp.0002.exr").exists()
+                && renders_dir.join("comp.0003.exr").exists()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Wait for MarkClean's DirtyStateChanged to be processed.
+        let clean_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < clean_deadline && app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Check for kernel errors during render.
+        assert!(
+            app.last_script_error.is_none(),
+            "kernel script error: {:?}",
+            app.last_script_error
+        );
+        assert!(app.failure.is_none(), "kernel failure: {:?}", app.failure);
+        assert!(
+            renders_dir.join("comp.0001.exr").exists(),
+            "comp.0001.exr must exist"
+        );
+        assert!(
+            renders_dir.join("comp.0002.exr").exists(),
+            "comp.0002.exr must exist"
+        );
+        assert!(
+            renders_dir.join("comp.0003.exr").exists(),
+            "comp.0003.exr must exist"
+        );
+        assert!(!app.is_dirty, "render must not dirty the project");
+
+        // --- BrowseReadExr: select comp.0001.exr with detect_sequence=true ---
+        // Add Read #5 connected to nothing yet.
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(5),
+                kind: "Read".to_string(),
+                x: 200.0,
+                y: 288.0,
+            }))
+            .expect("add Read #5");
+        app.pump();
+        // Wait for Read #5 to appear in the mirror (kernel round-trip).
+        let node5_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < node5_deadline && app.graph.node(NodeId(5)).is_none() {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.graph.node(NodeId(5)).is_some(),
+            "Read #5 must appear in mirror"
+        );
+
+        app.properties.pending_file_browse = Some(tanova_ui::FileBrowseRequest {
+            node_id: NodeId(5),
+            node_kind: "Read".to_string(),
+            current_path: renders_dir
+                .join("comp.0001.exr")
+                .to_string_lossy()
+                .into_owned(),
+        });
+        if let Some(req) = app.properties.take_pending_file_browse() {
+            app.open_exr_browse_modal(req);
+        }
+        assert!(app.file_modal.is_some(), "read browse modal should be open");
+
+        // Set detect_sequence = true (it's already true by default).
+        if let Some(FileModalState::BrowseReadExr {
+            detect_sequence, ..
+        }) = &mut app.file_modal
+        {
+            *detect_sequence = true;
+        }
+
+        // Confirm Open directly.
+        if let Some(FileModalState::BrowseReadExr {
+            directory,
+            file_input,
+            detect_sequence,
+            ..
+        }) = &app.file_modal
+        {
+            let path = if PathBuf::from(file_input).is_relative() {
+                directory.join(file_input)
+            } else {
+                PathBuf::from(file_input)
+            };
+            app.handle_confirm_read_exr(NodeId(5), path, *detect_sequence);
+        }
+        app.file_modal = None;
+        assert!(
+            app.file_modal.is_none(),
+            "read browse modal should be consumed after confirm"
+        );
+
+        // Verify Read #5 knobs were updated with sequence detection (wait for kernel round-trip).
+        let expected_file = KnobValue::Text(
+            renders_dir
+                .join("comp.%04d.exr")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let knob_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < knob_deadline {
+            app.pump();
+            if app.graph.node(NodeId(5)).is_some_and(|n| {
+                n.knobs.get("file") == Some(&expected_file)
+                    && n.knobs.get("first") == Some(&KnobValue::Int(1))
+                    && n.knobs.get("last") == Some(&KnobValue::Int(3))
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let read_node = app.graph.node(NodeId(5)).expect("Read #5 must exist");
+        assert_eq!(
+            read_node.knobs.get("file"),
+            Some(&expected_file),
+            "Read #5 file knob must be comp.%04d.exr"
+        );
+        assert_eq!(
+            read_node.knobs.get("first"),
+            Some(&KnobValue::Int(1)),
+            "Read #5 first knob must be 1"
+        );
+        assert_eq!(
+            read_node.knobs.get("last"),
+            Some(&KnobValue::Int(3)),
+            "Read #5 last knob must be 3"
+        );
+
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&temp_dir);
 
         app.kernel.shutdown();
     }

@@ -11,6 +11,15 @@ use crate::canvas::GraphMirror;
 
 const VIEWER: Color32 = Color32::from_rgb(255, 190, 40);
 
+/// A request from the properties panel to open the EXR file browse modal
+/// for a `Read` or `Write` node's `file` knob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileBrowseRequest {
+    pub node_id: NodeId,
+    pub node_kind: String,
+    pub current_path: String,
+}
+
 /// One knob edit session, latched in `egui` memory for as long as the artist is
 /// typing into or dragging one knob.
 ///
@@ -53,12 +62,20 @@ pub struct PropertiesPanel {
     /// A `Write` node waiting to render its sequence to disk, set when the
     /// artist clicks `[Render Sequence to Disk]` and consumed by the app.
     pub pending_write_render: Option<NodeId>,
+    /// A `Read`/`Write` node waiting for an EXR file browse, set when the
+    /// artist clicks `Browse...` on the `file` knob and consumed by the app.
+    pub pending_file_browse: Option<FileBrowseRequest>,
 }
 
 impl PropertiesPanel {
     /// Consumes and returns the pending write-render node, if any.
     pub fn take_pending_write_render(&mut self) -> Option<NodeId> {
         self.pending_write_render.take()
+    }
+
+    /// Consumes and returns the pending file-browse request, if any.
+    pub fn take_pending_file_browse(&mut self) -> Option<FileBrowseRequest> {
+        self.pending_file_browse.take()
     }
 
     /// Renders the panel and returns the commands the user requested.
@@ -199,6 +216,17 @@ impl PropertiesPanel {
                                         TextEdit::singleline(&mut edited).desired_width(150.0),
                                     );
                                     note(&edit);
+                                    // Browse... button for the `file` knob on Read/Write nodes.
+                                    if name == "file"
+                                        && (node.kind == "Read" || node.kind == "Write")
+                                        && ui.button("Browse...").clicked()
+                                    {
+                                        self.pending_file_browse = Some(FileBrowseRequest {
+                                            node_id,
+                                            node_kind: node.kind.clone(),
+                                            current_path: edited.clone(),
+                                        });
+                                    }
                                     if combo_changed || edit.changed() {
                                         next = KnobValue::Text(edited);
                                         changed = true;
