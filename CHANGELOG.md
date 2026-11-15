@@ -39,6 +39,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Top-bar labels updated: `Viewer Mode: [Viewer Node] [Direct Target]`, `Theme: [Classic] [Slate] [Midnight]`.
   - Added tests: `classic_slate_and_midnight_palettes_have_distinct_card_and_grid_styles` and `properties_panel_renders_two_column_grid_and_bypass_toggle_across_themes`.
 
+- **Milestone 19 — Graph Organization Cartridges & Canvas Containers (`tanova-nodes`, `tanova-parse`, `tanova-ui`, `tanova-app`):**
+  - New `"Dot"` cartridge: a 1-in/1-out routing elbow whose `evaluate()` is a zero-copy passthrough of `PortId(0)`, with an empty `label` knob.
+  - New `"BackdropNode"` cartridge: a 0-input canvas container with `label`, `color` (`slate`/`blue`/`teal`/`amber`/`purple`/`crimson`/`green`), `bdwidth` (default `320`), and `bdheight` (default `200`) knobs; its `evaluate()` returns an empty packet.
+  - `.nk` / `.tnv` parser normalizes Nuke's plain `Backdrop` to `BackdropNode` and never pops an input from, nor pushes the backdrop onto, the TCL stack, so a saved backdrop can never corrupt downstream wiring on reload.
+  - Canvas geometry helpers `DOT_SIZE` (`22x22`), `NODE_SIZE`, `is_dot_node()`, `is_backdrop_node()`, and `node_world_size()`; screen rects, wire endpoints, framing, and box selection all honor the per-node size.
+  - `.` single-key shortcut spawns a `Dot`; `Dot` and `BackdropNode` also appear in the `Tab` search, right-click `Add node` menu, and canvas hint (`R/W/C/G/B/T/M/.: add node`).
+  - Center-aligned vertical auto-chaining keeps `22px` Dots and `168px` cards on one dead-straight spine, and preserves the historical `90px` pitch for standard cards.
+  - `BackdropNode` spawning wraps the current selection in one atomic `Batch` (`AddNode` + `bdwidth`/`bdheight` `SetKnob`s) with `36px`/`44px` padding, and falls back to a default `320x200` backdrop at the cursor when nothing is selected.
+  - Three-layer z-order (`Backdrops` -> `Wires` -> `Nodes & Dots`): tinted semi-transparent backdrop bodies, a solid category-colored header bar with the label, and a diagonal bottom-right resize grip.
+  - Backdrop header group-drag moves every enclosed non-backdrop node in one coalesced undo step; corner resize commits a single `Batch` of two `SetKnob`s so `Ctrl+Z` restores the previous size in one press. Non-backdrop nodes and ports are hit-tested first, so a card inside a backdrop stays clickable.
+  - `PropertiesPanel` renders a `color` preset `ComboBox` for `BackdropNode` and hides the `[Bypass (D)]` toggle for `Dot` and `BackdropNode`.
+  - Added tests: `dot_node_spawns_via_period_key_centers_on_spine_and_passes_packet_through`, `backdrop_wraps_selected_nodes_moves_enclosed_nodes_and_round_trips_tcl`, and `backdrop_between_wired_nodes_never_corrupts_the_stack`.
+
+### Fixed
+
+- **Milestone 19 live-GUI interaction fixes (`tanova-ui`, `tanova-app`):**
+  - `Dot` grew to `22x22` and its circular body is now a drag handle: a pointer-down inside the body moves the node, and only the top/bottom stem tips can start a wire drag, so a body click can no longer spawn a stray wire.
+  - Spawning `.` (`Dot`) or `B` (`Blur`) below an already-wired node now performs a true pipe splice (`up -> new -> downstream`) in one atomic `Batch` and pushes the downstream column down, instead of leaving a dangling wire or nudging the new node sideways.
+  - `BackdropNode` spawning wraps the selection with `36px`/`44px` padding and never receives the `x += 140` overlap nudge; right-click and `Tab` spawns preserve the current selection.
+- Fixed the live-GUI bug where `BackdropNode` spawned at the cursor instead of wrapping box-selected nodes: all four spawn paths (`Tab` search Enter + mouse-click row, right-click context menu, `+ Add Node` top-bar dropdown, single-key shortcuts) now route through `spawn_node_message`; `TabSearchState` captures `selected_snapshot` / `primary_snapshot` when Tab opens and restores them unconditionally before every popup spawn; canvas pointer press/box-selection/deselect is fully disabled while any spawn UI (Tab popup, context menu, node menu) is open, so a popup click can never wipe `selected_nodes`; right-click on empty canvas never clears the selection; `Shift+B` and plain `Z` spawn `BackdropNode` alongside the existing `R/W/C/G/B/T/M/./Z` keys; `spawn_node_message` Case 0 computes the backdrop bounds from `GraphMirror` world coordinates (`x = min_x - 36`, `y = min_y - 44`, `bdwidth = ((max_x - min_x) + 72).max(200)`, `bdheight = ((max_y - min_y) + 76).max(140)`) using `mirror.node()` directly and keeping all non-backdrop nodes including `Dot` and `Viewer`; `GraphMirror::apply_command` `SetKnob` uses `.insert` so `bdwidth`/`bdheight` are stored even when the `BackdropNode` cartridge isn't linked, and `Batch` applies recursively.
+- Added `+ Add Node` top-bar toolbar dropdown (`ui.menu_button`) routing through `spawn_node_message` using `tanova_ui::canvas::spawnable_kinds`.
+- Added multi-frame regression tests `tab_search_enter_wraps_box_selected_nodes_in_backdrop_not_at_cursor` and `tab_search_mouse_click_on_backdrop_row_wraps_selected_nodes_without_clearing_selection` driving `TanovaApp::draw` / `NodeCanvas::show` frames (not isolated `spawn_node_message` calls) to catch frame-order selection loss.
+  - Backdrop group drag captures its enclosed nodes exactly once at mouse-down, so sweeping an empty backdrop across other cards can no longer capture or pile them together; box selection stays off during node drags and backdrop resizes.
+  - Added tests: `dot_body_drag_moves_dot_without_starting_wire_drag`, `spawning_dot_and_blur_on_wired_constant_splices_pipe_and_pushes_downstream_grade`, and `dragging_empty_backdrop_across_nodes_never_captures_or_moves_them`.
+
 ### Changed
 
 - Canvas bottom hint now uses printable ASCII separators instead of Unicode bullets, keeping the Linux `egui` glyph atlas clean.

@@ -241,6 +241,13 @@ impl<'a> Machine<'a> {
     }
 
     fn handle_block(&mut self, class: &str, body: &[(usize, String)]) -> Result<(), ParseError> {
+        // Nuke writes plain `Backdrop`; normalize to our cartridge name so it
+        // is treated as a 0-input, non-stack-pushing canvas container.
+        let class = if class == "Backdrop" {
+            "BackdropNode"
+        } else {
+            class
+        };
         let defaults = find_cartridge(class).map(|descriptor| (descriptor.default_knobs)());
         let env = self.knob_env();
 
@@ -784,5 +791,100 @@ mod tests {
 
         let reloaded = dag2.node(NodeId(2)).expect("Grade #2 in reloaded dag");
         assert!(reloaded.disabled, "reloaded node must be disabled");
+    }
+
+    /// A `BackdropNode` in the middle of a wired chain must not consume a
+    /// stack slot nor push one, so downstream wiring survives the reload.
+    #[test]
+    fn backdrop_between_wired_nodes_never_corrupts_the_stack() {
+        // Link the cartridges so `bdwidth`/`bdheight` parse with their real
+        // `Float` default types instead of falling back to `Int`.
+        tanova_nodes::ensure_linked();
+        let script = "\
+version 15.0 v5
+Constant {
+ inputs 0
+ xpos 40
+ ypos 40
+}
+set N1 [stack 0]
+Backdrop {
+ inputs 0
+ xpos 4
+ ypos -4
+ label \"Group\"
+ color teal
+ bdwidth 240
+ bdheight 272
+}
+set N2 [stack 0]
+push $N1
+Grade {
+ inputs 1
+ xpos 40
+ ypos 164
+}
+set N3 [stack 0]
+push $N3
+Dot {
+ inputs 1
+ xpos 115
+ ypos 254
+}
+set N4 [stack 0]
+";
+
+        let mut dag = Dag::new();
+        let parsed = load_nk_into_dag(script, &mut dag).expect("parse should succeed");
+
+        // `Backdrop` normalizes to the registered `BackdropNode` cartridge.
+        let backdrop = parsed
+            .nodes
+            .iter()
+            .find(|node| node.class == "BackdropNode")
+            .expect("backdrop must be parsed");
+        assert_eq!(backdrop.inputs, 0, "a backdrop has no image inputs");
+        assert_eq!(backdrop.xpos, Some(4.0));
+        assert_eq!(backdrop.ypos, Some(-4.0));
+        assert_eq!(
+            backdrop.knobs.get("label"),
+            Some(&KnobValue::Text("Group".to_string()))
+        );
+        assert_eq!(
+            backdrop.knobs.get("bdwidth"),
+            Some(&KnobValue::Float(240.0))
+        );
+        assert_eq!(
+            backdrop.knobs.get("bdheight"),
+            Some(&KnobValue::Float(272.0))
+        );
+
+        // Both real wires must land exactly where the script says, proving the
+        // backdrop neither popped an input nor pushed its own id.
+        let id_of = |class: &str| {
+            parsed
+                .nodes
+                .iter()
+                .find(|node| node.class == class)
+                .unwrap_or_else(|| panic!("{class} parsed"))
+                .id
+        };
+        let constant_id = id_of("Constant");
+        let grade_id = id_of("Grade");
+        let dot_id = id_of("Dot");
+        assert_eq!(
+            dag.edges()
+                .find(|edge| edge.to_node == grade_id && edge.to_port == PortId(0))
+                .map(|edge| edge.from_node),
+            Some(constant_id),
+            "Constant -> Grade must survive a backdrop in between"
+        );
+        assert_eq!(
+            dag.edges()
+                .find(|edge| edge.to_node == dot_id && edge.to_port == PortId(0))
+                .map(|edge| edge.from_node),
+            Some(grade_id),
+            "Grade -> Dot must survive a backdrop in between"
+        );
     }
 }

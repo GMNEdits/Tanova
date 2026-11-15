@@ -168,6 +168,20 @@ pub fn palette(theme: StudioTheme) -> ThemePalette {
     }
 }
 
+/// Resolves a `BackdropNode`'s `"color"` knob preset to a tint color.
+pub fn backdrop_tint_color(color: &str) -> Color32 {
+    match color {
+        "slate" => Color32::from_rgb(90, 100, 110),
+        "blue" => Color32::from_rgb(60, 90, 160),
+        "teal" => Color32::from_rgb(40, 120, 120),
+        "amber" => Color32::from_rgb(180, 140, 60),
+        "purple" => Color32::from_rgb(140, 80, 160),
+        "crimson" => Color32::from_rgb(180, 60, 70),
+        "green" => Color32::from_rgb(80, 140, 80),
+        _ => Color32::from_rgb(90, 100, 110),
+    }
+}
+
 /// Applies theme-derived `egui` visuals to the context.
 ///
 /// Only calls `ctx.set_visuals(...)` when `panel_fill` actually changes, so

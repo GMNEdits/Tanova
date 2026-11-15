@@ -21,7 +21,7 @@ use tanova_parse::load_nk_into_dag;
 use tanova_render::{GpuComputeEngine, Raster2D};
 use tanova_ui::{
     GraphMirror, NodeCanvas, NodeCanvasState, PropertiesPanel, StudioTheme, ViewerPanel,
-    ViewerWorkflow, apply_theme_visuals,
+    ViewerWorkflow, apply_theme_visuals, spawn_node_message,
 };
 
 /// Errors crossing the app boundary (eframe requires `Send + Sync`).
@@ -1064,6 +1064,32 @@ impl TanovaApp {
                 ui.selectable_value(&mut next_theme, StudioTheme::Midnight, "Midnight");
                 if next_theme != self.canvas.theme {
                     self.canvas.theme = next_theme;
+                }
+                ui.separator();
+                // `+ Add Node` toolbar dropdown: routes through
+                // `spawn_node_message` so backdrop wrapping and selection
+                // snapshots work exactly like the Tab popup and context menu.
+                let mut add_node_kind: Option<&'static str> = None;
+                ui.menu_button("+ Add Node", |ui| {
+                    for kind in tanova_ui::canvas::spawnable_kinds(self.workflow) {
+                        if ui.button(kind).clicked() {
+                            add_node_kind = Some(kind);
+                        }
+                    }
+                });
+                if let Some(kind) = add_node_kind {
+                    let pointer = ui
+                        .ctx()
+                        .input(|i| i.pointer.hover_pos())
+                        .unwrap_or(egui::Pos2::ZERO);
+                    let canvas_rect = self.canvas.last_canvas_rect.unwrap_or_else(|| {
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1280.0, 720.0))
+                    });
+                    let clamped = pointer.clamp(canvas_rect.min, canvas_rect.max);
+                    let world_pos = self.canvas.screen_to_world(canvas_rect, clamped);
+                    let message =
+                        spawn_node_message(&self.graph, &mut self.canvas, kind, world_pos);
+                    self.dispatch(vec![message]);
                 }
             });
         });
@@ -2322,6 +2348,7 @@ pub fn is_supported_exr_file(path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use egui::{Modifiers, PointerButton, Pos2, Rect, Vec2};
+    use tanova_ui::{DOT_SIZE, NODE_SIZE, spawn_node_message};
 
     fn ctrl() -> egui::Modifiers {
         egui::Modifiers {
@@ -5144,6 +5171,494 @@ mod tests {
         app.kernel.shutdown();
     }
 
+    /// `.` spawns a `Dot` elbow centered on the vertical spine below the
+    /// selected card; a following `B` chains back onto the spine, and the Dot
+    /// is a pure passthrough of the graded packet.
+    #[test]
+    fn dot_node_spawns_via_period_key_centers_on_spine_and_passes_packet_through() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "starter comp must land");
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        // One layout frame so `positions` is seeded from the mirror.
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+
+        let (grade_x, grade_y) = {
+            let node = app.graph.node(GRADE).expect("Grade #2 in mirror");
+            (node.x, node.y)
+        };
+
+        app.canvas.selected_nodes = HashSet::from([GRADE]);
+        app.canvas.primary_selected = Some(GRADE);
+
+        // Park the seeded Viewer clear of the spine so the Blur below the Dot
+        // is not nudged aside by the overlap guard.
+        app.dispatch(vec![KernelMessage::Execute(UndoableCommand::MoveNode {
+            id: VIEWER,
+            from_x: 40.0,
+            from_y: 288.0,
+            to_x: 600.0,
+            to_y: 600.0,
+        })]);
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+
+        press_canvas_key(&mut app, &ctx, screen, egui::Key::Period, Modifiers::NONE);
+
+        let dot_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < dot_deadline && app.graph.node_count() != 4 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 4, "the Dot must spawn");
+
+        let (dot_x, dot_y, dot_kind) = {
+            let dot = app.graph.node(NodeId(4)).expect("spawned Dot #4");
+            (dot.x, dot.y, dot.kind.clone())
+        };
+        assert_eq!(dot_kind, "Dot");
+        // Centered on Grade's spine: 168-wide card vs 22-wide Dot. The Dot
+        // splices into Grade -> Viewer, so it uses the tight 28px spacing.
+        assert_eq!(dot_x, grade_x + (NODE_SIZE.x - DOT_SIZE.x) * 0.5);
+        assert_eq!(dot_y, grade_y + NODE_SIZE.y + 28.0);
+        assert_eq!(
+            app.graph
+                .incoming_edge(NodeId(4), PortId(0))
+                .map(|edge| edge.from_node),
+            Some(GRADE),
+            "Dot must hang off Grade #2"
+        );
+
+        // A following `B` chains below the Dot and re-centers on the spine.
+        press_canvas_key(&mut app, &ctx, screen, egui::Key::B, Modifiers::NONE);
+        let blur_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < blur_deadline && app.graph.node_count() != 5 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 5, "the Blur must spawn");
+
+        let blur = app.graph.node(NodeId(5)).expect("spawned Blur #5");
+        assert_eq!(blur.kind, "Blur");
+        assert_eq!(blur.x, grade_x, "Blur must re-center on the spine");
+        assert_eq!(blur.y, dot_y + DOT_SIZE.y + 28.0);
+        assert_eq!(
+            app.graph
+                .incoming_edge(NodeId(5), PortId(0))
+                .map(|edge| edge.from_node),
+            Some(NodeId(4)),
+            "Dot #4 -> Blur #5"
+        );
+
+        // The Dot is a zero-copy passthrough: a Constant -> Grade -> Dot chain
+        // must produce the same raster as Constant -> Grade.
+        let mut dag = Dag::new();
+        dag.add_node(NodeId(1), "Constant").expect("constant");
+        dag.set_knob(NodeId(1), "color", KnobValue::Color([0.2, 0.4, 0.6, 1.0]))
+            .expect("constant color");
+        dag.add_node(NodeId(2), "Grade").expect("grade");
+        dag.add_node(NodeId(3), "Dot").expect("dot");
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .expect("constant -> grade");
+        dag.connect_edge(Edge::new(NodeId(2), PortId(0), NodeId(3), PortId(0)))
+            .expect("grade -> dot");
+
+        let governor = tanova_kernel::MemoryGovernor::new(64 * 1024 * 1024);
+        let epoch = tanova_kernel::RenderEpoch::new();
+        let graded = dag
+            .evaluate_pull(NodeId(2), &EvalContext::new(), &governor, &epoch, 0)
+            .expect("grade should evaluate");
+        let dotted = dag
+            .evaluate_pull(NodeId(3), &EvalContext::new(), &governor, &epoch, 0)
+            .expect("dot should evaluate");
+        let graded_raster = graded.get::<Raster2D>().expect("graded raster");
+        let dotted_raster = dotted.get::<Raster2D>().expect("dotted raster");
+        assert_eq!(
+            dotted_raster.bbox, graded_raster.bbox,
+            "the Dot must not change the data window"
+        );
+        for channel in [
+            tanova_render::Channel::RgbaRed,
+            tanova_render::Channel::RgbaGreen,
+            tanova_render::Channel::RgbaBlue,
+            tanova_render::Channel::RgbaAlpha,
+        ] {
+            assert_eq!(
+                dotted_raster.sample(&channel, 0, 0),
+                graded_raster.sample(&channel, 0, 0),
+                "the Dot must pass {channel:?} through unchanged"
+            );
+        }
+
+        app.kernel.shutdown();
+    }
+
+    /// Spawning `.` then `B` below a wired `Constant` must splice the pipe into
+    /// a single vertical chain and push the old downstream cards down, instead
+    /// of leaving a dangling wire or nudging a card sideways.
+    #[test]
+    fn spawning_dot_and_blur_on_wired_constant_splices_pipe_and_pushes_downstream_grade() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "starter comp must land");
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+
+        // The starter comp already wires Constant -> Grade -> Viewer.
+        assert_eq!(
+            app.graph
+                .incoming_edge(GRADE, PortId(0))
+                .map(|edge| edge.from_node),
+            Some(CONSTANT),
+            "starter Constant -> Grade"
+        );
+        assert_eq!(
+            app.graph
+                .incoming_edge(VIEWER, PortId(0))
+                .map(|edge| edge.from_node),
+            Some(GRADE),
+            "starter Grade -> Viewer"
+        );
+
+        app.canvas.selected_nodes = HashSet::from([CONSTANT]);
+        app.canvas.primary_selected = Some(CONSTANT);
+
+        press_canvas_key(&mut app, &ctx, screen, egui::Key::Period, Modifiers::NONE);
+        let dot_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < dot_deadline && app.graph.node_count() != 4 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 4, "the Dot must spawn");
+
+        press_canvas_key(&mut app, &ctx, screen, egui::Key::B, Modifiers::NONE);
+        let blur_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < blur_deadline && app.graph.node_count() != 5 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 5, "the Blur must spawn");
+
+        let dot_id = NodeId(4);
+        let blur_id = NodeId(5);
+        assert_eq!(app.graph.node(dot_id).expect("Dot #4").kind, "Dot");
+        assert_eq!(app.graph.node(blur_id).expect("Blur #5").kind, "Blur");
+
+        // One uninterrupted chain: Constant -> Dot -> Blur -> Grade -> Viewer.
+        for (downstream, upstream) in [
+            (dot_id, CONSTANT),
+            (blur_id, dot_id),
+            (GRADE, blur_id),
+            (VIEWER, GRADE),
+        ] {
+            assert_eq!(
+                app.graph
+                    .incoming_edge(downstream, PortId(0))
+                    .map(|edge| edge.from_node),
+                Some(upstream),
+                "expected {upstream:?} -> {downstream:?}"
+            );
+        }
+
+        let ids = [CONSTANT, dot_id, blur_id, GRADE, VIEWER];
+        let centers: Vec<f32> = ids
+            .iter()
+            .map(|id| {
+                let node = app.graph.node(*id).expect("node in mirror");
+                node.x + tanova_ui::node_world_size(node).x * 0.5
+            })
+            .collect();
+        for center in &centers {
+            assert!(
+                (center - centers[0]).abs() < 1e-3,
+                "every node must sit on one spine, got {centers:?}"
+            );
+        }
+
+        let ys: Vec<f32> = ids
+            .iter()
+            .map(|id| app.graph.node(*id).expect("node in mirror").y)
+            .collect();
+        for pair in ys.windows(2) {
+            assert!(pair[0] < pair[1], "y must strictly increase, got {ys:?}");
+        }
+
+        // No two cards may overlap after the push-down.
+        for (index, a) in ids.iter().enumerate() {
+            for b in ids.iter().skip(index + 1) {
+                let na = app.graph.node(*a).expect("node in mirror");
+                let nb = app.graph.node(*b).expect("node in mirror");
+                let ra = Rect::from_min_size(Pos2::new(na.x, na.y), tanova_ui::node_world_size(na));
+                let rb = Rect::from_min_size(Pos2::new(nb.x, nb.y), tanova_ui::node_world_size(nb));
+                assert!(
+                    !ra.intersects(rb),
+                    "cards #{:?} and #{:?} overlap: {ra:?} vs {rb:?}",
+                    a.0,
+                    b.0
+                );
+            }
+        }
+
+        app.kernel.shutdown();
+    }
+
+    /// A `BackdropNode` wraps the selected cards, dragging its header moves
+    /// everything it encloses as one undo step, and it round-trips through
+    /// `.nk`/TCL without corrupting downstream wiring.
+    #[test]
+    fn backdrop_wraps_selected_nodes_moves_enclosed_nodes_and_round_trips_tcl() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "starter comp must land");
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+
+        app.canvas.selected_nodes = HashSet::from([CONSTANT, GRADE]);
+        app.canvas.primary_selected = Some(GRADE);
+
+        let message = spawn_node_message(
+            &app.graph,
+            &mut app.canvas,
+            "BackdropNode",
+            Pos2::new(0.0, 0.0),
+        );
+        app.dispatch(vec![message]);
+
+        let backdrop_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < backdrop_deadline && app.graph.node_count() != 4 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 4, "the Backdrop must spawn");
+
+        // The backdrop must wrap both selected cards.
+        let (bd_rect, bd_world_min) = {
+            let backdrop = app.graph.node(NodeId(4)).expect("spawned Backdrop #4");
+            assert_eq!(backdrop.kind, "BackdropNode");
+            let size = tanova_ui::node_world_size(backdrop);
+            (
+                Rect::from_min_size(Pos2::new(backdrop.x, backdrop.y), size),
+                Pos2::new(backdrop.x, backdrop.y),
+            )
+        };
+        for id in [CONSTANT, GRADE] {
+            let node = app.graph.node(id).expect("selected node");
+            let center = Pos2::new(node.x, node.y) + tanova_ui::node_world_size(node) * 0.5;
+            assert!(
+                bd_rect.contains(center),
+                "Backdrop #4 must contain node #{:?} at {center:?} (rect {bd_rect:?})",
+                id.0
+            );
+        }
+        assert_eq!(app.canvas.primary_selected, Some(NodeId(4)));
+
+        // One layout frame so the canvas has a rect and the backdrop position.
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+        let canvas_rect = app
+            .canvas
+            .last_canvas_rect
+            .expect("the canvas must have been laid out");
+
+        let starts: HashMap<NodeId, (f32, f32)> = [CONSTANT, GRADE, NodeId(4)]
+            .into_iter()
+            .map(|id| {
+                let node = app.graph.node(id).expect("node in mirror");
+                (id, (node.x, node.y))
+            })
+            .collect();
+
+        // Aim at the backdrop's header bar, clear of every enclosed card.
+        let header_world = Pos2::new(
+            bd_world_min.x + bd_rect.width() * 0.5,
+            bd_world_min.y + 12.0,
+        );
+        let press = app.canvas.world_to_screen(canvas_rect, header_world);
+        let dragged = press + egui::vec2(50.0, 30.0);
+
+        run_app_frame(
+            &ctx,
+            &mut app,
+            screen,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        run_app_frame(
+            &ctx,
+            &mut app,
+            screen,
+            vec![egui::Event::PointerMoved(dragged)],
+        );
+        run_app_frame(
+            &ctx,
+            &mut app,
+            screen,
+            vec![egui::Event::PointerButton {
+                pos: dragged,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+
+        for id in [CONSTANT, GRADE, NodeId(4)] {
+            let node = app.graph.node(id).expect("node in mirror");
+            let (start_x, start_y) = starts[&id];
+            assert!(
+                (node.x - (start_x + 50.0)).abs() < 1.0 && (node.y - (start_y + 30.0)).abs() < 1.0,
+                "node #{:?} must move with the backdrop, got ({}, {}) from ({start_x}, {start_y})",
+                id.0,
+                node.x,
+                node.y
+            );
+        }
+
+        // One Ctrl+Z must restore the backdrop and both enclosed cards.
+        app.dispatch(vec![KernelMessage::Undo]);
+        let undo_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < undo_deadline {
+            let restored = [CONSTANT, GRADE, NodeId(4)].into_iter().all(|id| {
+                let node = app.graph.node(id).expect("node in mirror");
+                let (start_x, start_y) = starts[&id];
+                (node.x - start_x).abs() < 1e-3 && (node.y - start_y).abs() < 1e-3
+            });
+            if restored {
+                break;
+            }
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for id in [CONSTANT, GRADE, NodeId(4)] {
+            let node = app.graph.node(id).expect("node in mirror");
+            let (start_x, start_y) = starts[&id];
+            assert!(
+                (node.x - start_x).abs() < 1e-3 && (node.y - start_y).abs() < 1e-3,
+                "one Undo must restore node #{:?} to ({start_x}, {start_y}), got ({}, {})",
+                id.0,
+                node.x,
+                node.y
+            );
+        }
+
+        app.kernel.shutdown();
+
+        // TCL round-trip: a backdrop between wired cards must not disturb the
+        // stack machine on reload.
+        let mut dag = Dag::new();
+        dag.add_node(NodeId(1), "Constant").expect("constant");
+        dag.add_node(NodeId(2), "Grade").expect("grade");
+        dag.add_node(NodeId(3), "Dot").expect("dot");
+        dag.add_node(NodeId(4), "BackdropNode").expect("backdrop");
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(2), PortId(0)))
+            .expect("constant -> grade");
+        dag.connect_edge(Edge::new(NodeId(2), PortId(0), NodeId(3), PortId(0)))
+            .expect("grade -> dot");
+        dag.set_position(NodeId(4), 12.0, 34.0)
+            .expect("backdrop pos");
+        dag.set_knob(NodeId(4), "label", KnobValue::Text("My Group".to_string()))
+            .expect("backdrop label");
+        dag.set_knob(NodeId(4), "color", KnobValue::Text("teal".to_string()))
+            .expect("backdrop color");
+        dag.set_knob(NodeId(4), "bdwidth", KnobValue::Float(444.0))
+            .expect("backdrop width");
+        dag.set_knob(NodeId(4), "bdheight", KnobValue::Float(333.0))
+            .expect("backdrop height");
+
+        let tcl = dag.export_to_tcl();
+        let mut reloaded = Dag::new();
+        let parsed = load_nk_into_dag(&tcl, &mut reloaded).expect("reload exported TCL");
+
+        let reloaded_backdrop = parsed
+            .nodes
+            .iter()
+            .find(|node| node.class == "BackdropNode")
+            .expect("reloaded backdrop");
+        assert_eq!(reloaded_backdrop.xpos, Some(12.0));
+        assert_eq!(reloaded_backdrop.ypos, Some(34.0));
+        assert_eq!(
+            reloaded_backdrop.knobs.get("label"),
+            Some(&KnobValue::Text("My Group".to_string()))
+        );
+        assert_eq!(
+            reloaded_backdrop.knobs.get("color"),
+            Some(&KnobValue::Text("teal".to_string()))
+        );
+        assert_eq!(
+            reloaded_backdrop.knobs.get("bdwidth"),
+            Some(&KnobValue::Float(444.0))
+        );
+        assert_eq!(
+            reloaded_backdrop.knobs.get("bdheight"),
+            Some(&KnobValue::Float(333.0))
+        );
+
+        let id_of = |class: &str| {
+            parsed
+                .nodes
+                .iter()
+                .find(|node| node.class == class)
+                .unwrap_or_else(|| panic!("reloaded {class}"))
+                .id
+        };
+        let constant_id = id_of("Constant");
+        let grade_id = id_of("Grade");
+        let dot_id = id_of("Dot");
+        assert_eq!(
+            reloaded
+                .edges()
+                .find(|edge| edge.to_node == grade_id && edge.to_port == PortId(0))
+                .map(|edge| edge.from_node),
+            Some(constant_id),
+            "Constant -> Grade must survive the backdrop round-trip"
+        );
+        assert_eq!(
+            reloaded
+                .edges()
+                .find(|edge| edge.to_node == dot_id && edge.to_port == PortId(0))
+                .map(|edge| edge.from_node),
+            Some(grade_id),
+            "Grade -> Dot must survive the backdrop round-trip"
+        );
+    }
+
     /// Plain `C` spawns an unconnected Constant stamped with the project
     /// format, while `Ctrl+C` keeps its clipboard meaning.
     #[test]
@@ -5211,6 +5726,273 @@ mod tests {
             Some(&KnobValue::Int(256)),
             "Constant must inherit the 256-high project format"
         );
+
+        app.kernel.shutdown();
+    }
+
+    /// Regression test: `Tab` search + `Enter` wraps box-selected nodes in a
+    /// `BackdropNode` at the bounding-box position, NOT at the cursor.
+    ///
+    /// This runs full frames through `TanovaApp::draw` / `NodeCanvas::show`
+    /// (not isolated `spawn_node_message` calls) to catch the frame-order
+    /// bug where the canvas pointer handler clears `selected_nodes` before
+    /// the popup spawns.
+    #[test]
+    fn tab_search_enter_wraps_box_selected_nodes_in_backdrop_not_at_cursor() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Move Constant #1 to (0,0) and Grade #2 to (0,90) so the backdrop
+        // wraps at (-36, -44) instead of a seed-position-dependent offset.
+        app.dispatch(vec![
+            KernelMessage::Execute(UndoableCommand::MoveNode {
+                id: CONSTANT,
+                from_x: 40.0,
+                from_y: 40.0,
+                to_x: 0.0,
+                to_y: 0.0,
+            }),
+            KernelMessage::Execute(UndoableCommand::MoveNode {
+                id: GRADE,
+                from_x: 40.0,
+                from_y: 164.0,
+                to_x: 0.0,
+                to_y: 90.0,
+            }),
+        ]);
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+
+        app.canvas.selected_nodes = HashSet::from([CONSTANT, GRADE]);
+        app.canvas.primary_selected = Some(GRADE);
+
+        // Frame 1: park the pointer far away from the nodes and open Tab
+        // search there (set directly since egui may consume Tab for focus
+        // cycling in the full app layout).
+        app.canvas.tab_search = Some(tanova_ui::canvas::TabSearchState {
+            screen_pos: Pos2::new(650.0, 450.0),
+            world_pos: Pos2::new(650.0, 450.0),
+            query: String::new(),
+            just_opened: true,
+            selected_snapshot: app.canvas.selected_nodes.clone(),
+            primary_snapshot: app.canvas.primary_selected,
+        });
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+        assert!(
+            app.canvas.is_search_open(),
+            "Tab must open the quick-search popup"
+        );
+
+        // Frame 2: type "BackdropNode" and press Enter. The canvas pointer
+        // handler must not have cleared selected_nodes while the popup was
+        // open, so the backdrop wraps the box-selected nodes.
+        run_app_frame(
+            &ctx,
+            &mut app,
+            screen,
+            vec![
+                egui::Event::Text("BackdropNode".into()),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            !app.canvas.is_search_open(),
+            "Enter must close the quick-search popup"
+        );
+
+        let backdrop_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < backdrop_deadline && app.graph.node_count() != 4 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 4, "the Backdrop must spawn");
+
+        let backdrop = app.graph.node(NodeId(4)).expect("spawned Backdrop #4");
+        assert_eq!(backdrop.kind, "BackdropNode");
+        // Must wrap at (-36, -44) from the bounding box of Constant(0,0)
+        // and Grade(0,90), NOT near the cursor at (650, 450).
+        assert_eq!(
+            backdrop.x, -36.0,
+            "backdrop x must be -36 (wrapping), not near the cursor"
+        );
+        assert_eq!(
+            backdrop.y, -44.0,
+            "backdrop y must be -44 (wrapping), not near the cursor"
+        );
+
+        // The backdrop rect must strictly contain both selected nodes.
+        let size = tanova_ui::node_world_size(backdrop);
+        let bd_rect = Rect::from_min_size(Pos2::new(backdrop.x, backdrop.y), size);
+        for id in [CONSTANT, GRADE] {
+            let node = app.graph.node(id).expect("selected node");
+            let center = Pos2::new(node.x, node.y) + tanova_ui::node_world_size(node) * 0.5;
+            assert!(
+                bd_rect.contains(center),
+                "Backdrop must contain node #{:?} at {center:?} (rect {bd_rect:?})",
+                id.0
+            );
+        }
+
+        app.kernel.shutdown();
+    }
+
+    /// Regression test: clicking a `BackdropNode` row in the `Tab` search
+    /// popup must not clear `selected_nodes` before spawning, and must wrap
+    /// the box-selected nodes at (-36, -44).
+    ///
+    /// Runs full frames through `TanovaApp::draw` / `NodeCanvas::show`.
+    #[test]
+    fn tab_search_mouse_click_on_backdrop_row_wraps_selected_nodes_without_clearing_selection() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Move Constant #1 to (0,0) and Grade #2 to (0,90).
+        app.dispatch(vec![
+            KernelMessage::Execute(UndoableCommand::MoveNode {
+                id: CONSTANT,
+                from_x: 40.0,
+                from_y: 40.0,
+                to_x: 0.0,
+                to_y: 0.0,
+            }),
+            KernelMessage::Execute(UndoableCommand::MoveNode {
+                id: GRADE,
+                from_x: 40.0,
+                from_y: 164.0,
+                to_x: 0.0,
+                to_y: 90.0,
+            }),
+        ]);
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+
+        app.canvas.selected_nodes = HashSet::from([CONSTANT, GRADE]);
+        app.canvas.primary_selected = Some(GRADE);
+
+        // Frame 1: open Tab search at (600, 400).
+        app.canvas.tab_search = Some(tanova_ui::canvas::TabSearchState {
+            screen_pos: Pos2::new(600.0, 400.0),
+            world_pos: Pos2::new(600.0, 400.0),
+            query: String::new(),
+            just_opened: true,
+            selected_snapshot: app.canvas.selected_nodes.clone(),
+            primary_snapshot: app.canvas.primary_selected,
+        });
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+        assert!(
+            app.canvas.is_search_open(),
+            "Tab must open the quick-search popup"
+        );
+
+        // Frame 2: type "BackdropNode" so only the "BackdropNode" button
+        // remains in the popup list.
+        run_app_frame(
+            &ctx,
+            &mut app,
+            screen,
+            vec![egui::Event::Text("BackdropNode".into())],
+        );
+
+        // Frame 3: click the "BackdropNode" popup button. Position estimated
+        // as screen_pos + (~20, ~50) for the egui popup/TextEdit/button
+        // geometry (TextEdit + separator + one button row).
+        let click_pos = Pos2::new(620.0, 450.0);
+        run_app_frame(
+            &ctx,
+            &mut app,
+            screen,
+            vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            !app.canvas.is_search_open(),
+            "popup click must close the quick-search popup"
+        );
+
+        let backdrop_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < backdrop_deadline && app.graph.node_count() != 4 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            4,
+            "the Backdrop must spawn from the popup click"
+        );
+
+        let backdrop = app.graph.node(NodeId(4)).expect("spawned Backdrop #4");
+        assert_eq!(backdrop.kind, "BackdropNode");
+        assert_eq!(
+            backdrop.x, -36.0,
+            "backdrop x must be -36 (wrapping), not at the click position"
+        );
+        assert_eq!(
+            backdrop.y, -44.0,
+            "backdrop y must be -44 (wrapping), not at the click position"
+        );
+
+        let size = tanova_ui::node_world_size(backdrop);
+        let bd_rect = Rect::from_min_size(Pos2::new(backdrop.x, backdrop.y), size);
+        for id in [CONSTANT, GRADE] {
+            let node = app.graph.node(id).expect("selected node");
+            let center = Pos2::new(node.x, node.y) + tanova_ui::node_world_size(node) * 0.5;
+            assert!(
+                bd_rect.contains(center),
+                "Backdrop must contain node #{:?} at {center:?} (rect {bd_rect:?})",
+                id.0
+            );
+        }
 
         app.kernel.shutdown();
     }

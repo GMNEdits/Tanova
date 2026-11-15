@@ -45,8 +45,10 @@ fn registry_links_every_core_cartridge() {
     ensure_linked();
     let kinds = registered_cartridge_kinds();
     for expected in [
+        "BackdropNode",
         "Blur",
         "Constant",
+        "Dot",
         "Dummy",
         "Grade",
         "Merge2",

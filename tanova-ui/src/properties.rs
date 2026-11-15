@@ -54,6 +54,10 @@ const OPERATIONS: &[&str] = &[
 const BBOX_MODES: &[&str] = &["union", "B", "A", "intersection"];
 /// Channel export modes for the `Write` node's `channels` knob.
 const CHANNELS_MODES: &[&str] = &["rgba", "all"];
+/// Tint presets for a `BackdropNode`'s `color` knob.
+const BACKDROP_COLORS: &[&str] = &[
+    "slate", "blue", "teal", "amber", "purple", "crimson", "green",
+];
 
 /// Draws controls for every knob on the selected node.
 #[derive(Default)]
@@ -126,7 +130,10 @@ impl PropertiesPanel {
                             .color(Color32::WHITE),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if node.kind != "Viewer" {
+                        if node.kind != "Viewer"
+                            && node.kind != "BackdropNode"
+                            && node.kind != "Dot"
+                        {
                             let bypass_label = if node.disabled {
                                 "[Bypassed]"
                             } else {
@@ -224,6 +231,7 @@ impl PropertiesPanel {
                                 "operation" => Some(OPERATIONS),
                                 "bbox" => Some(BBOX_MODES),
                                 "channels" if node.kind == "Write" => Some(CHANNELS_MODES),
+                                "color" if node.kind == "BackdropNode" => Some(BACKDROP_COLORS),
                                 _ => None,
                             };
                             if let Some(presets) = presets {
