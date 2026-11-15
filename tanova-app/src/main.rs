@@ -774,6 +774,28 @@ impl TanovaApp {
             }
         }
 
+        // Nuke viewer comparison slots: `1` binds slot 1, `2` binds slot 2.
+        // The canvas also handles these when it owns the keyboard, but the app
+        // consumes them first so the active slot drives the viewer binding.
+        let viewer_slot_key = ctx.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::Num1) {
+                Some(0)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Num2) {
+                Some(1)
+            } else {
+                None
+            }
+        });
+        if let Some(slot) = viewer_slot_key {
+            if let Some(target) = self.canvas.select_viewer_slot(slot) {
+                messages.push(tanova_ui::viewer_message(
+                    &self.graph,
+                    self.workflow,
+                    target,
+                ));
+            }
+        }
+
         self.dispatch(messages);
     }
 
@@ -3891,6 +3913,9 @@ mod tests {
 
         // Select Grade #2 only.
         app.canvas.selected_nodes = HashSet::from([GRADE]);
+        // Force the in-app clipboard path: parallel tests share the real OS
+        // clipboard, so reading it could paste another test's selection.
+        app.os_clipboard = None;
 
         let ctx = egui::Context::default();
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
@@ -4781,6 +4806,150 @@ mod tests {
             let _ = std::fs::remove_file(temp_dir.join(f));
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
+
+        app.kernel.shutdown();
+    }
+
+    /// Sends one plain key press through `handle_shortcuts`.
+    fn press_key(app: &mut TanovaApp, ctx: &egui::Context, screen: Rect, key: egui::Key) {
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                app.handle_shortcuts(ctx);
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+
+    /// `1` and `2` pin the two viewer comparison slots. Pressing the other
+    /// slot's key while a node stays selected flips the viewer back without
+    /// overwriting the first slot (the A/B muscle-memory guard).
+    #[test]
+    fn viewer_slots_1_and_2_support_ab_comparison_with_and_without_selection() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Select Constant #1 and press 1.
+        app.canvas.selected_nodes = HashSet::from([CONSTANT]);
+        app.canvas.primary_selected = Some(CONSTANT);
+        press_key(&mut app, &ctx, screen, egui::Key::Num1);
+        assert_eq!(app.canvas.viewer_slots[0], Some(CONSTANT));
+        assert_eq!(app.canvas.active_viewer_slot, 0);
+
+        // The kernel re-wires the physical Viewer to Constant #1.
+        let route_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.pump();
+            if app
+                .graph
+                .incoming_edge(VIEWER, PortId(0))
+                .map(|e| e.from_node)
+                == Some(CONSTANT)
+            {
+                break;
+            }
+            if Instant::now() >= route_deadline {
+                panic!("viewer did not route to Constant #1");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Select Grade #2 and press 2.
+        app.canvas.selected_nodes = HashSet::from([GRADE]);
+        app.canvas.primary_selected = Some(GRADE);
+        press_key(&mut app, &ctx, screen, egui::Key::Num2);
+        assert_eq!(app.canvas.viewer_slots[1], Some(GRADE));
+        assert_eq!(app.canvas.active_viewer_slot, 1);
+
+        let route_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.pump();
+            if app
+                .graph
+                .incoming_edge(VIEWER, PortId(0))
+                .map(|e| e.from_node)
+                == Some(GRADE)
+            {
+                break;
+            }
+            if Instant::now() >= route_deadline {
+                panic!("viewer did not route to Grade #2");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Grade #2 is STILL selected; press 1. The A/B guard must keep slot 1
+        // bookmarked to Constant #1 instead of overwriting it with Grade #2.
+        press_key(&mut app, &ctx, screen, egui::Key::Num1);
+        assert_eq!(app.canvas.active_viewer_slot, 0);
+        assert_eq!(app.canvas.viewer_slots[0], Some(CONSTANT));
+        assert_eq!(app.canvas.viewer_slots[1], Some(GRADE));
+
+        let route_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.pump();
+            if app
+                .graph
+                .incoming_edge(VIEWER, PortId(0))
+                .map(|e| e.from_node)
+                == Some(CONSTANT)
+            {
+                break;
+            }
+            if Instant::now() >= route_deadline {
+                panic!("viewer did not route back to Constant #1");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Press 2 again: back to Grade #2.
+        press_key(&mut app, &ctx, screen, egui::Key::Num2);
+        assert_eq!(app.canvas.active_viewer_slot, 1);
+        assert_eq!(app.canvas.viewer_slots[1], Some(GRADE));
+
+        let route_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.pump();
+            if app
+                .graph
+                .incoming_edge(VIEWER, PortId(0))
+                .map(|e| e.from_node)
+                == Some(GRADE)
+            {
+                break;
+            }
+            if Instant::now() >= route_deadline {
+                panic!("viewer did not route back to Grade #2");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         app.kernel.shutdown();
     }

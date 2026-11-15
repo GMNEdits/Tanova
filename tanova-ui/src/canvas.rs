@@ -468,6 +468,14 @@ pub struct NodeCanvasState {
     pub selected_nodes: HashSet<NodeId>,
     /// The deterministic single active node (properties, transform jack, `1`).
     pub primary_selected: Option<NodeId>,
+    /// The two bookmarked viewer inputs for Nuke-style A/B comparison.
+    ///
+    /// Slot 0 is bound by `1`, slot 1 by `2`. Each slot stores the *routed
+    /// target* (the node the physical Viewer looks through), never the Viewer
+    /// node itself, so switching slots only re-routes the viewer.
+    pub viewer_slots: [Option<NodeId>; 2],
+    /// Which viewer slot the viewer panel is currently showing (`0` or `1`).
+    pub active_viewer_slot: usize,
     /// In-progress wire drag.
     pub active_wire_drag: Option<WireDrag>,
     /// In-progress box selection, stored as `(start_screen, current_screen)`.
@@ -508,6 +516,8 @@ impl Default for NodeCanvasState {
             last_canvas_rect: None,
             selected_nodes: HashSet::new(),
             primary_selected: None,
+            viewer_slots: [None, None],
+            active_viewer_slot: 0,
             active_wire_drag: None,
             box_selection: None,
             tab_search: None,
@@ -563,6 +573,8 @@ impl NodeCanvasState {
     pub fn reset_for_script(&mut self, mirror: &GraphMirror) {
         self.selected_nodes.clear();
         self.primary_selected = None;
+        self.viewer_slots = [None, None];
+        self.active_viewer_slot = 0;
         self.active_wire_drag = None;
         self.box_selection = None;
         self.dragging_nodes = false;
@@ -595,6 +607,38 @@ impl NodeCanvasState {
     /// collide with the ids the canvas will hand out next.
     pub fn sync_next_node_id(&mut self, floor: u64) {
         self.next_node_id = self.next_node_id.max(floor);
+    }
+
+    /// Resolves viewer-slot key `slot_idx` (`0` for `1`, `1` for `2`) into the
+    /// node the viewer should route to.
+    ///
+    /// The A/B guard keeps a selected node's knobs open while flipping between
+    /// two comparisons: if the selected node is already bookmarked in the
+    /// *other* slot and that slot is active, pressing this slot's key re-shows
+    /// the target already stored here instead of overwriting it with the
+    /// selection.
+    pub fn select_viewer_slot(&mut self, slot_idx: usize) -> Option<NodeId> {
+        let slot_idx = slot_idx.min(1);
+        let other_slot = 1 - slot_idx;
+
+        if let Some(sel_id) = self.primary_selected {
+            if self.viewer_slots[other_slot] == Some(sel_id)
+                && self.active_viewer_slot == other_slot
+            {
+                if let Some(existing_target) = self.viewer_slots[slot_idx] {
+                    self.active_viewer_slot = slot_idx;
+                    return Some(existing_target);
+                }
+            }
+            self.viewer_slots[slot_idx] = Some(sel_id);
+            self.active_viewer_slot = slot_idx;
+            Some(sel_id)
+        } else if let Some(bookmarked_id) = self.viewer_slots[slot_idx] {
+            self.active_viewer_slot = slot_idx;
+            Some(bookmarked_id)
+        } else {
+            None
+        }
     }
 
     /// Hands out the next never-reused node id.
@@ -738,7 +782,8 @@ impl NodeCanvas {
                 }
             }
             if let Some(viewer) = viewer {
-                ui.colored_label(VIEWER, format!("VIEWER 1: #{}", viewer.0));
+                let slot = if state.active_viewer_slot == 0 { 1 } else { 2 };
+                ui.colored_label(VIEWER, format!("VIEWER {slot}: #{}", viewer.0));
             }
             ui.separator();
             ui.label(format!("zoom {:.0}%", state.zoom * 100.0));
@@ -801,6 +846,34 @@ impl NodeCanvas {
             .is_some_and(|id| graph.node(id).is_none())
         {
             state.primary_selected = state.selected_nodes.iter().min().copied();
+        }
+
+        // Prune deleted nodes from the A/B viewer slots.
+        for slot in &mut state.viewer_slots {
+            if slot.is_some_and(|id| graph.node(id).is_none()) {
+                *slot = None;
+            }
+        }
+
+        // Seed slot 1 from the current viewer binding the first time the canvas
+        // sees a graph. Nuke stores the node the physical Viewer looks through;
+        // Fusion stores the viewer target directly.
+        if state.viewer_slots[0].is_none() {
+            if let Some(viewer_id) = viewer {
+                match workflow {
+                    ViewerWorkflow::Fusion => state.viewer_slots[0] = Some(viewer_id),
+                    ViewerWorkflow::Nuke => {
+                        if graph
+                            .node(viewer_id)
+                            .is_some_and(|node| node.kind == "Viewer")
+                        {
+                            if let Some(edge) = graph.incoming_edge(viewer_id, PortId(0)) {
+                                state.viewer_slots[0] = Some(edge.from_node);
+                            }
+                        }
+                    }
+                }
+            }
         }
         if state.active_wire_drag.is_some() {
             let drag_references_node = match state.active_wire_drag.as_ref() {
@@ -1243,14 +1316,21 @@ impl NodeCanvas {
         // value owns the keyboard.
         let keyboard_busy = keyboard_is_busy(ui);
 
-        // Nuke binds `1` to "view this node".
-        if ui.input(|input| input.key_pressed(Key::Num1))
-            && !keyboard_busy
-            && !search_open
-            && !modal_open
-        {
-            if let Some(selected) = state.primary_selected {
-                messages.push(viewer_message(graph, workflow, selected));
+        // Nuke binds `1` / `2` to the two viewer comparison slots.
+        if !keyboard_busy && !search_open && !modal_open {
+            let viewer_slot_key = ui.ctx().input_mut(|input| {
+                if input.consume_key(Modifiers::NONE, Key::Num1) {
+                    Some(0)
+                } else if input.consume_key(Modifiers::NONE, Key::Num2) {
+                    Some(1)
+                } else {
+                    None
+                }
+            });
+            if let Some(slot) = viewer_slot_key {
+                if let Some(target) = state.select_viewer_slot(slot) {
+                    messages.push(viewer_message(graph, workflow, target));
+                }
             }
         }
 
@@ -1350,10 +1430,11 @@ impl NodeCanvas {
             let to_rect = node_screen_rect_at(state, to_position, rect);
             let from = output_port(from_rect, state.zoom);
             let port_count = input_port_count(&to_node.kind);
-            let to = input_port(to_rect, edge.to_port, port_count);
+            let to = input_port(to_rect, &to_node.kind, port_count, edge.to_port);
+            let side = input_port_side(&to_node.kind, port_count, edge.to_port.0 as usize);
             let label = input_port_label(&to_node.kind, port_count, edge.to_port.0 as usize);
             let label = if label.is_empty() { None } else { Some(label) };
-            draw_wire(&painter, from, to, state.zoom, WIRE, label);
+            draw_wire(&painter, from, to, side, state.zoom, WIRE, label);
         }
 
         for node in graph.nodes() {
@@ -1374,20 +1455,25 @@ impl NodeCanvas {
             };
             let is_viewer = viewer == Some(node.id)
                 && (workflow != ViewerWorkflow::Nuke || node.kind == "Viewer");
+            let viewer_slot_label = is_viewer.then_some(if state.active_viewer_slot == 0 {
+                "VIEWER 1"
+            } else {
+                "VIEWER 2"
+            });
             draw_node(
                 &painter,
                 node_rect,
                 node,
                 state.selected_nodes.contains(&node.id),
-                is_viewer,
+                viewer_slot_label,
                 state.zoom,
                 active_port,
             );
         }
 
         if let Some(pointer) = pointer_pos {
-            if let Some((from, to)) = live_wire_points(state, graph, rect, pointer) {
-                draw_wire(&painter, from, to, state.zoom, WIRE_ACTIVE, None);
+            if let Some((from, to, side)) = live_wire_points(state, graph, rect, pointer) {
+                draw_wire(&painter, from, to, side, state.zoom, WIRE_ACTIVE, None);
             }
         }
 
@@ -1413,7 +1499,7 @@ impl NodeCanvas {
         painter.text(
             rect.left_bottom() + Vec2::new(12.0, -10.0),
             Align2::LEFT_BOTTOM,
-            "Tab: search  •  MMB: pan  •  Wheel: zoom  •  Shift: multi-select  •  Drag wire: connect/rip  •  RMB: menu  •  Del: remove  •  D: bypass  •  F: frame  •  Ctrl+C/V/D: copy/paste/dup",
+            "Tab: search  |  MMB: pan  |  Wheel: zoom  |  Shift: multi-select  |  Drag wire: connect/rip  |  RMB: menu  |  Del: remove  |  D: bypass  |  F: frame  |  1/2: view  |  Ctrl+C/V/D: copy/paste/dup",
             FontId::proportional(11.0),
             Color32::from_gray(110),
         );
@@ -1554,7 +1640,11 @@ fn draw_tab_search(
 }
 
 /// Builds the viewer message for the active workflow.
-fn viewer_message(graph: &GraphMirror, workflow: ViewerWorkflow, node: NodeId) -> KernelMessage {
+pub fn viewer_message(
+    graph: &GraphMirror,
+    workflow: ViewerWorkflow,
+    node: NodeId,
+) -> KernelMessage {
     match workflow {
         ViewerWorkflow::Fusion => KernelMessage::SetViewerNode(Some(node)),
         ViewerWorkflow::Nuke => {
@@ -1686,30 +1776,38 @@ fn resolve_wire_release(
 }
 
 /// Screen-space endpoints of the live wire, if a drag is active.
+///
+/// The third value is the side of the destination pin, so the live Bezier
+/// enters a left/right mask pin horizontally instead of from above.
 fn live_wire_points(
     state: &NodeCanvasState,
     graph: &GraphMirror,
     rect: Rect,
     pointer: Pos2,
-) -> Option<(Pos2, Pos2)> {
+) -> Option<(Pos2, Pos2, PortSide)> {
     match state.active_wire_drag? {
         WireDrag::FromOutput { from_node, .. } => {
             let position = state.node_position(from_node)?;
             Some((
                 output_port(node_screen_rect_at(state, position, rect), state.zoom),
                 pointer,
+                PortSide::Top,
             ))
         }
         WireDrag::FromInput { to_node, to_port } => {
             let position = state.node_position(to_node)?;
             let node = graph.node(to_node)?;
+            let count = input_port_count(&node.kind);
+            let side = input_port_side(&node.kind, count, to_port.0 as usize);
             Some((
                 pointer,
                 input_port(
                     node_screen_rect_at(state, position, rect),
+                    &node.kind,
+                    count,
                     to_port,
-                    input_port_count(&node.kind),
                 ),
+                side,
             ))
         }
         WireDrag::Detaching { from_node, .. } => {
@@ -1717,6 +1815,7 @@ fn live_wire_points(
             Some((
                 output_port(node_screen_rect_at(state, position, rect), state.zoom),
                 pointer,
+                PortSide::Top,
             ))
         }
     }
@@ -1745,6 +1844,42 @@ fn node_screen_rect_at(state: &NodeCanvasState, position: Pos2, rect: Rect) -> R
     Rect::from_min_size(min, Vec2::new(NODE_W, NODE_H) * state.zoom)
 }
 
+/// Which edge of a node card an input pin sits on.
+///
+/// Nuke's combiner layout puts the `B` pipe on top, the `A` pipe on the left,
+/// and the mask on the right. Two-input filters keep `in` on top and expose
+/// their mask on the right edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortSide {
+    /// Top edge (`B` / `in`).
+    Top,
+    /// Left edge (`A` on a combiner).
+    Left,
+    /// Right edge (`M` mask on filters and combiners).
+    Right,
+}
+
+/// Side of `port_index` for a node with `input_count` inputs.
+///
+/// Port 0 is always the top pipe. Two-input filters put their mask on the
+/// right, while three-or-more-input combiners put `A` on the left and every
+/// later pipe (the mask) on the right.
+pub fn input_port_side(kind: &str, input_count: usize, port_index: usize) -> PortSide {
+    if port_index == 0 || input_count <= 1 {
+        return PortSide::Top;
+    }
+    if input_count == 2 {
+        return PortSide::Right;
+    }
+    // `Merge2` and any other combiner: B top, A left, M right.
+    let combiner = kind == "Merge2" || input_count >= 3;
+    if combiner && port_index == 1 {
+        PortSide::Left
+    } else {
+        PortSide::Right
+    }
+}
+
 /// Number of input ports a cartridge exposes to the canvas.
 fn input_port_count(kind: &str) -> usize {
     match kind {
@@ -1761,14 +1896,26 @@ fn node_accepts_inputs(graph: &GraphMirror, id: NodeId) -> bool {
         .is_some_and(|node| input_port_count(&node.kind) > 0)
 }
 
-/// Position of input `port` on the top edge of `rect`.
-fn input_port(rect: Rect, port: PortId, count: usize) -> Pos2 {
+/// Pin anchor for input `port` on the correct edge of `rect`.
+fn input_port(rect: Rect, kind: &str, count: usize, port: PortId) -> Pos2 {
     if count == 0 {
         return rect.center_top();
     }
-    let slot = (port.0 as usize).min(count - 1);
-    let step = rect.width() / (count as f32 + 1.0);
-    Pos2::new(rect.left() + step * (slot as f32 + 1.0), rect.top())
+    match input_port_side(kind, count, port.0 as usize) {
+        PortSide::Top => rect.center_top(),
+        PortSide::Left => rect.left_center(),
+        PortSide::Right => rect.right_center(),
+    }
+}
+
+/// Tip of the stem drawn outward from an input pin.
+fn input_port_stem_tip(pin: Pos2, side: PortSide, zoom: f32) -> Pos2 {
+    let lead = PORT_LEAD * zoom;
+    match side {
+        PortSide::Top => pin - Vec2::new(0.0, lead),
+        PortSide::Left => pin - Vec2::new(lead, 0.0),
+        PortSide::Right => pin + Vec2::new(lead, 0.0),
+    }
 }
 
 /// Anchor for an input port label, clear of the port stem.
@@ -1778,6 +1925,25 @@ fn input_port(rect: Rect, port: PortId, count: usize) -> Pos2 {
 /// every glyph above the stem at any zoom level.
 fn port_label_position(position: Pos2, zoom: f32) -> Pos2 {
     position - Vec2::new(0.0, (PORT_LEAD + 3.0) * zoom)
+}
+
+/// Label anchor for an input pin on `side`.
+fn input_port_label_position(pin: Pos2, side: PortSide, zoom: f32) -> Pos2 {
+    let gap = (PORT_LEAD + 3.0) * zoom;
+    match side {
+        PortSide::Top => port_label_position(pin, zoom),
+        PortSide::Left => pin - Vec2::new(gap, 0.0),
+        PortSide::Right => pin + Vec2::new(gap, 0.0),
+    }
+}
+
+/// Text alignment that keeps a side-aware port label clear of its stem.
+fn input_port_label_align(side: PortSide) -> Align2 {
+    match side {
+        PortSide::Top => Align2::CENTER_BOTTOM,
+        PortSide::Left => Align2::RIGHT_CENTER,
+        PortSide::Right => Align2::LEFT_CENTER,
+    }
 }
 
 fn output_port(rect: Rect, zoom: f32) -> Pos2 {
@@ -1813,7 +1979,7 @@ fn hit_input_port(
         let node_rect = node_screen_rect(state, node.id, rect);
         let count = input_port_count(&node.kind);
         for port in 0..count {
-            let position = input_port(node_rect, PortId(port as u16), count);
+            let position = input_port(node_rect, &node.kind, count, PortId(port as u16));
             if pointer.distance(position) <= radius {
                 return Some((node.id, PortId(port as u16)));
             }
@@ -1908,7 +2074,7 @@ fn draw_node(
     rect: Rect,
     node: &CanvasNode,
     selected: bool,
-    is_viewer: bool,
+    viewer_slot_label: Option<&'static str>,
     zoom: f32,
     active_port: Option<PortId>,
 ) {
@@ -1943,16 +2109,15 @@ fn draw_node(
     let output = output_port(rect, zoom);
     let stub = Stroke::new((1.5 * zoom).max(0.6), border);
 
-    // Input ports: B (0), A (1), mask (2) laid out along the top edge.
+    // Input ports: B (top), A (left), mask (right).
     let count = input_port_count(&node.kind);
     let box_size = (9.0 * zoom).max(5.0);
     for port in 0..count {
         let port_id = PortId(port as u16);
-        let position = input_port(rect, port_id, count);
-        painter.line_segment(
-            [position - Vec2::new(0.0, PORT_LEAD * zoom), position],
-            stub,
-        );
+        let side = input_port_side(&node.kind, count, port);
+        let position = input_port(rect, &node.kind, count, port_id);
+        let stem_tip = input_port_stem_tip(position, side, zoom);
+        painter.line_segment([stem_tip, position], stub);
         let active = active_port == Some(port_id);
         let port_rect = Rect::from_center_size(position, Vec2::splat(box_size));
         painter.rect_filled(
@@ -1963,8 +2128,8 @@ fn draw_node(
         let label = input_port_label(&node.kind, count, port);
         if !label.is_empty() {
             painter.text(
-                port_label_position(position, zoom),
-                Align2::CENTER_BOTTOM,
+                input_port_label_position(position, side, zoom),
+                input_port_label_align(side),
                 label,
                 FontId::proportional((9.0 * zoom).clamp(7.0, 11.0)),
                 Color32::from_gray(200),
@@ -2025,7 +2190,7 @@ fn draw_node(
         );
     }
 
-    if is_viewer {
+    if let Some(label) = viewer_slot_label {
         painter.rect_stroke(
             rect.expand(4.0),
             radius,
@@ -2040,7 +2205,7 @@ fn draw_node(
         painter.text(
             tag.center(),
             Align2::CENTER_CENTER,
-            "VIEWER 1",
+            label,
             FontId::proportional((9.0 * zoom).clamp(7.0, 11.0)),
             Color32::from_rgb(30, 24, 8),
         );
@@ -2051,18 +2216,24 @@ fn draw_wire(
     painter: &Painter,
     from: Pos2,
     to: Pos2,
+    to_side: PortSide,
     zoom: f32,
     color: Color32,
     label: Option<&str>,
 ) {
-    let distance = (to.y - from.y).abs().max(40.0 * zoom);
+    let distance = match to_side {
+        PortSide::Top => (to.y - from.y).abs(),
+        PortSide::Left | PortSide::Right => (to.x - from.x).abs(),
+    }
+    .max(40.0 * zoom);
     let control = distance * 0.5;
-    let points = [
-        from,
-        from + Vec2::new(0.0, control),
-        to - Vec2::new(0.0, control),
-        to,
-    ];
+    let cp1 = from + Vec2::new(0.0, control);
+    let cp2 = match to_side {
+        PortSide::Top => to - Vec2::new(0.0, control),
+        PortSide::Left => to - Vec2::new(control, 0.0),
+        PortSide::Right => to + Vec2::new(control, 0.0),
+    };
+    let points = [from, cp1, cp2, to];
     painter.add(Shape::CubicBezier(CubicBezierShape::from_points_stroke(
         points,
         false,
@@ -2071,21 +2242,34 @@ fn draw_wire(
     )));
 
     let head = 6.0 * zoom.max(0.8);
-    let tip = to - Vec2::new(0.0, head * 0.5);
-    painter.add(Shape::convex_polygon(
-        vec![
-            tip,
-            tip + Vec2::new(-head * 0.6, -head),
-            tip + Vec2::new(head * 0.6, -head),
+    let arrow = match to_side {
+        PortSide::Top => vec![
+            to - Vec2::new(0.0, head * 0.5),
+            to + Vec2::new(-head * 0.6, -head * 1.5),
+            to + Vec2::new(head * 0.6, -head * 1.5),
         ],
-        color,
-        Stroke::NONE,
-    ));
+        PortSide::Left => vec![
+            to - Vec2::new(head * 0.5, 0.0),
+            to + Vec2::new(-head * 1.5, -head * 0.6),
+            to + Vec2::new(-head * 1.5, head * 0.6),
+        ],
+        PortSide::Right => vec![
+            to + Vec2::new(head * 0.5, 0.0),
+            to + Vec2::new(head * 1.5, -head * 0.6),
+            to + Vec2::new(head * 1.5, head * 0.6),
+        ],
+    };
+    painter.add(Shape::convex_polygon(arrow, color, Stroke::NONE));
 
     if let Some(label) = label {
+        let (anchor, align) = match to_side {
+            PortSide::Top => (to + Vec2::new(8.0, 2.0), Align2::LEFT_TOP),
+            PortSide::Left => (to - Vec2::new(8.0, 0.0), Align2::RIGHT_CENTER),
+            PortSide::Right => (to + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER),
+        };
         painter.text(
-            to + Vec2::new(8.0, 2.0),
-            Align2::LEFT_TOP,
+            anchor,
+            align,
             label,
             FontId::proportional((11.0 * zoom).clamp(9.0, 14.0)),
             color,
@@ -2433,13 +2617,18 @@ mod tests {
     }
 
     #[test]
-    fn input_ports_spread_across_the_node_top() {
+    fn input_ports_follow_side_aware_geometry() {
         let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(120.0, 72.0));
 
-        assert_eq!(input_port(rect, PortId(0), 1), Pos2::new(60.0, 0.0));
-        assert_eq!(input_port(rect, PortId(0), 2), Pos2::new(40.0, 0.0));
-        assert_eq!(input_port(rect, PortId(1), 2), Pos2::new(80.0, 0.0));
-        assert_eq!(input_port(rect, PortId(2), 3), Pos2::new(90.0, 0.0));
+        assert_eq!(input_port(rect, "Blur", 1, PortId(0)), rect.center_top());
+        assert_eq!(input_port(rect, "Grade", 2, PortId(0)), rect.center_top());
+        assert_eq!(input_port(rect, "Grade", 2, PortId(1)), rect.right_center());
+        assert_eq!(input_port(rect, "Merge2", 3, PortId(0)), rect.center_top());
+        assert_eq!(input_port(rect, "Merge2", 3, PortId(1)), rect.left_center());
+        assert_eq!(
+            input_port(rect, "Merge2", 3, PortId(2)),
+            rect.right_center()
+        );
     }
 
     #[test]
@@ -2558,6 +2747,25 @@ mod tests {
         assert_ne!(input_port_label("Grade", 2, 1), "A");
 
         assert_eq!(input_port_label("Blur", 1, 0), "");
+    }
+
+    #[test]
+    fn pin_geometry_places_b_top_a_left_and_mask_right() {
+        assert_eq!(input_port_side("Merge2", 3, 0), PortSide::Top);
+        assert_eq!(input_port_side("Merge2", 3, 1), PortSide::Left);
+        assert_eq!(input_port_side("Merge2", 3, 2), PortSide::Right);
+        assert_eq!(input_port_side("Grade", 2, 0), PortSide::Top);
+        assert_eq!(input_port_side("Grade", 2, 1), PortSide::Right);
+
+        let rect = Rect::from_min_size(Pos2::new(100.0, 200.0), Vec2::new(NODE_W, NODE_H));
+        assert_eq!(input_port(rect, "Merge2", 3, PortId(0)), rect.center_top());
+        assert_eq!(input_port(rect, "Merge2", 3, PortId(1)), rect.left_center());
+        assert_eq!(
+            input_port(rect, "Merge2", 3, PortId(2)),
+            rect.right_center()
+        );
+        assert_eq!(input_port(rect, "Grade", 2, PortId(0)), rect.center_top());
+        assert_eq!(input_port(rect, "Grade", 2, PortId(1)), rect.right_center());
     }
 
     #[test]
