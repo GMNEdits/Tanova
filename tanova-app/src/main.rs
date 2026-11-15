@@ -20,7 +20,8 @@ use tanova_kernel::{
 use tanova_parse::load_nk_into_dag;
 use tanova_render::{GpuComputeEngine, Raster2D};
 use tanova_ui::{
-    GraphMirror, NodeCanvas, NodeCanvasState, PropertiesPanel, ViewerPanel, ViewerWorkflow,
+    GraphMirror, NodeCanvas, NodeCanvasState, PropertiesPanel, StudioTheme, ViewerPanel,
+    ViewerWorkflow, apply_theme_visuals,
 };
 
 /// Errors crossing the app boundary (eframe requires `Send + Sync`).
@@ -946,6 +947,10 @@ impl TanovaApp {
     fn draw(&mut self, ui: &mut egui::Ui) {
         self.pump();
 
+        // Apply studio theme visuals to the egui context (cache-safe: only
+        // updates when panel_fill actually changes).
+        apply_theme_visuals(ui.ctx(), self.canvas.theme);
+
         // Bridge Ctrl+V into egui::Event::Paste for focused text inputs
         // (the file modal's `File:` field) on backends that don't emit it
         // automatically. On the plain canvas we do not inject `Event::Paste`:
@@ -1050,6 +1055,15 @@ impl TanovaApp {
                 ui.selectable_value(&mut next_workflow, ViewerWorkflow::Fusion, "Fusion Target");
                 if next_workflow != self.workflow {
                     self.set_workflow(next_workflow);
+                }
+                ui.separator();
+                ui.label("Theme:");
+                let mut next_theme = self.canvas.theme;
+                ui.selectable_value(&mut next_theme, StudioTheme::Nuke, "Nuke");
+                ui.selectable_value(&mut next_theme, StudioTheme::Natron, "Natron");
+                ui.selectable_value(&mut next_theme, StudioTheme::Fusion, "Fusion");
+                if next_theme != self.canvas.theme {
+                    self.canvas.theme = next_theme;
                 }
             });
         });
@@ -5196,6 +5210,67 @@ mod tests {
             Some(&KnobValue::Int(256)),
             "Constant must inherit the 256-high project format"
         );
+
+        app.kernel.shutdown();
+    }
+
+    /// Theme persists across script reset and preserves pin geometry.
+    #[test]
+    fn theme_persists_across_script_reset_and_preserves_pin_geometry() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        // Default theme is Nuke.
+        assert_eq!(app.canvas.theme, StudioTheme::Nuke);
+
+        // Switch to Fusion before script reset.
+        app.canvas.theme = StudioTheme::Fusion;
+
+        // Reset script - theme must persist (reset_for_script must not touch it).
+        app.execute_new_script();
+        assert_eq!(app.canvas.theme, StudioTheme::Fusion);
+
+        // Add a Merge2 node after reset.
+        app.graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(10),
+            kind: "Merge2".to_string(),
+            x: 200.0,
+            y: 200.0,
+        });
+
+        let merge2_x = app.graph.node(NodeId(10)).unwrap().x;
+        let merge2_y = app.graph.node(NodeId(10)).unwrap().y;
+
+        // Pin geometry (input_port_side) is theme-independent.
+        assert_eq!(
+            tanova_ui::input_port_side("Merge2", 3, 0),
+            tanova_ui::PortSide::Top
+        );
+        assert_eq!(
+            tanova_ui::input_port_side("Merge2", 3, 1),
+            tanova_ui::PortSide::Left
+        );
+        assert_eq!(
+            tanova_ui::input_port_side("Merge2", 3, 2),
+            tanova_ui::PortSide::Right
+        );
+
+        // Render a frame in each theme; node positions must be identical.
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        for theme in [StudioTheme::Nuke, StudioTheme::Natron, StudioTheme::Fusion] {
+            app.canvas.theme = theme;
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            app.pump();
+
+            let node = app.graph.node(NodeId(10)).expect("Merge2 #10 must exist");
+            assert_eq!(node.x, merge2_x, "{theme:?}: Merge2 x must be preserved");
+            assert_eq!(node.y, merge2_y, "{theme:?}: Merge2 y must be preserved");
+        }
 
         app.kernel.shutdown();
     }

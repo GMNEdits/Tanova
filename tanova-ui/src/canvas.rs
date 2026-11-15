@@ -15,11 +15,11 @@ use tanova_kernel::{
     UndoableCommand, find_cartridge,
 };
 
+use crate::theme::{StudioTheme, ThemePalette, node_category, palette};
 use crate::workflow::ViewerWorkflow;
 
 const NODE_W: f32 = 168.0;
 const NODE_H: f32 = 72.0;
-const HEADER_H: f32 = 24.0;
 const PORT_LEAD: f32 = 18.0;
 const GRID_SPACING: f32 = 24.0;
 const MIN_ZOOM: f32 = 0.25;
@@ -39,23 +39,9 @@ const CONTEXT_MENU_KINDS: &[&str] = &[
     "Viewer",
 ];
 
-const BG: Color32 = Color32::from_rgb(20, 20, 24);
-const GRID_MINOR: Color32 = Color32::from_rgb(32, 32, 38);
-const GRID_MAJOR: Color32 = Color32::from_rgb(44, 44, 52);
-const WIRE: Color32 = Color32::from_rgb(196, 178, 82);
 const WIRE_ACTIVE: Color32 = Color32::from_rgb(245, 220, 120);
-const NODE_BORDER: Color32 = Color32::from_rgb(110, 110, 125);
-const NODE_FILL: Color32 = Color32::from_rgb(44, 44, 50);
-const NODE_HEADER: Color32 = Color32::from_rgb(64, 64, 74);
-const CRASH_BORDER: Color32 = Color32::from_rgb(230, 70, 70);
-const CRASH_FILL: Color32 = Color32::from_rgb(58, 22, 24);
-const CRASH_HEADER: Color32 = Color32::from_rgb(92, 30, 34);
-/// Muted card colours for a bypassed node.
-const DISABLED_FILL: Color32 = Color32::from_rgb(30, 31, 35);
-const DISABLED_HEADER: Color32 = Color32::from_rgb(44, 45, 50);
 /// The bold red `X` drawn across a bypassed node.
 const BYPASS_X: Color32 = Color32::from_rgb(230, 95, 70);
-const SELECTED: Color32 = Color32::from_rgb(90, 190, 255);
 const VIEWER: Color32 = Color32::from_rgb(255, 190, 40);
 
 /// One node as the UI knows it.
@@ -520,6 +506,8 @@ pub struct NodeCanvasState {
     node_menu_pos: Option<Pos2>,
     node_menu_node: Option<NodeId>,
     node_menu_open: bool,
+    /// Active studio theme for card colors, canvas background, pins, and wires.
+    pub theme: StudioTheme,
 }
 
 impl Default for NodeCanvasState {
@@ -547,6 +535,7 @@ impl Default for NodeCanvasState {
             node_menu_pos: None,
             node_menu_node: None,
             node_menu_open: false,
+            theme: StudioTheme::Nuke,
         }
     }
 }
@@ -1448,7 +1437,9 @@ impl NodeCanvas {
             }
         }
 
-        draw_grid(&painter, rect, state.pan, state.zoom);
+        let pal = palette(state.theme);
+
+        draw_grid(&painter, rect, state.pan, state.zoom, &pal);
 
         // A detaching wire hides its committed edge until release.
         let detached = match state.active_wire_drag {
@@ -1479,7 +1470,12 @@ impl NodeCanvas {
             let side = input_port_side(&to_node.kind, port_count, edge.to_port.0 as usize);
             let label = input_port_label(&to_node.kind, port_count, edge.to_port.0 as usize);
             let label = if label.is_empty() { None } else { Some(label) };
-            draw_wire(&painter, from, to, side, state.zoom, WIRE, label);
+            let wire_color = match side {
+                PortSide::Top => pal.wire_default,
+                PortSide::Left => pal.pin_a,
+                PortSide::Right => pal.pin_m,
+            };
+            draw_wire(&painter, from, to, side, state.zoom, wire_color, label);
         }
 
         for node in graph.nodes() {
@@ -1512,13 +1508,19 @@ impl NodeCanvas {
                 state.selected_nodes.contains(&node.id),
                 viewer_slot_label,
                 state.zoom,
+                &pal,
                 active_port,
             );
         }
 
         if let Some(pointer) = pointer_pos {
             if let Some((from, to, side)) = live_wire_points(state, graph, rect, pointer) {
-                draw_wire(&painter, from, to, side, state.zoom, WIRE_ACTIVE, None);
+                let wire_color = match side {
+                    PortSide::Top => pal.wire_default,
+                    PortSide::Left => pal.pin_a,
+                    PortSide::Right => pal.pin_m,
+                };
+                draw_wire(&painter, from, to, side, state.zoom, wire_color, None);
             }
         }
 
@@ -2173,41 +2175,47 @@ pub fn input_port_label(kind: &str, input_count: usize, port_index: usize) -> &'
     }
 }
 
-fn draw_grid(painter: &Painter, rect: Rect, pan: Vec2, zoom: f32) {
-    painter.rect_filled(rect, 0.0, BG);
+fn draw_grid(painter: &Painter, rect: Rect, pan: Vec2, zoom: f32, pal: &ThemePalette) {
+    painter.rect_filled(rect, 0.0, pal.canvas_bg);
 
-    let mut spacing = GRID_SPACING * zoom;
-    while spacing < 12.0 {
-        spacing *= 2.0;
-    }
+    let spacing = (GRID_SPACING * zoom).max(18.0);
     let origin = rect.min + pan;
 
-    let first_x = ((rect.left() - origin.x) / spacing).floor() as i64;
-    let last_x = ((rect.right() - origin.x) / spacing).ceil() as i64;
-    for index in first_x..=last_x {
-        let x = origin.x + index as f32 * spacing;
-        let major = index.rem_euclid(5) == 0;
-        painter.line_segment(
-            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            Stroke::new(
-                if major { 1.0 } else { 0.5 },
-                if major { GRID_MAJOR } else { GRID_MINOR },
-            ),
-        );
-    }
+    if pal.use_dot_grid {
+        // Fusion: dot grid at intersections.
+        let first_x = ((rect.left() - origin.x) / spacing).floor() as i64;
+        let last_x = ((rect.right() - origin.x) / spacing).ceil() as i64;
+        let first_y = ((rect.top() - origin.y) / spacing).floor() as i64;
+        let last_y = ((rect.bottom() - origin.y) / spacing).ceil() as i64;
+        for x in first_x..=last_x {
+            for y in first_y..=last_y {
+                let pos = Pos2::new(origin.x + x as f32 * spacing, origin.y + y as f32 * spacing);
+                if rect.contains(pos) {
+                    painter.circle_filled(pos, 1.5, pal.grid_line);
+                }
+            }
+        }
+    } else {
+        // Nuke / Natron: line grid.
+        let first_x = ((rect.left() - origin.x) / spacing).floor() as i64;
+        let last_x = ((rect.right() - origin.x) / spacing).ceil() as i64;
+        for index in first_x..=last_x {
+            let x = origin.x + index as f32 * spacing;
+            painter.line_segment(
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                Stroke::new(1.0, pal.grid_line),
+            );
+        }
 
-    let first_y = ((rect.top() - origin.y) / spacing).floor() as i64;
-    let last_y = ((rect.bottom() - origin.y) / spacing).ceil() as i64;
-    for index in first_y..=last_y {
-        let y = origin.y + index as f32 * spacing;
-        let major = index.rem_euclid(5) == 0;
-        painter.line_segment(
-            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-            Stroke::new(
-                if major { 1.0 } else { 0.5 },
-                if major { GRID_MAJOR } else { GRID_MINOR },
-            ),
-        );
+        let first_y = ((rect.top() - origin.y) / spacing).floor() as i64;
+        let last_y = ((rect.bottom() - origin.y) / spacing).ceil() as i64;
+        for index in first_y..=last_y {
+            let y = origin.y + index as f32 * spacing;
+            painter.line_segment(
+                [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                Stroke::new(1.0, pal.grid_line),
+            );
+        }
     }
 }
 
@@ -2219,28 +2227,59 @@ fn draw_node(
     selected: bool,
     viewer_slot_label: Option<&'static str>,
     zoom: f32,
+    pal: &ThemePalette,
     active_port: Option<PortId>,
 ) {
     let crashed = node.crashed.is_some();
     let disabled = node.disabled;
-    let (fill, header, border) = if crashed {
-        (CRASH_FILL, CRASH_HEADER, CRASH_BORDER)
-    } else if disabled {
-        (DISABLED_FILL, DISABLED_HEADER, NODE_BORDER)
-    } else {
-        (NODE_FILL, NODE_HEADER, NODE_BORDER)
-    };
-    // Bypassed nodes read as "muted" so the eye skips them.
-    let text_tint = if disabled {
-        Color32::from_gray(150)
-    } else {
-        Color32::from_gray(235)
-    };
-    let radius = CornerRadius::same((4.0 * zoom).clamp(1.0, 8.0) as u8);
+    let cat = node_category(&node.kind);
 
-    painter.rect_filled(rect, radius, fill);
-    let header_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), HEADER_H * zoom));
-    painter.rect_filled(header_rect, radius, header);
+    // Scaled corner radius, clamped to stay sensible at extreme zoom levels.
+    let r = (pal.card_corner_radius as f32 * zoom)
+        .round()
+        .clamp(1.0, 12.0) as u8;
+    let full_rounding = CornerRadius::same(r);
+    let top_only_rounding = CornerRadius {
+        nw: r,
+        ne: r,
+        sw: 0,
+        se: 0,
+    };
+
+    // Body fill: dark crimson when crashed, dimmed when bypassed.
+    let body_fill = if crashed {
+        Color32::from_rgb(58, 22, 24)
+    } else if disabled {
+        pal.card_body_bg.linear_multiply(0.7)
+    } else {
+        pal.card_body_bg
+    };
+
+    // 1. Drop shadow behind the card.
+    painter.rect_filled(
+        rect.translate(Vec2::new(3.0 * zoom, 4.0 * zoom)),
+        full_rounding,
+        pal.card_shadow,
+    );
+
+    // 2. Card base body.
+    painter.rect_filled(rect, full_rounding, body_fill);
+
+    // 3. Category header band: top-only rounding so the bottom edge sits flat.
+    let header_h = (rect.height() * 0.44).clamp(14.0 * zoom, 26.0 * zoom);
+    let header_rect = Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.min.y + header_h));
+
+    let header_color = if crashed {
+        Color32::from_rgb(230, 70, 70) // bright Airbag red
+    } else if disabled {
+        pal.category_color(cat).linear_multiply(0.7)
+    } else {
+        pal.category_color(cat)
+    };
+
+    painter.rect_filled(header_rect, top_only_rounding, header_color);
+
+    // 1 px dark separator along the header bottom edge.
     painter.line_segment(
         [
             Pos2::new(rect.left(), header_rect.bottom()),
@@ -2249,10 +2288,7 @@ fn draw_node(
         Stroke::new(1.0, Color32::from_black_alpha(90)),
     );
 
-    let output = output_port(rect, zoom);
-    let stub = Stroke::new((1.5 * zoom).max(0.6), border);
-
-    // Input ports: B (top), A (left), mask (right).
+    // Input ports: role-colored pins by PortSide.
     let count = input_port_count(&node.kind);
     let box_size = (9.0 * zoom).max(5.0);
     for port in 0..count {
@@ -2260,13 +2296,21 @@ fn draw_node(
         let side = input_port_side(&node.kind, count, port);
         let position = input_port(rect, &node.kind, count, port_id);
         let stem_tip = input_port_stem_tip(position, side, zoom);
+
+        let pin_color = match side {
+            PortSide::Top => pal.pin_b,
+            PortSide::Left => pal.pin_a,
+            PortSide::Right => pal.pin_m,
+        };
+
+        let stub = Stroke::new((1.5 * zoom).max(0.6), pin_color);
         painter.line_segment([stem_tip, position], stub);
         let active = active_port == Some(port_id);
         let port_rect = Rect::from_center_size(position, Vec2::splat(box_size));
         painter.rect_filled(
             port_rect,
             CornerRadius::same(1),
-            if active { WIRE_ACTIVE } else { border },
+            if active { WIRE_ACTIVE } else { pin_color },
         );
         let label = input_port_label(&node.kind, count, port);
         if !label.is_empty() {
@@ -2280,16 +2324,28 @@ fn draw_node(
         }
     }
 
+    // Output port at bottom center.
+    let output = output_port(rect, zoom);
+    let stub = Stroke::new((1.5 * zoom).max(0.6), pal.card_border);
     painter.line_segment([rect.center_bottom(), output], stub);
-    painter.circle_filled(output, (4.0 * zoom).max(2.5), border);
+    painter.circle_filled(output, (4.0 * zoom).max(2.5), pal.card_border);
 
+    // 5. Crisp shadowed typography: 1 px dark drop-shadow behind bright white kind text.
     let header_font = FontId::proportional((13.0 * zoom).clamp(9.0, 17.0));
+    let kind_pos = rect.left_top() + Vec2::new(8.0 * zoom, 4.0 * zoom);
     painter.text(
-        rect.left_top() + Vec2::new(8.0 * zoom, 4.0 * zoom),
+        kind_pos + Vec2::new(1.0, 1.0),
+        Align2::LEFT_TOP,
+        node.kind.as_str(),
+        header_font.clone(),
+        Color32::from_black_alpha(160),
+    );
+    painter.text(
+        kind_pos,
         Align2::LEFT_TOP,
         node.kind.as_str(),
         header_font,
-        text_tint,
+        Color32::WHITE,
     );
 
     let body_font = FontId::proportional((12.0 * zoom).clamp(9.0, 16.0));
@@ -2315,7 +2371,30 @@ fn draw_node(
         );
     }
 
-    painter.rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
+    // 4. Card border & active selection rim on `rect` with full_rounding.
+    let (border_color, border_width) = if crashed {
+        (Color32::from_rgb(230, 70, 70), 2.0)
+    } else if selected {
+        (pal.selected_rim, 2.0)
+    } else {
+        (pal.card_border, 1.0)
+    };
+    painter.rect_stroke(
+        rect,
+        full_rounding,
+        Stroke::new(border_width, border_color),
+        StrokeKind::Inside,
+    );
+
+    // Additional outside selection rim for high visibility.
+    if selected {
+        painter.rect_stroke(
+            rect.expand(2.0),
+            full_rounding,
+            Stroke::new(2.0, pal.selected_rim),
+            StrokeKind::Outside,
+        );
+    }
 
     // Nuke's bypass marker: a bold diagonal `X` across the whole card.
     if disabled {
@@ -2324,19 +2403,10 @@ fn draw_node(
         painter.line_segment([rect.left_bottom(), rect.right_top()], stroke);
     }
 
-    if selected {
-        painter.rect_stroke(
-            rect.expand(2.0),
-            radius,
-            Stroke::new(2.0, SELECTED),
-            StrokeKind::Outside,
-        );
-    }
-
     if let Some(label) = viewer_slot_label {
         painter.rect_stroke(
             rect.expand(4.0),
-            radius,
+            full_rounding,
             Stroke::new(2.0, VIEWER),
             StrokeKind::Outside,
         );

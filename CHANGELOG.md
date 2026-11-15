@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Automatic vertical B-pipe chaining: spawning a processor or combiner with a node selected emits an atomic `UndoableCommand::Batch` of `AddNode` + `ConnectEdge` at `y + 90.0`, nudging `x += 140.0` when branching, and advances selection so `G` -> `B` -> `T` builds a wired column in one undo step.
   - `GraphMirror` command application is idempotent: repeated `AddNode` events update `kind` / `x` / `y` in place while preserving knobs and project-format stamping, and `ConnectEdge` replaces the existing incoming edge on `(to_node, to_port)` instead of duplicating it.
   - `Tab` quick-search and context-menu spawns now share the `spawn_node_message` helper, and the canvas hint reads `R/W/C/G/B/T/M: add node | Tab: search | 1/2: view | D: bypass | F: frame`.
+- **Milestone 18 Part 1 — Studio Theme Engine & Node Category Colors (`tanova-ui`, `tanova-app`):**
+  - New `tanova-ui::theme` module with `StudioTheme` (`Nuke`, `Natron`, `Fusion`), `NodeCategory` (`Io`, `Color`, `Merge`, `Filter`, `Transform`, `Viewer`, `Other`), `ThemePalette`, `node_category()`, `palette()`, and cache-safe `apply_theme_visuals()`.
+  - Two-tone node cards: category-colored header band with top-only rounding, dark crimson crashed fill, dimmed disabled state, drop shadow, and `card_corner_radius` per theme (`2` Nuke, `3` Natron, `6` Fusion).
+  - Themed canvas background and grid: line grid for Nuke/Natron, dot grid for Fusion; spacing clamped to `.max(18.0)` at low zoom.
+  - Role-colored input pins (`pin_b` / `pin_a` / `pin_m` by `PortSide`) and matching wire colors (`wire_default` for top/B, `pin_a` for left/A, `pin_m` for right/mask).
+  - `NodeCanvasState.theme` persists across `execute_new_script()` / script reloads.
+  - Top-bar segmented theme selector: `Theme: [Nuke] [Natron] [Fusion]`.
 
 ### Changed
 

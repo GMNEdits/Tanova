@@ -6,6 +6,7 @@
 
 pub mod canvas;
 pub mod properties;
+pub mod theme;
 pub mod viewer;
 pub mod workflow;
 
@@ -15,5 +16,8 @@ pub use canvas::{
     viewer_message,
 };
 pub use properties::{FileBrowseRequest, PropertiesPanel};
+pub use theme::{
+    NodeCategory, StudioTheme, ThemePalette, apply_theme_visuals, node_category, palette,
+};
 pub use viewer::ViewerPanel;
 pub use workflow::ViewerWorkflow;
