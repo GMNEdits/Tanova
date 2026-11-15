@@ -5,6 +5,23 @@ All notable changes to Tanova are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Phase 6
+
+### Added
+
+- **Milestone 20 Part 1 — Bounded GreedyDual-Size DAG Cache (`tanova-kernel`):**
+  - Replaced the unbounded DAG RAM cache with a bounded, cost- and recency-aware GreedyDual-Size cache keyed by `OpHash` (`max_cache_entries` defaults to 64, `global_clock` drives recency).
+  - Cache entries track `cost_us` (evaluation time measured with `std::time::Instant` around `evaluate_with_airbag`, floored at 1 us) and `priority` (`global_clock + cost_us` on insert and on every hit).
+  - `Dag::pull` refreshes a hit entry's priority so actively scrubbed nodes stay hot; on insert, when the cache is full, the lowest-priority entry is evicted and `global_clock` advances to the victim's priority.
+  - New `Dag::set_max_cache_entries`, `Dag::cache_len`, and `Dag::clear_cache` (which also resets `global_clock`); `invalidate_downstream` behavior is unchanged.
+
+- **Milestone 20 Part 2 — Viewer Display Transforms & Channel Soloing (`tanova-render`, `tanova-ui`):**
+  - New `DisplayTransform` (`Linear`, `sRGB`, `Rec.709`, `ACES`) and `ViewerChannel` (`Rgba`, `R`, `G`, `B`, `A`) enums, re-exported from `tanova-render`.
+  - `Raster2D::to_top_left_rgba8_with_view` applies gain/gamma to RGB, the selected display transform (sRGB OETF, BT.709 OETF, or ACES filmic + sRGB), then channel soloing. `to_top_left_rgba8` and `to_top_left_rgba8_with_display` delegate with `Linear`/`Rgba` and remain byte-identical.
+  - `ViewerPanel` stores `pub display_transform` (default `Linear`) and `pub channel` (default `Rgba`); both are tracked in the texture dirty flag so changes upload immediately even while playback is paused.
+  - Viewer toolbar: channel solo buttons `[RGBA] [R] [G] [B] [A]` (highlighting the active channel) and a `Display transform` combo box (`Linear`, `sRGB`, `Rec.709`, `ACES`).
+  - Pointer-scoped `R`/`G`/`B`/`A` hotkeys toggle channel soloing only when the pointer is inside the viewer viewport and no widget owns the keyboard — never conflicting with canvas node spawning. `NodeCanvas::over_canvas` now requires the pointer over the canvas rect, so hovering the viewer never spawns a `Read`/`Grade`/`Blur` node.
+
 ## [v0.4.5] - 2026-11-16
 
 ### Added

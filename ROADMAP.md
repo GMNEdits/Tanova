@@ -70,6 +70,19 @@ Node Category Colors, High-Contrast Dark Theme + Studio Palettes (`Classic`, `Sl
 **Milestone 19: Graph Organization Cartridges & Canvas Containers (`Dot` Routing Elbows & `Backdrop` Boxes) (`tanova-kernel`, `tanova-parse`, `tanova-ui`, `tanova-app`)**
 Graph Organization Cartridges & Canvas Containers (`Dot` Routing Elbows & `Backdrop` Boxes)
 
+# TANOVA ROADMAP - PHASE 6: PRODUCTION COMPOSITING ENGINE
+
+*AI DIRECTIVE: Execute one milestone at a time. Do not skip or combine milestones.*
+
+**Milestone 20: Bounded GreedyDual-Size DAG Cache, Viewer Display Transforms & Channel Soloing**
+Bounded GreedyDual-Size DAG cache (cost- & recency-aware eviction), Viewer display transforms (`Linear`, `sRGB`, `Rec.709`, `ACES`) and `R`/`G`/`B`/`A` channel soloing, plus core color/alpha cartridges (`Premult`, `Unpremult`, `ColorCorrect`, `Invert`).
+
+**Milestone 21: Demand-Driven Input & Temporal Routing (`Switch`, `TimeOffset`, `FrameHold`) & Pipe Splicing on Drop**
+Nodes that selectively evaluate upstream inputs or shift evaluation time (`Switch`, `TimeOffset`, `FrameHold`), and pipe splicing that reconnects upstream/downstream wires when a node is dropped.
+
+**Milestone 22: Keyframe Animation Engine (`{curve ...}`), Animated Knob Indicators & Timeline Keyframe Ticks**
+Per-knob keyframe curves (`{curve ...}` syntax), animated knob value indicators in the properties bin, and keyframe ticks on the timeline playhead.
+
 ## Release & Tagging Policy
 
 - Every milestone/version tag must first record all Added, Changed, and Fixed items in `CHANGELOG.md`.

@@ -7,11 +7,11 @@
 use std::sync::Arc;
 
 use egui::{
-    Align, Align2, Color32, ColorImage, FontId, Layout, PointerButton, Pos2, Rect, Sense, Shape,
-    Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
+    Align, Align2, Color32, ColorImage, FontId, Key, Layout, Modifiers, PointerButton, Pos2, Rect,
+    Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
 };
 use tanova_kernel::{FrameNotification, KernelMessage, KnobValue, NodeId, Packet, UndoableCommand};
-use tanova_render::{BBox, Mat3x3, Raster2D};
+use tanova_render::{BBox, DisplayTransform, Mat3x3, Raster2D, ViewerChannel};
 
 use crate::canvas::GraphMirror;
 
@@ -71,6 +71,10 @@ pub struct ViewerPanel {
     pub pan: Vec2,
     /// Image zoom relative to the fitted size.
     pub zoom: f32,
+    /// Viewer display color transform (default `Linear`).
+    pub display_transform: DisplayTransform,
+    /// Viewer channel solo (`Rgba`, `R`, `G`, `B`, `A`; default `Rgba`).
+    pub channel: ViewerChannel,
     frame: Option<Arc<Packet>>,
     texture: Option<TextureHandle>,
     dirty: bool,
@@ -86,6 +90,8 @@ impl Default for ViewerPanel {
             gamma: 1.0,
             pan: Vec2::ZERO,
             zoom: 1.0,
+            display_transform: DisplayTransform::Linear,
+            channel: ViewerChannel::Rgba,
             frame: None,
             texture: None,
             dirty: true,
@@ -192,6 +198,31 @@ impl ViewerPanel {
         draw_checkerboard(&painter, rect);
 
         self.handle_navigation(ui, &response);
+
+        // Pointer-scoped channel soloing: plain `R`/`G`/`B`/`A` toggle a
+        // channel solo only while the pointer hovers the viewer viewport and
+        // no widget owns the keyboard. The pointer cannot be over the viewer
+        // and the canvas at the same time, so this never conflicts with the
+        // canvas `R` (Read), `G` (Grade) and `B` (Blur) spawning hotkeys.
+        let pointer_pos = ui.input(|input| input.pointer.hover_pos());
+        if let Some(pointer) = pointer_pos {
+            if rect.contains(pointer) && !ui.ctx().egui_wants_keyboard_input() {
+                let mut toggle_channel = |key: Key, channel: ViewerChannel| {
+                    if ui.input_mut(|input| input.consume_key(Modifiers::NONE, key)) {
+                        self.channel = if self.channel == channel {
+                            ViewerChannel::Rgba
+                        } else {
+                            channel
+                        };
+                        self.dirty = true;
+                    }
+                };
+                toggle_channel(Key::R, ViewerChannel::Red);
+                toggle_channel(Key::G, ViewerChannel::Green);
+                toggle_channel(Key::B, ViewerChannel::Blue);
+                toggle_channel(Key::A, ViewerChannel::Alpha);
+            }
+        }
 
         let frame = self.frame.clone();
         let Some(raster) = frame.as_ref().and_then(|packet| packet.get::<Raster2D>()) else {
@@ -332,6 +363,51 @@ impl ViewerPanel {
             if ui.button("Fit").clicked() {
                 self.zoom = 1.0;
                 self.pan = Vec2::ZERO;
+            }
+            ui.separator();
+
+            // Channel solo buttons: `[RGBA] [R] [G] [B] [A]`, highlighting
+            // the active channel. Clicking sets the channel; pressing the
+            // same pointer-scoped hotkey again returns to `[RGBA]`.
+            for (label, channel) in [
+                ("[RGBA]", ViewerChannel::Rgba),
+                ("[R]", ViewerChannel::Red),
+                ("[G]", ViewerChannel::Green),
+                ("[B]", ViewerChannel::Blue),
+                ("[A]", ViewerChannel::Alpha),
+            ] {
+                if ui
+                    .selectable_label(self.channel == channel, label)
+                    .clicked()
+                {
+                    self.channel = channel;
+                    self.dirty = true;
+                }
+            }
+            ui.separator();
+
+            // Display transform combo box.
+            let previous_transform = self.display_transform;
+            egui::ComboBox::from_label("Display transform").show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.display_transform,
+                    DisplayTransform::Linear,
+                    "Linear",
+                );
+                ui.selectable_value(&mut self.display_transform, DisplayTransform::Srgb, "sRGB");
+                ui.selectable_value(
+                    &mut self.display_transform,
+                    DisplayTransform::Rec709,
+                    "Rec.709",
+                );
+                ui.selectable_value(
+                    &mut self.display_transform,
+                    DisplayTransform::AcesTonemap,
+                    "ACES",
+                );
+            });
+            if self.display_transform != previous_transform {
+                self.dirty = true;
             }
         });
     }
@@ -576,8 +652,13 @@ impl ViewerPanel {
     fn upload(&mut self, ctx: &egui::Context, raster: &Raster2D) {
         let width = raster.format.width.max(1) as usize;
         let height = raster.format.height.max(1) as usize;
-        let bytes =
-            raster.to_top_left_rgba8_with_display(raster.format.to_bbox(), self.gain, self.gamma);
+        let bytes = raster.to_top_left_rgba8_with_view(
+            raster.format.to_bbox(),
+            self.gain,
+            self.gamma,
+            self.display_transform,
+            self.channel,
+        );
         let image = ColorImage::from_rgba_unmultiplied([width, height], &bytes);
 
         match &mut self.texture {
@@ -956,5 +1037,57 @@ mod tests {
             Some(Some(AxisConstraint::Y))
         );
         assert_eq!(jack_hit(anchor, anchor + Vec2::new(80.0, 80.0)), None);
+    }
+
+    #[test]
+    fn viewer_r_g_b_a_hotkeys_solo_and_toggle_back_when_hovered() {
+        let ctx = egui::Context::default();
+        let mut viewer = ViewerPanel::new();
+        let graph = GraphMirror::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0));
+        // Anywhere inside the viewer viewport rect allocated by `show`.
+        let pointer = Pos2::new(100.0, 100.0);
+
+        let key_event = |key: Key| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+
+        let run_frame = |viewer: &mut ViewerPanel, key: Key| {
+            ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerMoved(pointer), key_event(key)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            let _ = viewer.show(ui, &graph, None);
+                        });
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+        };
+
+        // Frame 1: pointer over the viewer, press `R` → solo red.
+        run_frame(&mut viewer, Key::R);
+        assert_eq!(viewer.channel, ViewerChannel::Red);
+
+        // Frame 2: press `R` again → back to RGBA.
+        run_frame(&mut viewer, Key::R);
+        assert_eq!(viewer.channel, ViewerChannel::Rgba);
+
+        // `G` and `B` solo while hovered; `A` solos alpha.
+        run_frame(&mut viewer, Key::G);
+        assert_eq!(viewer.channel, ViewerChannel::Green);
+        run_frame(&mut viewer, Key::B);
+        assert_eq!(viewer.channel, ViewerChannel::Blue);
+        run_frame(&mut viewer, Key::A);
+        assert_eq!(viewer.channel, ViewerChannel::Alpha);
     }
 }

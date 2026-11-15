@@ -951,7 +951,8 @@ impl NodeCanvas {
         let tab_just_pressed = tab_event || (tab_down && !state.was_tab_down);
         state.was_tab_down = tab_down;
 
-        let over_canvas = pointer_pos.is_none_or(|pointer| rect.contains(pointer));
+        let over_canvas =
+            pointer_pos.is_some_and(|pointer| rect.contains(pointer)) || pointer_pos.is_none();
         if tab_just_pressed && state.active_wire_drag.is_none() {
             if state.tab_search.is_some() {
                 state.tab_search = None;

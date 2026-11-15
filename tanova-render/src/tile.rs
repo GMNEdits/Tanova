@@ -281,6 +281,73 @@ pub struct Raster2D {
     pub channels: IndexMap<Channel, ChannelPlane>,
 }
 
+/// Viewer display transform applied to linear RGB before byte conversion.
+///
+/// `Linear` is the default and passes linear RGB through untouched, which
+/// keeps `to_top_left_rgba8` and `to_top_left_rgba8_with_display`
+/// byte-identical to their historical output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayTransform {
+    /// Pass linear RGB through directly.
+    #[default]
+    Linear,
+    /// IEC 61966-2-1 sRGB opto-electronic transfer function.
+    Srgb,
+    /// ITU-R BT.709 opto-electronic transfer function.
+    Rec709,
+    /// ACES filmic tone-mapping curve followed by sRGB encoding.
+    AcesTonemap,
+}
+
+/// Viewer channel soloing applied after the display transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewerChannel {
+    /// Full `[r, g, b, a]` with raw alpha.
+    #[default]
+    Rgba,
+    /// Display-transformed red channel as luminance, opaque alpha.
+    Red,
+    /// Display-transformed green channel as luminance, opaque alpha.
+    Green,
+    /// Display-transformed blue channel as luminance, opaque alpha.
+    Blue,
+    /// Raw alpha as luminance, opaque alpha (no gamma or curve on mattes).
+    Alpha,
+}
+
+/// Applies `DisplayTransform` to one linear channel value.
+fn apply_display_transform(value: f32, transform: DisplayTransform) -> f32 {
+    match transform {
+        DisplayTransform::Linear => value,
+        DisplayTransform::Srgb => srgb_oetf(value),
+        DisplayTransform::Rec709 => rec709_oetf(value),
+        DisplayTransform::AcesTonemap => srgb_oetf(aces_filmic(value)),
+    }
+}
+
+/// IEC 61966-2-1 sRGB opto-electronic transfer function (linear -> display).
+fn srgb_oetf(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// ITU-R BT.709 opto-electronic transfer function (linear -> display).
+fn rec709_oetf(c: f32) -> f32 {
+    if c < 0.018 {
+        4.5 * c
+    } else {
+        1.099 * c.powf(0.45) - 0.099
+    }
+}
+
+/// ACES filmic tone-mapping curve followed by sRGB encoding.
+fn aces_filmic(c: f32) -> f32 {
+    (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14)
+}
+
 impl Raster2D {
     /// Creates an empty raster.
     pub fn new(format: Format, bbox: BBox, edge_mode: EdgeMode) -> Self {
@@ -363,7 +430,13 @@ impl Raster2D {
     /// consumed by `egui` and `wgpu` uploads. A missing alpha channel is
     /// treated as fully opaque.
     pub fn to_top_left_rgba8(&self, display_bbox: BBox) -> Vec<u8> {
-        self.to_top_left_rgba8_with_display(display_bbox, 1.0, 1.0)
+        self.to_top_left_rgba8_with_view(
+            display_bbox,
+            1.0,
+            1.0,
+            DisplayTransform::Linear,
+            ViewerChannel::Rgba,
+        )
     }
 
     /// Converts to Top-Left `RGBA8` through the viewer's exposure and gamma.
@@ -377,6 +450,33 @@ impl Raster2D {
         gain: f32,
         gamma: f32,
     ) -> Vec<u8> {
+        self.to_top_left_rgba8_with_view(
+            display_bbox,
+            gain,
+            gamma,
+            DisplayTransform::Linear,
+            ViewerChannel::Rgba,
+        )
+    }
+
+    /// Converts to Top-Left `RGBA8` through gain, gamma, a display transform
+    /// and channel soloing.
+    ///
+    /// `gain` and viewer `gamma` (`val.powf(1.0 / gamma)` for `val > 0.0`)
+    /// apply to `R`, `G`, `B` before `transform` encodes the display color
+    /// space. `channel` solos one channel: `R`/`G`/`B` render the
+    /// display-transformed channel as luminance with an opaque alpha byte,
+    /// while `Alpha` renders raw alpha as luminance (`[a_u8, a_u8, a_u8,
+    /// 255]`) with no curve applied to alpha mattes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn to_top_left_rgba8_with_view(
+        &self,
+        display_bbox: BBox,
+        gain: f32,
+        gamma: f32,
+        transform: DisplayTransform,
+        channel: ViewerChannel,
+    ) -> Vec<u8> {
         let width = display_bbox.width().max(0) as usize;
         let height = display_bbox.height().max(0) as usize;
         let mut out = vec![0u8; width * height * 4];
@@ -385,13 +485,6 @@ impl Raster2D {
         }
 
         let has_alpha = self.channels.contains_key(&Channel::RgbaAlpha);
-        let display = |value: f32| {
-            let mut value = value * gain;
-            if value > 0.0 && gamma > 1e-6 {
-                value = value.powf(1.0 / gamma);
-            }
-            to_unorm8(value)
-        };
 
         for row in 0..height {
             let y = display_bbox.max_y - 1 - row as i32;
@@ -399,14 +492,51 @@ impl Raster2D {
                 let x = display_bbox.min_x + col as i32;
                 let index = (row * width + col) * 4;
 
-                out[index] = display(self.sample(&Channel::RgbaRed, x, y));
-                out[index + 1] = display(self.sample(&Channel::RgbaGreen, x, y));
-                out[index + 2] = display(self.sample(&Channel::RgbaBlue, x, y));
-                out[index + 3] = if has_alpha {
-                    to_unorm8(self.sample(&Channel::RgbaAlpha, x, y))
+                let mut r = self.sample(&Channel::RgbaRed, x, y) * gain;
+                let mut g = self.sample(&Channel::RgbaGreen, x, y) * gain;
+                let mut b = self.sample(&Channel::RgbaBlue, x, y) * gain;
+                if gamma > 1e-6 {
+                    if r > 0.0 {
+                        r = r.powf(1.0 / gamma);
+                    }
+                    if g > 0.0 {
+                        g = g.powf(1.0 / gamma);
+                    }
+                    if b > 0.0 {
+                        b = b.powf(1.0 / gamma);
+                    }
+                }
+                r = apply_display_transform(r, transform);
+                g = apply_display_transform(g, transform);
+                b = apply_display_transform(b, transform);
+
+                let a = if has_alpha {
+                    self.sample(&Channel::RgbaAlpha, x, y)
                 } else {
-                    255
+                    1.0
                 };
+                let a_u8 = to_unorm8(a);
+
+                let bytes = match channel {
+                    ViewerChannel::Rgba => [to_unorm8(r), to_unorm8(g), to_unorm8(b), a_u8],
+                    ViewerChannel::Red => {
+                        let v = to_unorm8(r);
+                        [v, v, v, 255]
+                    }
+                    ViewerChannel::Green => {
+                        let v = to_unorm8(g);
+                        [v, v, v, 255]
+                    }
+                    ViewerChannel::Blue => {
+                        let v = to_unorm8(b);
+                        [v, v, v, 255]
+                    }
+                    ViewerChannel::Alpha => [a_u8, a_u8, a_u8, 255],
+                };
+                out[index] = bytes[0];
+                out[index + 1] = bytes[1];
+                out[index + 2] = bytes[2];
+                out[index + 3] = bytes[3];
             }
         }
 
@@ -690,5 +820,79 @@ mod tests {
             .set_pixel(Channel::RgbaRed, 1, 1, 0.7, None)
             .unwrap();
         assert_eq!(no_alpha.sample_rgba(1, 1)[3], 1.0);
+    }
+
+    #[test]
+    fn display_transforms_and_channel_soloing_produce_expected_rgba8() {
+        let bbox = BBox::new(0, 0, 1, 1);
+        let mut raster = Raster2D::new(Format::new("1x1", 1, 1, 1.0), bbox, EdgeMode::BlackOutside);
+        raster
+            .set_pixel(Channel::RgbaRed, 0, 0, 0.214, None)
+            .unwrap();
+        raster
+            .set_pixel(Channel::RgbaAlpha, 0, 0, 0.5, None)
+            .unwrap();
+
+        // The legacy entry points delegate to the view form with
+        // `Linear` / `Rgba`, so output stays byte-identical.
+        let legacy = raster.to_top_left_rgba8(bbox);
+        let direct = raster.to_top_left_rgba8_with_view(
+            bbox,
+            1.0,
+            1.0,
+            DisplayTransform::Linear,
+            ViewerChannel::Rgba,
+        );
+        let exposed = raster.to_top_left_rgba8_with_display(bbox, 1.0, 1.0);
+        assert_eq!(legacy, direct);
+        assert_eq!(legacy, exposed);
+        assert_eq!(&legacy[0..4], &[55, 0, 0, 128]);
+
+        // sRGB OETF maps 0.214 linear to mid-gray (~128).
+        let srgb = raster.to_top_left_rgba8_with_view(
+            bbox,
+            1.0,
+            1.0,
+            DisplayTransform::Srgb,
+            ViewerChannel::Rgba,
+        );
+        assert!(
+            (srgb[0] as i32 - 128).abs() <= 2,
+            "srgb(0.214) = {}",
+            srgb[0]
+        );
+
+        // ACES tonemap compresses HDR 5.0 into display range without clipping.
+        let mut hdr = Raster2D::new(Format::new("1x1", 1, 1, 1.0), bbox, EdgeMode::BlackOutside);
+        hdr.set_pixel(Channel::RgbaRed, 0, 0, 5.0, None).unwrap();
+        let aces = hdr.to_top_left_rgba8_with_view(
+            bbox,
+            1.0,
+            1.0,
+            DisplayTransform::AcesTonemap,
+            ViewerChannel::Rgba,
+        );
+        assert!(aces[0] < 255, "ACES must not clip HDR 5.0 to white");
+        assert!(aces[0] > 240, "ACES should map HDR 5.0 near display white");
+
+        // Channel soloing: red renders luminance with opaque alpha.
+        let red = raster.to_top_left_rgba8_with_view(
+            bbox,
+            1.0,
+            1.0,
+            DisplayTransform::Linear,
+            ViewerChannel::Red,
+        );
+        assert_eq!(&red[0..4], &[55, 55, 55, 255]);
+
+        // Alpha solo renders raw alpha as luminance; no curve is applied.
+        let alpha = raster.to_top_left_rgba8_with_view(
+            bbox,
+            1.0,
+            1.0,
+            DisplayTransform::Srgb,
+            ViewerChannel::Alpha,
+        );
+        assert_eq!(&alpha[0..4], &[128, 128, 128, 255]);
     }
 }

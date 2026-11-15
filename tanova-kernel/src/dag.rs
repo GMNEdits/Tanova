@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use indexmap::IndexMap;
 
@@ -265,32 +266,60 @@ impl Default for RamCache {
     }
 }
 
+/// One cache entry for the bounded GreedyDual-Size packet cache.
+///
+/// `priority` orders entries for eviction: the lowest-priority entry is the
+/// victim when the cache is full. A cache hit refreshes `priority` to
+/// `global_clock + cost_us`, so actively scrubbed nodes stay hot, while
+/// expensive entries (high `cost_us`) are inherently harder to evict than
+/// cheap ones.
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    /// The cached packet.
+    pub packet: Arc<Packet>,
+    /// Measured evaluation cost in microseconds (floored at 1).
+    pub cost_us: u64,
+    /// `global_clock + cost_us` at insert or last hit time.
+    pub priority: f64,
+}
+
 /// The kernel's graph: nodes, edges, and the packet cache.
 #[derive(Debug)]
 pub struct Dag {
     nodes: IndexMap<NodeId, DagNode>,
     edges: Vec<Edge>,
-    cache: RamCache,
+    cache: HashMap<OpHash, CacheEntry>,
     /// Most recent op hash per node, used for targeted cache invalidation.
     node_hashes: HashMap<NodeId, OpHash>,
     /// Active project format, stamped onto source cartridges when they spawn.
     project_format: Option<ProjectFormat>,
+    /// Maximum number of cached packets (0 disables caching entirely).
+    pub max_cache_entries: usize,
+    /// Monotonic recency clock, advanced to evicted priorities on eviction.
+    pub global_clock: f64,
 }
 
 impl Dag {
+    /// Default number of cached packets kept by [`Dag::new`].
+    pub const DEFAULT_MAX_CACHE_ENTRIES: usize = 64;
+
     /// Creates an empty graph with the default cache capacity.
     pub fn new() -> Self {
-        Self::with_cache_capacity(RamCache::DEFAULT_CAPACITY)
+        Self::with_cache_capacity(Self::DEFAULT_MAX_CACHE_ENTRIES)
     }
 
     /// Creates an empty graph with a specific cache capacity.
+    ///
+    /// A capacity of zero disables caching entirely.
     pub fn with_cache_capacity(capacity: usize) -> Self {
         Self {
             nodes: IndexMap::new(),
             edges: Vec::new(),
-            cache: RamCache::new(capacity),
+            cache: HashMap::new(),
             node_hashes: HashMap::new(),
             project_format: None,
+            max_cache_entries: capacity,
+            global_clock: 0.0,
         }
     }
 
@@ -350,13 +379,38 @@ impl Dag {
     }
 
     /// Borrows the packet cache.
-    pub fn cache(&self) -> &RamCache {
+    pub fn cache(&self) -> &HashMap<OpHash, CacheEntry> {
         &self.cache
     }
 
     /// Mutably borrows the packet cache.
-    pub fn cache_mut(&mut self) -> &mut RamCache {
+    pub fn cache_mut(&mut self) -> &mut HashMap<OpHash, CacheEntry> {
         &mut self.cache
+    }
+
+    /// Maximum number of cached packets (0 disables caching entirely).
+    pub fn max_cache_entries(&self) -> usize {
+        self.max_cache_entries
+    }
+
+    /// Sets the maximum number of cached packets.
+    ///
+    /// A capacity of zero disables caching entirely. Lowering the capacity
+    /// below the current entry count does not evict immediately; the next
+    /// insertion triggers GreedyDual-Size eviction.
+    pub fn set_max_cache_entries(&mut self, max: usize) {
+        self.max_cache_entries = max;
+    }
+
+    /// Number of packets currently in the cache.
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Clears the cache and resets the recency clock.
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+        self.global_clock = 0.0;
     }
 
     /// Removes cached packets for `node_id` and every node downstream of it
@@ -1010,9 +1064,11 @@ impl Dag {
 
         let hash = self.compute_op_hash(id, ctx)?;
         self.node_hashes.insert(id, hash);
-        if let Some(cached) = self.cache.get(&hash) {
+        // Cache hit: refresh priority so actively scrubbed nodes stay hot.
+        if let Some(entry) = self.cache.get_mut(&hash) {
+            entry.priority = self.global_clock + (entry.cost_us as f64);
             visiting.remove(&id);
-            return Ok(cached);
+            return Ok(entry.packet.clone());
         }
 
         // A bypassed node is a pure wire: it never runs its cartridge, so it
@@ -1051,6 +1107,10 @@ impl Dag {
             inputs[edge.to_port.0 as usize] = (*packet).clone();
         }
 
+        // Time the cartridge evaluation so the cache can keep expensive
+        // entries alive longer than cheap ones (GreedyDual-Size: evict the
+        // least valuable entry, where value ~ cost * recency).
+        let start = Instant::now();
         let evaluated = if disabled {
             Ok(inputs.first().cloned().unwrap_or_default())
         } else {
@@ -1070,6 +1130,7 @@ impl Dag {
                 None => Err(NodeError::NoImplementation(id.0)),
             }
         };
+        let cost_us = start.elapsed().as_micros().max(1) as u64;
 
         if !epoch.is_current(target_epoch) {
             visiting.remove(&id);
@@ -1094,7 +1155,33 @@ impl Dag {
             }
         };
 
-        self.cache.insert(hash, Arc::clone(&packet));
+        // GreedyDual-Size admission: when the cache is full, evict the entry
+        // with the lowest priority and advance the recency clock to the
+        // victim's priority before inserting. Entries are never evicted on a
+        // hit; hits only refresh priority. A capacity of zero disables
+        // caching entirely.
+        if self.max_cache_entries > 0 {
+            if self.cache.len() >= self.max_cache_entries && !self.cache.contains_key(&hash) {
+                let victim = self
+                    .cache
+                    .iter()
+                    .min_by(|(_, a), (_, b)| a.priority.total_cmp(&b.priority))
+                    .map(|(hash, entry)| (*hash, entry.priority));
+                if let Some((victim_hash, victim_priority)) = victim {
+                    self.global_clock = victim_priority;
+                    self.cache.remove(&victim_hash);
+                }
+            }
+            self.cache.insert(
+                hash,
+                CacheEntry {
+                    packet: Arc::clone(&packet),
+                    cost_us,
+                    priority: self.global_clock + (cost_us as f64),
+                },
+            );
+        }
+
         visiting.remove(&id);
         Ok(packet)
     }
@@ -2242,5 +2329,94 @@ mod tests {
             other => panic!("expected SetKnob, got {other:?}"),
         }
         assert!(stack.can_undo(), "second undo step should remain");
+    }
+
+    #[test]
+    fn greedy_dual_size_cache_evicts_cheap_entries_before_expensive_ones() {
+        /// Cartridge that sleeps so its measured evaluation cost is high.
+        struct ExpensiveNode;
+
+        impl NodeTrait for ExpensiveNode {
+            fn evaluate(
+                &self,
+                _ctx: &EvalContext,
+                _inputs: &[Packet],
+            ) -> Result<Packet, NodeError> {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                let mut packet = Packet::new();
+                packet.insert(42u32);
+                Ok(packet)
+            }
+
+            fn serialize_to_tcl(&self) -> String {
+                "ExpensiveNode {}".to_string()
+            }
+        }
+
+        /// Instant cartridge that echoes its tag into the packet.
+        struct CheapNode(u32);
+
+        impl NodeTrait for CheapNode {
+            fn evaluate(
+                &self,
+                _ctx: &EvalContext,
+                _inputs: &[Packet],
+            ) -> Result<Packet, NodeError> {
+                let mut packet = Packet::new();
+                packet.insert(self.0);
+                Ok(packet)
+            }
+
+            fn serialize_to_tcl(&self) -> String {
+                "CheapNode {}".to_string()
+            }
+        }
+
+        let mut dag = Dag::new();
+        dag.set_max_cache_entries(2);
+        dag.add_node_with_implementation(NodeId(1), "Expensive", Arc::new(ExpensiveNode))
+            .unwrap();
+        dag.add_node_with_implementation(NodeId(2), "CheapA", Arc::new(CheapNode(1)))
+            .unwrap();
+        dag.add_node_with_implementation(NodeId(3), "CheapB", Arc::new(CheapNode(2)))
+            .unwrap();
+
+        let ctx = EvalContext::new();
+        let governor = MemoryGovernor::new(usize::MAX);
+        let epoch = RenderEpoch::new();
+        let target_epoch = epoch.bump();
+
+        // Populate the cache: one expensive entry (~5 ms) plus two cheap ones.
+        dag.evaluate_pull(NodeId(1), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+        dag.evaluate_pull(NodeId(2), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+        dag.evaluate_pull(NodeId(3), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+
+        assert_eq!(
+            dag.cache_len(),
+            2,
+            "the bounded cache holds at most 2 entries"
+        );
+
+        // The cheap entry inserted second must have been evicted first:
+        // GreedyDual-Size always picks the lowest-priority (cheapest) entry.
+        let cheap_a_hash = dag.compute_op_hash(NodeId(2), &ctx).unwrap();
+        assert!(
+            !dag.cache().contains_key(&cheap_a_hash),
+            "cheap entry should be evicted before the expensive one"
+        );
+
+        // The expensive entry survives and is served from cache on re-pull.
+        let expensive_hash = dag.compute_op_hash(NodeId(1), &ctx).unwrap();
+        assert!(
+            dag.cache().contains_key(&expensive_hash),
+            "expensive entry must remain cached"
+        );
+        let packet = dag
+            .evaluate_pull(NodeId(1), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+        assert_eq!(packet.get::<u32>(), Some(&42));
     }
 }

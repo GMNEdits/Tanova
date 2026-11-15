@@ -27,4 +27,7 @@ pub use shader::{
     BlurParams, DISPATCH_SIZE, EvalContextGpu, GpuComputeEngine, GradeParams, MergeParams,
     TransformParams, WORKGROUP_SIZE,
 };
-pub use tile::{Channel, ChannelPlane, Raster2D, TILE_BYTES, TileBuffer, extract_padded_tile};
+pub use tile::{
+    Channel, ChannelPlane, DisplayTransform, Raster2D, TILE_BYTES, TileBuffer, ViewerChannel,
+    extract_padded_tile,
+};
