@@ -11,7 +11,8 @@ pub mod workflow;
 
 pub use canvas::{
     CanvasEdge, CanvasNode, GraphMirror, NodeCanvas, NodeCanvasState, PortSide, WireDrag,
-    input_port_side, nuke_workflow_binding_message, viewer_message,
+    input_port_side, nuke_key_to_node_kind, nuke_workflow_binding_message, spawn_node_message,
+    viewer_message,
 };
 pub use properties::{FileBrowseRequest, PropertiesPanel};
 pub use viewer::ViewerPanel;

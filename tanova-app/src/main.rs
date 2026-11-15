@@ -1111,7 +1111,11 @@ impl TanovaApp {
                     self.workflow,
                     modal_open,
                 );
-                self.dispatch(messages);
+                // A modal owns the keyboard. Drop canvas shortcut messages so a
+                // key pressed while the dialog is open cannot spawn a node.
+                if !modal_open {
+                    self.dispatch(messages);
+                }
             });
 
         // File browser modal (Open / Save As).
@@ -4950,6 +4954,248 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+
+        app.kernel.shutdown();
+    }
+
+    /// Sends one plain key press to the live canvas, with the pointer parked
+    /// over the canvas so the single-key spawn guard passes.
+    fn press_canvas_key(
+        app: &mut TanovaApp,
+        ctx: &egui::Context,
+        screen: Rect,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) {
+        // A layout frame first so `last_canvas_rect` is populated.
+        run_app_frame(ctx, app, screen, vec![]);
+        let canvas_rect = app
+            .canvas
+            .last_canvas_rect
+            .expect("the canvas must have been laid out");
+        let pointer = canvas_rect.center();
+        run_app_frame(
+            ctx,
+            app,
+            screen,
+            vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ],
+        );
+    }
+
+    /// `G` -> `B` -> `T` on a selected Constant must build a wired vertical
+    /// column, never duplicate nodes/edges when the kernel's `Applied` events
+    /// echo the optimistic updates, and undo the last node + wire in one step.
+    #[test]
+    fn single_key_spawning_auto_chains_g_b_t_vertically_and_undoes_atomically() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        app.canvas.selected_nodes = HashSet::from([CONSTANT]);
+        app.canvas.primary_selected = Some(CONSTANT);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        let (start_x, start_y) = {
+            let node = app.graph.node(CONSTANT).expect("Constant #1 in mirror");
+            (node.x, node.y)
+        };
+
+        for key in [egui::Key::G, egui::Key::B, egui::Key::T] {
+            press_canvas_key(&mut app, &ctx, screen, key, Modifiers::NONE);
+        }
+
+        // Let the three batches round-trip; idempotent mirror updates must keep
+        // the counts at exactly the seeded three plus the three new nodes.
+        let settle_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < settle_deadline {
+            app.pump();
+            if app.graph.edge_count() == 5 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            app.graph.node_count(),
+            6,
+            "optimistic + Applied must not duplicate nodes"
+        );
+        assert_eq!(
+            app.graph.edge_count(),
+            5,
+            "optimistic + Applied must not duplicate edges"
+        );
+
+        // New ids continue after the seeded comp: #4 Grade, #5 Blur, #6 Transform.
+        let grade = app.graph.node(NodeId(4)).expect("spawned Grade #4");
+        let blur = app.graph.node(NodeId(5)).expect("spawned Blur #5");
+        let transform = app.graph.node(NodeId(6)).expect("spawned Transform #6");
+
+        assert_eq!(grade.kind, "Grade");
+        assert_eq!(blur.kind, "Blur");
+        assert_eq!(transform.kind, "Transform");
+
+        // Vertical B-pipe spacing: y + 90, + 180, + 270. The third card would
+        // land on the seeded Viewer, so the overlap nudge moves it right.
+        assert_eq!(grade.x, start_x);
+        assert_eq!(grade.y, start_y + 90.0);
+        assert_eq!(blur.x, start_x);
+        assert_eq!(blur.y, start_y + 180.0);
+        assert_eq!(transform.y, start_y + 270.0);
+        assert_eq!(
+            transform.x,
+            start_x + 140.0,
+            "the Transform must nudge aside instead of stacking on the Viewer"
+        );
+
+        assert_eq!(
+            app.graph
+                .incoming_edge(NodeId(4), PortId(0))
+                .map(|edge| edge.from_node),
+            Some(CONSTANT),
+            "Constant #1 -> Grade #4"
+        );
+        assert_eq!(
+            app.graph
+                .incoming_edge(NodeId(5), PortId(0))
+                .map(|edge| edge.from_node),
+            Some(NodeId(4)),
+            "Grade #4 -> Blur #5"
+        );
+        assert_eq!(
+            app.graph
+                .incoming_edge(NodeId(6), PortId(0))
+                .map(|edge| edge.from_node),
+            Some(NodeId(5)),
+            "Blur #5 -> Transform #6"
+        );
+        assert_eq!(app.canvas.primary_selected, Some(NodeId(6)));
+
+        // One undo must remove both the Transform node and its incoming wire.
+        app.dispatch(vec![KernelMessage::Undo]);
+        let undo_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < undo_deadline {
+            app.pump();
+            if app.graph.node_count() == 5 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(app.graph.node_count(), 5, "Transform #6 must be removed");
+        assert!(
+            app.graph.node(NodeId(6)).is_none(),
+            "Transform #6 must be gone"
+        );
+        assert!(
+            app.graph
+                .edges()
+                .iter()
+                .all(|edge| edge.to_node != NodeId(6)),
+            "the Blur -> Transform wire must be undone with the node"
+        );
+        assert_eq!(
+            app.graph
+                .incoming_edge(NodeId(5), PortId(0))
+                .map(|edge| edge.from_node),
+            Some(NodeId(4)),
+            "the earlier Grade -> Blur wire must survive the undo"
+        );
+
+        app.kernel.shutdown();
+    }
+
+    /// Plain `C` spawns an unconnected Constant stamped with the project
+    /// format, while `Ctrl+C` keeps its clipboard meaning.
+    #[test]
+    fn single_key_c_spawns_unconnected_constant_with_project_format_and_ctrl_c_copies() {
+        tanova_nodes::ensure_linked();
+
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let seed_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < seed_deadline && app.graph.node_count() != 3 {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.graph.node_count(),
+            3,
+            "starter comp must land in mirror"
+        );
+
+        app.canvas.selected_nodes = HashSet::from([GRADE]);
+        app.canvas.primary_selected = Some(GRADE);
+        // Force the in-app clipboard path: parallel tests share the OS
+        // clipboard.
+        app.os_clipboard = None;
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Ctrl+C copies and must never spawn.
+        press_canvas_key(&mut app, &ctx, screen, egui::Key::C, ctrl());
+        assert_eq!(app.graph.node_count(), 3, "Ctrl+C must not spawn a node");
+        assert!(
+            app.internal_clipboard.is_some(),
+            "Ctrl+C must still copy the selection"
+        );
+
+        // Plain C spawns a Constant at the cursor, unconnected.
+        press_canvas_key(&mut app, &ctx, screen, egui::Key::C, Modifiers::NONE);
+
+        let settle_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < settle_deadline {
+            app.pump();
+            if app.graph.node_count() == 4 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(app.graph.node_count(), 4, "plain C must spawn one node");
+        let constant = app.graph.node(NodeId(4)).expect("Constant #4");
+        assert_eq!(constant.kind, "Constant");
+        assert!(
+            app.graph.incoming_edge(NodeId(4), PortId(0)).is_none(),
+            "a Constant source must spawn without an incoming wire"
+        );
+        assert_eq!(
+            constant.knobs.get("format_width"),
+            Some(&KnobValue::Int(256)),
+            "Constant must inherit the 256-wide project format"
+        );
+        assert_eq!(
+            constant.knobs.get("format_height"),
+            Some(&KnobValue::Int(256)),
+            "Constant must inherit the 256-high project format"
+        );
 
         app.kernel.shutdown();
     }

@@ -171,6 +171,11 @@ impl GraphMirror {
         self.nodes.iter().find(|node| node.id == id)
     }
 
+    /// Alias for [`GraphMirror::node`] used by spawn helpers.
+    pub fn find_node(&self, id: NodeId) -> Option<&CanvasNode> {
+        self.node(id)
+    }
+
     /// Number of nodes.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
@@ -267,7 +272,15 @@ impl GraphMirror {
     pub fn apply_command(&mut self, command: &UndoableCommand) {
         match command {
             UndoableCommand::AddNode { id, kind, x, y } => {
-                if !self.nodes.iter().any(|node| node.id == *id) {
+                if let Some(existing) = self.nodes.iter_mut().find(|node| node.id == *id) {
+                    // Optimistic dispatch may apply the same `AddNode` before
+                    // the kernel's `Applied` event arrives. Update the
+                    // coordinates in place and preserve the initialized knobs
+                    // (including the project-format stamp).
+                    existing.kind = kind.clone();
+                    existing.x = *x;
+                    existing.y = *y;
+                } else {
                     let mut knobs = find_cartridge(kind)
                         .map(|descriptor| (descriptor.default_knobs)())
                         .unwrap_or_default();
@@ -336,15 +349,17 @@ impl GraphMirror {
                 to_node,
                 to_port,
             } => {
-                let edge = CanvasEdge {
+                // One input port can only carry one wire. Replacing the old
+                // edge (rather than appending) keeps optimistic dispatch and
+                // the kernel's `Applied` event idempotent.
+                self.edges
+                    .retain(|edge| !(edge.to_node == *to_node && edge.to_port == *to_port));
+                self.edges.push(CanvasEdge {
                     from_node: *from_node,
                     from_port: *from_port,
                     to_node: *to_node,
                     to_port: *to_port,
-                };
-                if !self.edges.contains(&edge) {
-                    self.edges.push(edge);
-                }
+                });
             }
             UndoableCommand::DisconnectEdge {
                 from_node,
@@ -1301,7 +1316,7 @@ impl NodeCanvas {
 
             if let Some(kind) = chosen {
                 let position = state.screen_to_world(rect, anchor);
-                messages.push(add_node_message(state, kind, position));
+                messages.push(spawn_node_message(graph, state, kind, position));
                 state.context_menu_open = false;
                 state.context_menu_pos = None;
             } else {
@@ -1403,6 +1418,36 @@ impl NodeCanvas {
             }
         }
 
+        // Default Nuke single-key spawning. Strict `Modifiers::NONE` keeps
+        // Ctrl+C / Ctrl+V / Ctrl+D for the app's clipboard shortcuts.
+        let spawn_guard = over_canvas
+            && pointer_pos.is_none_or(|pointer| {
+                ui.ctx()
+                    .layer_id_at(pointer)
+                    .is_none_or(|layer| layer == ui.layer_id())
+            })
+            && !ui.ctx().egui_wants_keyboard_input()
+            && !ui.memory(|memory| memory.focused().is_some())
+            && !search_open
+            && state.active_wire_drag.is_none()
+            && !modal_open;
+        if spawn_guard {
+            let spawn_key = ui.ctx().input_mut(|input| {
+                [Key::R, Key::W, Key::C, Key::G, Key::B, Key::T, Key::M]
+                    .into_iter()
+                    .find(|key| input.consume_key(Modifiers::NONE, *key))
+            });
+            if let Some(key) = spawn_key {
+                if let Some(kind) = nuke_key_to_node_kind(key) {
+                    let anchor_screen = pointer_pos
+                        .unwrap_or_else(|| rect.center())
+                        .clamp(rect.min, rect.max);
+                    let world_pos = state.screen_to_world(rect, anchor_screen);
+                    messages.push(spawn_node_message(graph, state, kind, world_pos));
+                }
+            }
+        }
+
         draw_grid(&painter, rect, state.pan, state.zoom);
 
         // A detaching wire hides its committed edge until release.
@@ -1499,7 +1544,7 @@ impl NodeCanvas {
         painter.text(
             rect.left_bottom() + Vec2::new(12.0, -10.0),
             Align2::LEFT_BOTTOM,
-            "Tab: search  |  MMB: pan  |  Wheel: zoom  |  Shift: multi-select  |  Drag wire: connect/rip  |  RMB: menu  |  Del: remove  |  D: bypass  |  F: frame  |  1/2: view  |  Ctrl+C/V/D: copy/paste/dup",
+            "R/W/C/G/B/T/M: add node | Tab: search | 1/2: view | D: bypass | F: frame",
             FontId::proportional(11.0),
             Color32::from_gray(110),
         );
@@ -1568,7 +1613,7 @@ pub fn nuke_workflow_binding_message(
 fn draw_tab_search(
     ui: &mut Ui,
     state: &mut NodeCanvasState,
-    _graph: &GraphMirror,
+    graph: &GraphMirror,
     workflow: ViewerWorkflow,
 ) -> Option<KernelMessage> {
     state.tab_search.as_ref()?;
@@ -1629,7 +1674,7 @@ fn draw_tab_search(
 
     if let Some(kind) = spawn {
         state.tab_search = None;
-        return Some(add_node_message(state, kind, search.world_pos));
+        return Some(spawn_node_message(graph, state, kind, search.world_pos));
     }
     if close {
         state.tab_search = None;
@@ -1661,6 +1706,9 @@ pub fn viewer_message(
 }
 
 /// Builds an `AddNode` command using the canvas's monotonic node-id allocator.
+///
+/// Kept for direct callers and unit tests. Interactive spawns go through
+/// [`spawn_node_message`], which advances selection and auto-chains.
 fn add_node_message(state: &NodeCanvasState, kind: &str, position: Pos2) -> KernelMessage {
     KernelMessage::Execute(UndoableCommand::AddNode {
         id: NodeId(state.next_node_id),
@@ -1668,6 +1716,101 @@ fn add_node_message(state: &NodeCanvasState, kind: &str, position: Pos2) -> Kern
         x: position.x,
         y: position.y,
     })
+}
+
+/// Spawns `kind` at the cursor, or auto-chains it below the active node.
+///
+/// Processor and combiner nodes (`input_count >= 1`) chain vertically under a
+/// selected non-Viewer node with an atomic `AddNode` + `ConnectEdge` batch.
+/// Sources (`Read`, `Constant`) and the `Viewer` always spawn unconnected at
+/// the cursor. The new node becomes the active selection so the next key in a
+/// fast `G` -> `B` -> `T` sequence chains from it.
+pub fn spawn_node_message(
+    mirror: &GraphMirror,
+    state: &mut NodeCanvasState,
+    kind: &str,
+    cursor_world: Pos2,
+) -> KernelMessage {
+    let max_id = mirror
+        .nodes()
+        .iter()
+        .map(|node| node.id.0)
+        .max()
+        .unwrap_or(0);
+    state.next_node_id = state.next_node_id.max(max_id.saturating_add(1));
+
+    let new_id = NodeId(state.next_node_id);
+    let input_count = input_port_count(kind);
+
+    // Case 1: chain below the selected processor/combiner.
+    if let Some(up_id) = state.primary_selected {
+        if let Some(up_node) = mirror.find_node(up_id) {
+            if up_node.kind != "Viewer" && kind != "Viewer" && input_count >= 1 {
+                let mut x = up_node.x;
+                let y = up_node.y + 90.0;
+                // Branching a second child from the same parent nudges the
+                // new card sideways instead of stacking it on the first child.
+                while mirror
+                    .nodes()
+                    .iter()
+                    .any(|node| (node.x - x).abs() < 40.0 && (node.y - y).abs() < 30.0)
+                {
+                    x += 140.0;
+                }
+
+                state.next_node_id = state.next_node_id.saturating_add(1);
+                state.selected_nodes.clear();
+                state.selected_nodes.insert(new_id);
+                state.primary_selected = Some(new_id);
+
+                return KernelMessage::Execute(UndoableCommand::Batch(vec![
+                    UndoableCommand::AddNode {
+                        id: new_id,
+                        kind: kind.to_string(),
+                        x,
+                        y,
+                    },
+                    UndoableCommand::ConnectEdge {
+                        from_node: up_id,
+                        from_port: PortId(0),
+                        to_node: new_id,
+                        to_port: PortId(0),
+                    },
+                ]));
+            }
+        }
+    }
+
+    // Case 2: unconnected spawn at the cursor / anchor.
+    let (mut x, y) = (cursor_world.x, cursor_world.y);
+    while mirror
+        .nodes()
+        .iter()
+        .any(|node| (node.x - x).abs() < 40.0 && (node.y - y).abs() < 30.0)
+    {
+        x += 140.0;
+    }
+
+    let message = add_node_message(state, kind, Pos2::new(x, y));
+    state.next_node_id = state.next_node_id.saturating_add(1);
+    state.selected_nodes.clear();
+    state.selected_nodes.insert(new_id);
+    state.primary_selected = Some(new_id);
+    message
+}
+
+/// Maps a plain Nuke spawn key to its cartridge kind.
+pub fn nuke_key_to_node_kind(key: Key) -> Option<&'static str> {
+    match key {
+        Key::R => Some("Read"),
+        Key::W => Some("Write"),
+        Key::C => Some("Constant"),
+        Key::G => Some("Grade"),
+        Key::B => Some("Blur"),
+        Key::T => Some("Transform"),
+        Key::M => Some("Merge2"),
+        _ => None,
+    }
 }
 
 /// Applies one click to the deterministic multi-selection.
@@ -2719,6 +2862,101 @@ mod tests {
                 assert!((y - world.y).abs() < 1e-4);
             }
             other => panic!("expected an AddNode command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nuke_keys_spawn_unconnected_sources_and_chain_processors_vertically() {
+        assert_eq!(nuke_key_to_node_kind(Key::R), Some("Read"));
+        assert_eq!(nuke_key_to_node_kind(Key::W), Some("Write"));
+        assert_eq!(nuke_key_to_node_kind(Key::C), Some("Constant"));
+        assert_eq!(nuke_key_to_node_kind(Key::G), Some("Grade"));
+        assert_eq!(nuke_key_to_node_kind(Key::B), Some("Blur"));
+        assert_eq!(nuke_key_to_node_kind(Key::T), Some("Transform"));
+        assert_eq!(nuke_key_to_node_kind(Key::M), Some("Merge2"));
+        assert_eq!(nuke_key_to_node_kind(Key::Q), None);
+
+        let mut graph = GraphMirror::default();
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(1),
+            kind: "Constant".to_string(),
+            x: 40.0,
+            y: 40.0,
+        });
+        let mut state = NodeCanvasState::default();
+
+        // No selection: a processor spawns unconnected at the cursor.
+        match spawn_node_message(&graph, &mut state, "Grade", Pos2::new(300.0, 200.0)) {
+            KernelMessage::Execute(UndoableCommand::AddNode { id, kind, x, y }) => {
+                assert_eq!(id, NodeId(2));
+                assert_eq!(kind, "Grade");
+                assert_eq!((x, y), (300.0, 200.0));
+            }
+            other => panic!("expected an unconnected AddNode, got {other:?}"),
+        }
+        assert_eq!(state.primary_selected, Some(NodeId(2)));
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(2),
+            kind: "Grade".to_string(),
+            x: 300.0,
+            y: 200.0,
+        });
+
+        // A selected processor chains below it at y + 90 in one atomic batch.
+        match spawn_node_message(&graph, &mut state, "Blur", Pos2::new(0.0, 0.0)) {
+            KernelMessage::Execute(UndoableCommand::Batch(commands)) => {
+                assert_eq!(commands.len(), 2);
+                match &commands[0] {
+                    UndoableCommand::AddNode { id, kind, x, y } => {
+                        assert_eq!(*id, NodeId(3));
+                        assert_eq!(kind, "Blur");
+                        assert_eq!((*x, *y), (300.0, 290.0));
+                    }
+                    other => panic!("expected AddNode first, got {other:?}"),
+                }
+                match &commands[1] {
+                    UndoableCommand::ConnectEdge {
+                        from_node,
+                        from_port,
+                        to_node,
+                        to_port,
+                    } => {
+                        assert_eq!(*from_node, NodeId(2));
+                        assert_eq!(*from_port, PortId(0));
+                        assert_eq!(*to_node, NodeId(3));
+                        assert_eq!(*to_port, PortId(0));
+                    }
+                    other => panic!("expected ConnectEdge second, got {other:?}"),
+                }
+            }
+            other => panic!("expected an atomic AddNode + ConnectEdge batch, got {other:?}"),
+        }
+        assert_eq!(state.primary_selected, Some(NodeId(3)));
+        for command in [
+            UndoableCommand::AddNode {
+                id: NodeId(3),
+                kind: "Blur".to_string(),
+                x: 300.0,
+                y: 290.0,
+            },
+            UndoableCommand::ConnectEdge {
+                from_node: NodeId(2),
+                from_port: PortId(0),
+                to_node: NodeId(3),
+                to_port: PortId(0),
+            },
+        ] {
+            graph.apply_command(&command);
+        }
+
+        // Sources never chain, even with a processor selected.
+        match spawn_node_message(&graph, &mut state, "Constant", Pos2::new(500.0, 500.0)) {
+            KernelMessage::Execute(UndoableCommand::AddNode { id, kind, x, y }) => {
+                assert_eq!(id, NodeId(4));
+                assert_eq!(kind, "Constant");
+                assert_eq!((x, y), (500.0, 500.0));
+            }
+            other => panic!("expected an unconnected source AddNode, got {other:?}"),
         }
     }
 
