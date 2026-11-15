@@ -68,6 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Canvas bottom hint now uses printable ASCII separators instead of Unicode bullets, keeping the Linux `egui` glyph atlas clean.
 
+### Known Limitations (Phase 4 carryover)
+
+- **Duplicate / paste use a fixed canvas offset:** `Ctrl+D` duplicate and each `Ctrl+V` paste cascade shift every pasted node by a hard-coded `(40, 40)` offset (`paste_tcl_snippet` adds `offset.0`/`offset.1` to every node's `x`/`y`). There is no way to paste at the cursor, configure the cascade offset or direction, or disable cascading, so repeated pastes always march down-right at a fixed 40pt pitch.
+- **No auto-save or crash recovery:** The Milestone 14 unsaved-changes guard prompts on close, but there is no periodic auto-save. A crash or kill loses all work since the last manual `Save`/`Save As`.
+- **Sequence render has no resume / checkpoint:** The Milestone 16 `Write` sequence render reports `WriteFrameRendered` (`frame of first..last`) and `WriteCompleted`, but if a render is interrupted there is no checkpoint; re-running always restarts from frame `first` of `first..=last`.
+- **File browser filters to supported extensions only:** Milestone 14/16 file dialogs only surface `.tnv`, `.nk`, and `.exr` files (via `is_supported_script_file` / `is_supported_exr_file`). There is no "all files" mode and no recently-opened scripts list.
+
 ## [v0.4.0-studio-pipeline] - 2026-11-14
 
 ### Added
