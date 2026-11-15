@@ -5,6 +5,76 @@ All notable changes to Tanova are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Phase 5: UI/UX Polish & Artist Muscle Memory
+
+### Added
+
+- **Milestone 17 Part 1 — Nuke Pin Geometry & Viewer A/B Pinning (`tanova-ui`, `tanova-app`):**
+  - Exported `PortSide` (`Top`, `Left`, `Right`) and `input_port_side()` from `tanova-ui` so the canvas can place `B` on top, `A` on the left, and the mask on the right.
+  - Side-aware input pin anchors, stems, and labels: `Merge2` renders `B` at `rect.center_top()`, `A` at `rect.left_center()`, and `M` at `rect.right_center()`; two-input filters such as `Grade` keep `in` on top and their mask on the right.
+  - Side-aware cubic Bezier wire tangents and arrowheads, so wires enter left/right mask pins horizontally instead of from above. Input port hit-testing now uses the same side-aware pin positions.
+  - `NodeCanvasState::viewer_slots: [Option<NodeId>; 2]` and `active_viewer_slot` for Nuke-style `1` / `2` viewer input pinning, including deletion pruning and first-frame seeding from the current viewer binding.
+  - `NodeCanvasState::select_viewer_slot()` with an A/B comparison guard: pressing the other slot's key while a node stays selected flips the viewer back without overwriting the bookmarked slot.
+  - `1` / `2` shortcuts wired in `TanovaApp::handle_shortcuts` and the standalone canvas, with `VIEWER 1` / `VIEWER 2` badges on the active viewer card and a `1/2: view` canvas hint.
+- **Milestone 17 Part 2 — Single-Key Node Spawning & Vertical Auto-Chaining (`tanova-ui`, `tanova-app`):**
+  - Default Nuke single-key node spawning: `R` Read, `W` Write, `C` Constant, `G` Grade, `B` Blur, `T` Transform, and `M` Merge2. Keys use strict `Modifiers::NONE` so `Ctrl+C` / `Ctrl+V` / `Ctrl+D` keep their clipboard meanings.
+  - Spawn guards require the pointer over the canvas with no floating layer capturing it, no focused text/widget keyboard input, no Tab search, no active wire drag, and no open modal. Canvas shortcut messages are dropped while a modal is open.
+  - Automatic vertical B-pipe chaining: spawning a processor or combiner with a node selected emits an atomic `UndoableCommand::Batch` of `AddNode` + `ConnectEdge` at `y + 90.0`, nudging `x += 140.0` when branching, and advances selection so `G` -> `B` -> `T` builds a wired column in one undo step.
+  - `GraphMirror` command application is idempotent: repeated `AddNode` events update `kind` / `x` / `y` in place while preserving knobs and project-format stamping, and `ConnectEdge` replaces the existing incoming edge on `(to_node, to_port)` instead of duplicating it.
+  - `Tab` quick-search and context-menu spawns now share the `spawn_node_message` helper, and the canvas hint reads `R/W/C/G/B/T/M: add node | Tab: search | 1/2: view | D: bypass | F: frame`.
+- **Milestone 18 Part 1 — Studio Theme Engine & Node Category Colors (`tanova-ui`, `tanova-app`):**
+  - New `tanova-ui::theme` module with `StudioTheme` (`Classic`, `Slate`, `Midnight`), `NodeCategory` (`Io`, `Color`, `Merge`, `Filter`, `Transform`, `Viewer`, `Other`), `ThemePalette`, `node_category()`, `palette()`, and cache-safe `apply_theme_visuals()`.
+  - Two-tone node cards: category-colored header band with top-only rounding, dark crimson crashed fill, dimmed disabled state, drop shadow, and `card_corner_radius` per theme (`2` Classic, `3` Slate, `7` Midnight).
+  - Themed canvas background and grid: line grid for Classic/Slate, dot grid for Midnight; spacing clamped to `.max(18.0)` at low zoom.
+  - Role-colored input pins (`pin_b` / `pin_a` / `pin_m` by `PortSide`) and matching wire colors (`wire_default` for top/B, `pin_a` for left/A, `pin_m` for right/mask).
+  - `NodeCanvasState.theme` persists across `execute_new_script()` / script reloads.
+  - Top-bar segmented theme selector: `Theme: [Classic] [Slate] [Midnight]`.
+
+- **Milestone 18 Part 2 — Brand-Free Theme Naming, Visual Fixes & Two-Column Inspector (`tanova-ui`, `tanova-app`):**
+  - Renamed `StudioTheme` variants to brand-free names: `Classic` (Nuke muscle memory), `Slate` (Natron-inspired), `Midnight` (Fusion-inspired).
+  - Distinct visual silhouettes: `Classic` uses full-body category-fill cards with a warm grid; `Slate` uses two-tone header cards on a cool high-contrast grid; `Midnight` uses rounded capsule cards on a deep gunmetal dot grid.
+  - Port label wire-clearance fix: `B`/`in` labels shift left of the vertical stem; `A` and `M` labels sit below their horizontal stems so incoming wires no longer slice through them.
+  - Theme-coordinated active viewer ring and `VIEWER 1`/`2` badge using `viewer_badge_accent` per theme.
+  - Two-Column `PropertiesPanel` Inspector: category header banner with bypass toggle, aligned `egui::Grid` with labeled columns for all knob types (Float, Int, Bool, Text, ComboBox, Color, Vec2).
+  - Top-bar labels updated: `Viewer Mode: [Viewer Node] [Direct Target]`, `Theme: [Classic] [Slate] [Midnight]`.
+  - Added tests: `classic_slate_and_midnight_palettes_have_distinct_card_and_grid_styles` and `properties_panel_renders_two_column_grid_and_bypass_toggle_across_themes`.
+
+- **Milestone 19 — Graph Organization Cartridges & Canvas Containers (`tanova-nodes`, `tanova-parse`, `tanova-ui`, `tanova-app`):**
+  - New `"Dot"` cartridge: a 1-in/1-out routing elbow whose `evaluate()` is a zero-copy passthrough of `PortId(0)`, with an empty `label` knob.
+  - New `"BackdropNode"` cartridge: a 0-input canvas container with `label`, `color` (`slate`/`blue`/`teal`/`amber`/`purple`/`crimson`/`green`), `bdwidth` (default `320`), and `bdheight` (default `200`) knobs; its `evaluate()` returns an empty packet.
+  - `.nk` / `.tnv` parser normalizes Nuke's plain `Backdrop` to `BackdropNode` and never pops an input from, nor pushes the backdrop onto, the TCL stack, so a saved backdrop can never corrupt downstream wiring on reload.
+  - Canvas geometry helpers `DOT_SIZE` (`22x22`), `NODE_SIZE`, `is_dot_node()`, `is_backdrop_node()`, and `node_world_size()`; screen rects, wire endpoints, framing, and box selection all honor the per-node size.
+  - `.` single-key shortcut spawns a `Dot`; `Dot` and `BackdropNode` also appear in the `Tab` search, right-click `Add node` menu, and canvas hint (`R/W/C/G/B/T/M/.: add node`).
+  - Center-aligned vertical auto-chaining keeps `22px` Dots and `168px` cards on one dead-straight spine, and preserves the historical `90px` pitch for standard cards.
+  - `BackdropNode` spawning wraps the current selection in one atomic `Batch` (`AddNode` + `bdwidth`/`bdheight` `SetKnob`s) with `36px`/`44px` padding, and falls back to a default `320x200` backdrop at the cursor when nothing is selected.
+  - Three-layer z-order (`Backdrops` -> `Wires` -> `Nodes & Dots`): tinted semi-transparent backdrop bodies, a solid category-colored header bar with the label, and a diagonal bottom-right resize grip.
+  - Backdrop header group-drag moves every enclosed non-backdrop node in one coalesced undo step; corner resize commits a single `Batch` of two `SetKnob`s so `Ctrl+Z` restores the previous size in one press. Non-backdrop nodes and ports are hit-tested first, so a card inside a backdrop stays clickable.
+  - `PropertiesPanel` renders a `color` preset `ComboBox` for `BackdropNode` and hides the `[Bypass (D)]` toggle for `Dot` and `BackdropNode`.
+  - Added tests: `dot_node_spawns_via_period_key_centers_on_spine_and_passes_packet_through`, `backdrop_wraps_selected_nodes_moves_enclosed_nodes_and_round_trips_tcl`, and `backdrop_between_wired_nodes_never_corrupts_the_stack`.
+
+### Fixed
+
+- **Milestone 19 live-GUI interaction fixes (`tanova-ui`, `tanova-app`):**
+  - `Dot` grew to `22x22` and its circular body is now a drag handle: a pointer-down inside the body moves the node, and only the top/bottom stem tips can start a wire drag, so a body click can no longer spawn a stray wire.
+  - Spawning `.` (`Dot`) or `B` (`Blur`) below an already-wired node now performs a true pipe splice (`up -> new -> downstream`) in one atomic `Batch` and pushes the downstream column down, instead of leaving a dangling wire or nudging the new node sideways.
+  - `BackdropNode` spawning wraps the selection with `36px`/`44px` padding and never receives the `x += 140` overlap nudge; right-click and `Tab` spawns preserve the current selection.
+- Fixed the live-GUI bug where `BackdropNode` spawned at the cursor instead of wrapping box-selected nodes: all four spawn paths (`Tab` search Enter + mouse-click row, right-click context menu, `+ Add Node` top-bar dropdown, single-key shortcuts) now route through `spawn_node_message`; `TabSearchState` captures `selected_snapshot` / `primary_snapshot` when Tab opens and restores them unconditionally before every popup spawn; canvas pointer press/box-selection/deselect is fully disabled while any spawn UI (Tab popup, context menu, node menu) is open, so a popup click can never wipe `selected_nodes`; right-click on empty canvas never clears the selection; `Shift+B` and plain `Z` spawn `BackdropNode` alongside the existing `R/W/C/G/B/T/M/./Z` keys; `spawn_node_message` Case 0 computes the backdrop bounds from `GraphMirror` world coordinates (`x = min_x - 36`, `y = min_y - 44`, `bdwidth = ((max_x - min_x) + 72).max(200)`, `bdheight = ((max_y - min_y) + 76).max(140)`) using `mirror.node()` directly and keeping all non-backdrop nodes including `Dot` and `Viewer`; `GraphMirror::apply_command` `SetKnob` uses `.insert` so `bdwidth`/`bdheight` are stored even when the `BackdropNode` cartridge isn't linked, and `Batch` applies recursively.
+- Added `+ Add Node` top-bar toolbar dropdown (`ui.menu_button`) routing through `spawn_node_message` using `tanova_ui::canvas::spawnable_kinds`.
+- Added multi-frame regression tests `tab_search_enter_wraps_box_selected_nodes_in_backdrop_not_at_cursor` and `tab_search_mouse_click_on_backdrop_row_wraps_selected_nodes_without_clearing_selection` driving `TanovaApp::draw` / `NodeCanvas::show` frames (not isolated `spawn_node_message` calls) to catch frame-order selection loss.
+  - Backdrop group drag captures its enclosed nodes exactly once at mouse-down, so sweeping an empty backdrop across other cards can no longer capture or pile them together; box selection stays off during node drags and backdrop resizes.
+  - Added tests: `dot_body_drag_moves_dot_without_starting_wire_drag`, `spawning_dot_and_blur_on_wired_constant_splices_pipe_and_pushes_downstream_grade`, and `dragging_empty_backdrop_across_nodes_never_captures_or_moves_them`.
+
+### Changed
+
+- Canvas bottom hint now uses printable ASCII separators instead of Unicode bullets, keeping the Linux `egui` glyph atlas clean.
+
+### Known Limitations (Phase 4 carryover)
+
+- **Duplicate / paste use a fixed canvas offset:** `Ctrl+D` duplicate and each `Ctrl+V` paste cascade shift every pasted node by a hard-coded `(40, 40)` offset (`paste_tcl_snippet` adds `offset.0`/`offset.1` to every node's `x`/`y`). There is no way to paste at the cursor, configure the cascade offset or direction, or disable cascading, so repeated pastes always march down-right at a fixed 40pt pitch.
+- **No auto-save or crash recovery:** The Milestone 14 unsaved-changes guard prompts on close, but there is no periodic auto-save. A crash or kill loses all work since the last manual `Save`/`Save As`.
+- **Sequence render has no resume / checkpoint:** The Milestone 16 `Write` sequence render reports `WriteFrameRendered` (`frame of first..last`) and `WriteCompleted`, but if a render is interrupted there is no checkpoint; re-running always restarts from frame `first` of `first..=last`.
+- **File browser filters to supported extensions only:** Milestone 14/16 file dialogs only surface `.tnv`, `.nk`, and `.exr` files (via `is_supported_script_file` / `is_supported_exr_file`). There is no "all files" mode and no recently-opened scripts list.
+
 ## [v0.4.0-studio-pipeline] - 2026-11-14
 
 ### Added

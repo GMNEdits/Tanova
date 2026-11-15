@@ -8,8 +8,7 @@ use egui::{Color32, ComboBox, DragValue, TextEdit, Ui};
 use tanova_kernel::{KernelMessage, KnobValue, NodeId, UndoableCommand};
 
 use crate::canvas::GraphMirror;
-
-const VIEWER: Color32 = Color32::from_rgb(255, 190, 40);
+use crate::theme::{StudioTheme, node_category, palette};
 
 /// A request from the properties panel to open the EXR file browse modal
 /// for a `Read` or `Write` node's `file` knob.
@@ -55,10 +54,16 @@ const OPERATIONS: &[&str] = &[
 const BBOX_MODES: &[&str] = &["union", "B", "A", "intersection"];
 /// Channel export modes for the `Write` node's `channels` knob.
 const CHANNELS_MODES: &[&str] = &["rgba", "all"];
+/// Tint presets for a `BackdropNode`'s `color` knob.
+const BACKDROP_COLORS: &[&str] = &[
+    "slate", "blue", "teal", "amber", "purple", "crimson", "green",
+];
 
 /// Draws controls for every knob on the selected node.
 #[derive(Default)]
 pub struct PropertiesPanel {
+    /// Active studio theme, synced from `NodeCanvasState.theme`.
+    pub theme: StudioTheme,
     /// A `Write` node waiting to render its sequence to disk, set when the
     /// artist clicks `[Render Sequence to Disk]` and consumed by the app.
     pub pending_write_render: Option<NodeId>,
@@ -84,12 +89,14 @@ impl PropertiesPanel {
         ui: &mut Ui,
         graph: &GraphMirror,
         selected: Option<NodeId>,
-        viewer: Option<NodeId>,
+        _viewer: Option<NodeId>,
     ) -> Vec<KernelMessage> {
         let mut messages = Vec::new();
 
         #[cfg(test)]
         KNOB_WIDGET_RECTS.with(|rects| rects.borrow_mut().clear());
+
+        let pal = palette(self.theme);
 
         let Some(node_id) = selected else {
             ui.label("No node selected");
@@ -102,17 +109,51 @@ impl PropertiesPanel {
             return messages;
         };
 
-        ui.horizontal(|ui| {
-            ui.heading(format!("{} #{}", node.kind, node_id.0));
-            ui.separator();
-            if ui.button("View (1)").clicked() {
-                messages.push(KernelMessage::SetViewerNode(Some(node_id)));
-            }
-            if viewer == Some(node_id) {
-                ui.colored_label(VIEWER, "VIEWER 1");
-            }
-        });
-        ui.separator();
+        // Node category header banner: full-width rounded band filled with the
+        // category color. Left: kind + id. Right: bypass toggle or VIEWER tag.
+        let cat = node_category(&node.kind);
+        let banner_color = if node.disabled {
+            pal.category_color(cat).linear_multiply(0.7)
+        } else {
+            pal.category_color(cat)
+        };
+
+        egui::Frame::new()
+            .fill(banner_color)
+            .corner_radius(pal.card_corner_radius)
+            .inner_margin(egui::Margin::symmetric(12, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{}  #{}", node.kind, node_id.0))
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if node.kind != "Viewer"
+                            && node.kind != "BackdropNode"
+                            && node.kind != "Dot"
+                        {
+                            let bypass_label = if node.disabled {
+                                "[Bypassed]"
+                            } else {
+                                "[Bypass (D)]"
+                            };
+                            if ui.button(bypass_label).clicked() {
+                                messages.push(KernelMessage::Execute(
+                                    UndoableCommand::SetDisabled {
+                                        node: node_id,
+                                        disabled: !node.disabled,
+                                    },
+                                ));
+                            }
+                        } else {
+                            ui.colored_label(pal.viewer_badge_accent, "VIEWER");
+                        }
+                    });
+                });
+            });
+        ui.add_space(6.0);
 
         // A session belongs to the node that was being edited. Switching
         // selection ends it, so a later edit never inherits a stale origin.
@@ -124,11 +165,11 @@ impl PropertiesPanel {
             }
         });
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // Scope widget IDs by node id so switching selection between two
-            // nodes of the same kind never leaks egui widget focus or drag
-            // state.
-            ui.push_id(node_id, |ui| {
+        egui::Grid::new(("tanova_props_grid", node_id.0))
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .striped(true)
+            .show(ui, |ui| {
                 for (name, value) in node.knobs.iter() {
                     // Value the artist saw before this frame. It becomes the
                     // session origin if this frame starts a new edit.
@@ -138,169 +179,166 @@ impl PropertiesPanel {
                     let mut row_active = false;
                     let mut widget_rect: Option<egui::Rect> = None;
 
-                    let row = {
-                        // Tracks the knob's interactive area and whether it
-                        // still owns keyboard focus or an active pointer drag.
-                        let mut note = |response: &egui::Response| {
-                            widget_rect = Some(
-                                widget_rect.map_or(response.rect, |rect| rect.union(response.rect)),
-                            );
-                            row_active |= response.has_focus() || response.dragged();
-                        };
+                    // Tracks the knob's interactive area and whether it
+                    // still owns keyboard focus or an active pointer drag.
+                    let mut note = |response: &egui::Response| {
+                        widget_rect = Some(
+                            widget_rect.map_or(response.rect, |rect| rect.union(response.rect)),
+                        );
+                        row_active |= response.has_focus() || response.dragged();
+                    };
 
-                        ui.horizontal(|ui| {
-                            ui.label(name);
-                            match value {
-                                KnobValue::Float(value) => {
-                                    let mut float = *value as f32;
-                                    let response = if name == "mix" {
-                                        ui.add(
-                                            DragValue::new(&mut float).speed(0.01).range(0.0..=1.0),
-                                        )
-                                    } else {
-                                        ui.add(DragValue::new(&mut float).speed(0.01))
-                                    };
-                                    note(&response);
-                                    if response.changed() {
-                                        next = KnobValue::Float(float as f64);
-                                        changed = true;
-                                    }
-                                }
-                                KnobValue::Int(value) => {
-                                    let mut integer = *value;
-                                    let response = ui.add(DragValue::new(&mut integer).speed(1.0));
-                                    note(&response);
-                                    if response.changed() {
-                                        next = KnobValue::Int(integer);
-                                        changed = true;
-                                    }
-                                }
-                                KnobValue::Bool(value) => {
-                                    let mut boolean = *value;
-                                    let response = ui.checkbox(&mut boolean, "");
-                                    note(&response);
-                                    if response.changed() {
-                                        next = KnobValue::Bool(boolean);
-                                        changed = true;
-                                    }
-                                }
-                                KnobValue::Text(text) => {
-                                    let mut edited = text.clone();
-                                    let mut combo_changed = false;
-                                    let presets = match name {
-                                        "operation" => Some(OPERATIONS),
-                                        "bbox" => Some(BBOX_MODES),
-                                        "channels" if node.kind == "Write" => Some(CHANNELS_MODES),
-                                        _ => None,
-                                    };
-                                    if let Some(presets) = presets {
-                                        let combo = ComboBox::from_id_salt((node_id.0, name))
-                                            .selected_text(edited.clone())
-                                            .show_ui(ui, |ui| {
-                                                for preset in presets {
-                                                    if ui
-                                                        .selectable_value(
-                                                            &mut edited,
-                                                            (*preset).to_string(),
-                                                            *preset,
-                                                        )
-                                                        .changed()
-                                                    {
-                                                        combo_changed = true;
-                                                    }
-                                                }
-                                            });
-                                        note(&combo.response);
-                                    }
-                                    let edit = ui.add(
-                                        TextEdit::singleline(&mut edited).desired_width(150.0),
-                                    );
-                                    note(&edit);
-                                    // Browse... button for the `file` knob on Read/Write nodes.
-                                    if name == "file"
-                                        && (node.kind == "Read" || node.kind == "Write")
-                                        && ui.button("Browse...").clicked()
-                                    {
-                                        self.pending_file_browse = Some(FileBrowseRequest {
-                                            node_id,
-                                            node_kind: node.kind.clone(),
-                                            current_path: edited.clone(),
-                                        });
-                                    }
-                                    if combo_changed || edit.changed() {
-                                        next = KnobValue::Text(edited);
-                                        changed = true;
-                                    }
-                                }
-                                KnobValue::Color(channels)
-                                    if name == "translate" || name == "center" =>
-                                {
-                                    // 2D spatial knobs keep `Color([x, y, z, w])`
-                                    // storage for cartridge compatibility but edit as
-                                    // coordinates, never as RGBA.
-                                    let mut color = *channels;
-                                    ui.label("X");
-                                    let x = ui.add(DragValue::new(&mut color[0]).speed(1.0));
-                                    note(&x);
-                                    if x.changed() {
-                                        changed = true;
-                                    }
-                                    ui.label("Y");
-                                    let y = ui.add(DragValue::new(&mut color[1]).speed(1.0));
-                                    note(&y);
-                                    if y.changed() {
-                                        changed = true;
-                                    }
-                                    if changed {
-                                        next = KnobValue::Color(color);
-                                    }
-                                }
-                                KnobValue::Color(channels) => {
-                                    let mut color = *channels;
-                                    let mut srgba = Color32::from_rgba_unmultiplied(
-                                        to_u8(color[0]),
-                                        to_u8(color[1]),
-                                        to_u8(color[2]),
-                                        to_u8(color[3]),
-                                    );
-                                    let swatch = ui.color_edit_button_srgba(&mut srgba);
-                                    note(&swatch);
-                                    if swatch.changed() {
-                                        color = [
-                                            srgba.r() as f32 / 255.0,
-                                            srgba.g() as f32 / 255.0,
-                                            srgba.b() as f32 / 255.0,
-                                            srgba.a() as f32 / 255.0,
-                                        ];
-                                        changed = true;
-                                    }
-                                    for (label, channel) in
-                                        ["R", "G", "B", "A"].iter().zip(color.iter_mut())
-                                    {
-                                        ui.label(*label);
-                                        let response = ui.add(DragValue::new(channel).speed(0.01));
-                                        note(&response);
-                                        if response.changed() {
-                                            changed = true;
+                    // Column 1: knob name label.
+                    ui.label(egui::RichText::new(name).color(Color32::from_rgb(200, 205, 215)));
+
+                    // Column 2: knob widget(s).
+                    match value {
+                        KnobValue::Float(value) => {
+                            let mut float = *value as f32;
+                            let response = if name == "mix" {
+                                ui.add(DragValue::new(&mut float).speed(0.01).range(0.0..=1.0))
+                            } else {
+                                ui.add(DragValue::new(&mut float).speed(0.01))
+                            };
+                            note(&response);
+                            if response.changed() {
+                                next = KnobValue::Float(float as f64);
+                                changed = true;
+                            }
+                        }
+                        KnobValue::Int(value) => {
+                            let mut integer = *value;
+                            let response = ui.add(DragValue::new(&mut integer).speed(1.0));
+                            note(&response);
+                            if response.changed() {
+                                next = KnobValue::Int(integer);
+                                changed = true;
+                            }
+                        }
+                        KnobValue::Bool(value) => {
+                            let mut boolean = *value;
+                            let response = ui.checkbox(&mut boolean, "");
+                            note(&response);
+                            if response.changed() {
+                                next = KnobValue::Bool(boolean);
+                                changed = true;
+                            }
+                        }
+                        KnobValue::Text(text) => {
+                            let mut edited = text.clone();
+                            let mut combo_changed = false;
+                            let presets = match name {
+                                "operation" => Some(OPERATIONS),
+                                "bbox" => Some(BBOX_MODES),
+                                "channels" if node.kind == "Write" => Some(CHANNELS_MODES),
+                                "color" if node.kind == "BackdropNode" => Some(BACKDROP_COLORS),
+                                _ => None,
+                            };
+                            if let Some(presets) = presets {
+                                let combo = ComboBox::from_id_salt((node_id.0, name))
+                                    .selected_text(edited.clone())
+                                    .show_ui(ui, |ui| {
+                                        for preset in presets {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut edited,
+                                                    (*preset).to_string(),
+                                                    *preset,
+                                                )
+                                                .changed()
+                                            {
+                                                combo_changed = true;
+                                            }
                                         }
-                                    }
-                                    if changed {
-                                        next = KnobValue::Color(color);
-                                    }
+                                    });
+                                note(&combo.response);
+                            }
+                            let edit =
+                                ui.add(TextEdit::singleline(&mut edited).desired_width(150.0));
+                            note(&edit);
+                            // Browse... button for the `file` knob on Read/Write nodes.
+                            if name == "file"
+                                && (node.kind == "Read" || node.kind == "Write")
+                                && ui.button("Browse...").clicked()
+                            {
+                                self.pending_file_browse = Some(FileBrowseRequest {
+                                    node_id,
+                                    node_kind: node.kind.clone(),
+                                    current_path: edited.clone(),
+                                });
+                            }
+                            if combo_changed || edit.changed() {
+                                next = KnobValue::Text(edited);
+                                changed = true;
+                            }
+                        }
+                        KnobValue::Color(channels) if name == "translate" || name == "center" => {
+                            // 2D spatial knobs keep `Color([x, y, z, w])`
+                            // storage for cartridge compatibility but edit as
+                            // coordinates, never as RGBA.
+                            let mut color = *channels;
+                            ui.label("X");
+                            let x = ui.add(DragValue::new(&mut color[0]).speed(1.0));
+                            note(&x);
+                            if x.changed() {
+                                changed = true;
+                            }
+                            ui.label("Y");
+                            let y = ui.add(DragValue::new(&mut color[1]).speed(1.0));
+                            note(&y);
+                            if y.changed() {
+                                changed = true;
+                            }
+                            if changed {
+                                next = KnobValue::Color(color);
+                            }
+                        }
+                        KnobValue::Color(channels) => {
+                            let mut color = *channels;
+                            let mut srgba = Color32::from_rgba_unmultiplied(
+                                to_u8(color[0]),
+                                to_u8(color[1]),
+                                to_u8(color[2]),
+                                to_u8(color[3]),
+                            );
+                            let swatch = ui.color_edit_button_srgba(&mut srgba);
+                            note(&swatch);
+                            if swatch.changed() {
+                                color = [
+                                    srgba.r() as f32 / 255.0,
+                                    srgba.g() as f32 / 255.0,
+                                    srgba.b() as f32 / 255.0,
+                                    srgba.a() as f32 / 255.0,
+                                ];
+                                changed = true;
+                            }
+                            for (label, channel) in
+                                ["R", "G", "B", "A"].iter().zip(color.iter_mut())
+                            {
+                                ui.label(*label);
+                                let response = ui.add(DragValue::new(channel).speed(0.01));
+                                note(&response);
+                                if response.changed() {
+                                    changed = true;
                                 }
                             }
-                        })
-                    };
+                            if changed {
+                                next = KnobValue::Color(color);
+                            }
+                        }
+                    }
+
+                    ui.end_row();
 
                     #[cfg(test)]
                     KNOB_WIDGET_RECTS.with(|rects| {
                         rects.borrow_mut().insert(
                             (node_id, name.to_string()),
-                            widget_rect.unwrap_or(row.response.rect),
+                            widget_rect.unwrap_or(egui::Rect::ZERO),
                         );
                     });
                     #[cfg(not(test))]
-                    let _ = (row, widget_rect);
+                    let _ = widget_rect;
 
                     if changed && next != pre_edit_value {
                         // Continue the live session if there is one, otherwise
@@ -352,7 +390,6 @@ impl PropertiesPanel {
                     }
                 }
             });
-        });
 
         // A `Write` node offers a one-click render to disk.
         if node.kind == "Write" {

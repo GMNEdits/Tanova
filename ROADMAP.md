@@ -58,6 +58,18 @@ Node Bypass (`D` Key), Copy/Paste (`Ctrl+C`/`Ctrl+V` via `.nk` TCL Clipboard) & 
 **Milestone 16: Multi-Channel EXR `Write` Cartridge & Sequence Render Execution (`tanova-io`, `tanova-app`)**
 Multi-Channel EXR `Write` Cartridge & Sequence Render Execution
 
+# TANOVA ROADMAP - PHASE 5: UI/UX POLISH & ARTIST MUSCLE MEMORY
+*AI DIRECTIVE: Execute one milestone at a time. Do not skip or combine milestones.*
+
+**Milestone 17: Nuke Pin Geometry, `1`/`2` Viewer Input Pinning, Single-Key Node Spawning & Vertical Auto-Chaining (`tanova-ui` & `tanova-app`)**
+Nuke Pin Geometry (`B` Top, `A` Left, `M` Right), `1`/`2` Viewer Input Pinning, Single-Key Node Spawning & Vertical Auto-Chaining
+
+**Milestone 18: Node Category Colors, High-Contrast Dark Theme + Studio Palettes & Two-Column Inspector Grid (`tanova-ui` & `tanova-app`)**
+Node Category Colors, High-Contrast Dark Theme + Studio Palettes (`Classic`, `Slate`, `Midnight`) & Two-Column Inspector Grid
+
+**Milestone 19: Graph Organization Cartridges & Canvas Containers (`Dot` Routing Elbows & `Backdrop` Boxes) (`tanova-kernel`, `tanova-parse`, `tanova-ui`, `tanova-app`)**
+Graph Organization Cartridges & Canvas Containers (`Dot` Routing Elbows & `Backdrop` Boxes)
+
 ## Release & Tagging Policy
 
 - Every milestone/version tag must first record all Added, Changed, and Fixed items in `CHANGELOG.md`.

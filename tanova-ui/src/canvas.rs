@@ -15,11 +15,21 @@ use tanova_kernel::{
     UndoableCommand, find_cartridge,
 };
 
+use crate::theme::{StudioTheme, ThemePalette, backdrop_tint_color, node_category, palette};
 use crate::workflow::ViewerWorkflow;
 
 const NODE_W: f32 = 168.0;
 const NODE_H: f32 = 72.0;
-const HEADER_H: f32 = 24.0;
+/// Canvas size of a standard node card.
+pub const NODE_SIZE: egui::Vec2 = egui::vec2(NODE_W, NODE_H);
+/// Size of the `22x22` `Dot` routing elbow.
+///
+/// Slightly larger than the original `18x18` so the circular body is a
+/// comfortable drag handle; its stem tips still own the wire hit-test.
+pub const DOT_SIZE: egui::Vec2 = egui::vec2(22.0, 22.0);
+/// Gap below a card's bottom edge when auto-chaining. Standard cards are
+/// [`NODE_H`] tall, so this keeps the historical 90px vertical pitch.
+const CHAIN_GAP: f32 = 18.0;
 const PORT_LEAD: f32 = 18.0;
 const GRID_SPACING: f32 = 24.0;
 const MIN_ZOOM: f32 = 0.25;
@@ -37,25 +47,13 @@ const CONTEXT_MENU_KINDS: &[&str] = &[
     "Merge2",
     "Write",
     "Viewer",
+    "Dot",
+    "BackdropNode",
 ];
 
-const BG: Color32 = Color32::from_rgb(20, 20, 24);
-const GRID_MINOR: Color32 = Color32::from_rgb(32, 32, 38);
-const GRID_MAJOR: Color32 = Color32::from_rgb(44, 44, 52);
-const WIRE: Color32 = Color32::from_rgb(196, 178, 82);
 const WIRE_ACTIVE: Color32 = Color32::from_rgb(245, 220, 120);
-const NODE_BORDER: Color32 = Color32::from_rgb(110, 110, 125);
-const NODE_FILL: Color32 = Color32::from_rgb(44, 44, 50);
-const NODE_HEADER: Color32 = Color32::from_rgb(64, 64, 74);
-const CRASH_BORDER: Color32 = Color32::from_rgb(230, 70, 70);
-const CRASH_FILL: Color32 = Color32::from_rgb(58, 22, 24);
-const CRASH_HEADER: Color32 = Color32::from_rgb(92, 30, 34);
-/// Muted card colours for a bypassed node.
-const DISABLED_FILL: Color32 = Color32::from_rgb(30, 31, 35);
-const DISABLED_HEADER: Color32 = Color32::from_rgb(44, 45, 50);
 /// The bold red `X` drawn across a bypassed node.
 const BYPASS_X: Color32 = Color32::from_rgb(230, 95, 70);
-const SELECTED: Color32 = Color32::from_rgb(90, 190, 255);
 const VIEWER: Color32 = Color32::from_rgb(255, 190, 40);
 
 /// One node as the UI knows it.
@@ -171,6 +169,11 @@ impl GraphMirror {
         self.nodes.iter().find(|node| node.id == id)
     }
 
+    /// Alias for [`GraphMirror::node`] used by spawn helpers.
+    pub fn find_node(&self, id: NodeId) -> Option<&CanvasNode> {
+        self.node(id)
+    }
+
     /// Number of nodes.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
@@ -267,7 +270,15 @@ impl GraphMirror {
     pub fn apply_command(&mut self, command: &UndoableCommand) {
         match command {
             UndoableCommand::AddNode { id, kind, x, y } => {
-                if !self.nodes.iter().any(|node| node.id == *id) {
+                if let Some(existing) = self.nodes.iter_mut().find(|node| node.id == *id) {
+                    // Optimistic dispatch may apply the same `AddNode` before
+                    // the kernel's `Applied` event arrives. Update the
+                    // coordinates in place and preserve the initialized knobs
+                    // (including the project-format stamp).
+                    existing.kind = kind.clone();
+                    existing.x = *x;
+                    existing.y = *y;
+                } else {
                     let mut knobs = find_cartridge(kind)
                         .map(|descriptor| (descriptor.default_knobs)())
                         .unwrap_or_default();
@@ -336,15 +347,17 @@ impl GraphMirror {
                 to_node,
                 to_port,
             } => {
-                let edge = CanvasEdge {
+                // One input port can only carry one wire. Replacing the old
+                // edge (rather than appending) keeps optimistic dispatch and
+                // the kernel's `Applied` event idempotent.
+                self.edges
+                    .retain(|edge| !(edge.to_node == *to_node && edge.to_port == *to_port));
+                self.edges.push(CanvasEdge {
                     from_node: *from_node,
                     from_port: *from_port,
                     to_node: *to_node,
                     to_port: *to_port,
-                };
-                if !self.edges.contains(&edge) {
-                    self.edges.push(edge);
-                }
+                });
             }
             UndoableCommand::DisconnectEdge {
                 from_node,
@@ -447,6 +460,13 @@ pub struct TabSearchState {
     pub query: String,
     /// `true` on the frame the popup opened; requests keyboard focus once.
     pub just_opened: bool,
+    /// Selection snapshot captured the moment Tab opens, so spawning from the
+    /// popup wraps the box-selected nodes instead of an empty set (the canvas
+    /// pointer handler runs before the popup is drawn and can otherwise wipe
+    /// `selected_nodes`).
+    pub selected_snapshot: HashSet<NodeId>,
+    /// Primary selection snapshot captured the moment Tab opens.
+    pub primary_snapshot: Option<NodeId>,
 }
 
 /// Visual-only canvas state.
@@ -468,6 +488,14 @@ pub struct NodeCanvasState {
     pub selected_nodes: HashSet<NodeId>,
     /// The deterministic single active node (properties, transform jack, `1`).
     pub primary_selected: Option<NodeId>,
+    /// The two bookmarked viewer inputs for Nuke-style A/B comparison.
+    ///
+    /// Slot 0 is bound by `1`, slot 1 by `2`. Each slot stores the *routed
+    /// target* (the node the physical Viewer looks through), never the Viewer
+    /// node itself, so switching slots only re-routes the viewer.
+    pub viewer_slots: [Option<NodeId>; 2],
+    /// Which viewer slot the viewer panel is currently showing (`0` or `1`).
+    pub active_viewer_slot: usize,
     /// In-progress wire drag.
     pub active_wire_drag: Option<WireDrag>,
     /// In-progress box selection, stored as `(start_screen, current_screen)`.
@@ -497,6 +525,18 @@ pub struct NodeCanvasState {
     node_menu_pos: Option<Pos2>,
     node_menu_node: Option<NodeId>,
     node_menu_open: bool,
+    /// Active corner-resize gesture on a `BackdropNode`.
+    ///
+    /// Stores `(backdrop_id, initial_bdwidth, initial_bdheight)` so release can
+    /// emit one `Batch` of two `SetKnob`s whose `previous` values are the size
+    /// the artist started the drag from, making `Ctrl+Z` undo the resize in a
+    /// single step.
+    pub resizing_backdrop: Option<(NodeId, f32, f32)>,
+    /// Live `(backdrop_id, width, height)` preview while a corner-resize drag is
+    /// in flight. Committed to the kernel as one `Batch` on release.
+    resize_preview: Option<(NodeId, f32, f32)>,
+    /// Active studio theme for card colors, canvas background, pins, and wires.
+    pub theme: StudioTheme,
 }
 
 impl Default for NodeCanvasState {
@@ -508,6 +548,8 @@ impl Default for NodeCanvasState {
             last_canvas_rect: None,
             selected_nodes: HashSet::new(),
             primary_selected: None,
+            viewer_slots: [None, None],
+            active_viewer_slot: 0,
             active_wire_drag: None,
             box_selection: None,
             tab_search: None,
@@ -522,6 +564,9 @@ impl Default for NodeCanvasState {
             node_menu_pos: None,
             node_menu_node: None,
             node_menu_open: false,
+            resizing_backdrop: None,
+            resize_preview: None,
+            theme: StudioTheme::Classic,
         }
     }
 }
@@ -563,9 +608,13 @@ impl NodeCanvasState {
     pub fn reset_for_script(&mut self, mirror: &GraphMirror) {
         self.selected_nodes.clear();
         self.primary_selected = None;
+        self.viewer_slots = [None, None];
+        self.active_viewer_slot = 0;
         self.active_wire_drag = None;
         self.box_selection = None;
         self.dragging_nodes = false;
+        self.resizing_backdrop = None;
+        self.resize_preview = None;
         self.tab_search = None;
         self.pan = Vec2::ZERO;
         self.zoom = 1.0;
@@ -595,6 +644,38 @@ impl NodeCanvasState {
     /// collide with the ids the canvas will hand out next.
     pub fn sync_next_node_id(&mut self, floor: u64) {
         self.next_node_id = self.next_node_id.max(floor);
+    }
+
+    /// Resolves viewer-slot key `slot_idx` (`0` for `1`, `1` for `2`) into the
+    /// node the viewer should route to.
+    ///
+    /// The A/B guard keeps a selected node's knobs open while flipping between
+    /// two comparisons: if the selected node is already bookmarked in the
+    /// *other* slot and that slot is active, pressing this slot's key re-shows
+    /// the target already stored here instead of overwriting it with the
+    /// selection.
+    pub fn select_viewer_slot(&mut self, slot_idx: usize) -> Option<NodeId> {
+        let slot_idx = slot_idx.min(1);
+        let other_slot = 1 - slot_idx;
+
+        if let Some(sel_id) = self.primary_selected {
+            if self.viewer_slots[other_slot] == Some(sel_id)
+                && self.active_viewer_slot == other_slot
+            {
+                if let Some(existing_target) = self.viewer_slots[slot_idx] {
+                    self.active_viewer_slot = slot_idx;
+                    return Some(existing_target);
+                }
+            }
+            self.viewer_slots[slot_idx] = Some(sel_id);
+            self.active_viewer_slot = slot_idx;
+            Some(sel_id)
+        } else if let Some(bookmarked_id) = self.viewer_slots[slot_idx] {
+            self.active_viewer_slot = slot_idx;
+            Some(bookmarked_id)
+        } else {
+            None
+        }
     }
 
     /// Hands out the next never-reused node id.
@@ -635,7 +716,10 @@ impl NodeCanvasState {
             else {
                 continue;
             };
-            let card = Rect::from_min_size(position, Vec2::new(NODE_W, NODE_H));
+            let size = mirror
+                .node(id)
+                .map_or(Vec2::new(NODE_W, NODE_H), node_world_size);
+            let card = Rect::from_min_size(position, size);
             bounds = Some(bounds.map_or(card, |current| current.union(card)));
         }
 
@@ -685,7 +769,7 @@ impl NodeCanvasState {
             .iter()
             .filter(|node| {
                 self.positions.get(&node.id).is_some_and(|position| {
-                    Rect::from_min_size(*position, Vec2::new(NODE_W, NODE_H)).intersects(selection)
+                    Rect::from_min_size(*position, node_world_size(node)).intersects(selection)
                 })
             })
             .map(|node| node.id)
@@ -738,7 +822,8 @@ impl NodeCanvas {
                 }
             }
             if let Some(viewer) = viewer {
-                ui.colored_label(VIEWER, format!("VIEWER 1: #{}", viewer.0));
+                let slot = if state.active_viewer_slot == 0 { 1 } else { 2 };
+                ui.colored_label(VIEWER, format!("VIEWER {slot}: #{}", viewer.0));
             }
             ui.separator();
             ui.label(format!("zoom {:.0}%", state.zoom * 100.0));
@@ -802,6 +887,34 @@ impl NodeCanvas {
         {
             state.primary_selected = state.selected_nodes.iter().min().copied();
         }
+
+        // Prune deleted nodes from the A/B viewer slots.
+        for slot in &mut state.viewer_slots {
+            if slot.is_some_and(|id| graph.node(id).is_none()) {
+                *slot = None;
+            }
+        }
+
+        // Seed slot 1 from the current viewer binding the first time the canvas
+        // sees a graph. Nuke stores the node the physical Viewer looks through;
+        // Fusion stores the viewer target directly.
+        if state.viewer_slots[0].is_none() {
+            if let Some(viewer_id) = viewer {
+                match workflow {
+                    ViewerWorkflow::Fusion => state.viewer_slots[0] = Some(viewer_id),
+                    ViewerWorkflow::Nuke => {
+                        if graph
+                            .node(viewer_id)
+                            .is_some_and(|node| node.kind == "Viewer")
+                        {
+                            if let Some(edge) = graph.incoming_edge(viewer_id, PortId(0)) {
+                                state.viewer_slots[0] = Some(edge.from_node);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if state.active_wire_drag.is_some() {
             let drag_references_node = match state.active_wire_drag.as_ref() {
                 Some(WireDrag::FromOutput { from_node, .. }) => graph.node(*from_node).is_some(),
@@ -860,10 +973,17 @@ impl NodeCanvas {
                     world_pos: state.screen_to_world(rect, raw_anchor),
                     query: String::new(),
                     just_opened: true,
+                    selected_snapshot: state.selected_nodes.clone(),
+                    primary_snapshot: state.primary_selected,
                 });
             }
         }
         let search_open = state.is_search_open();
+        // True when any spawn UI (Tab popup, context menu, node menu) is open.
+        // While any of these is open the canvas must not process pointer
+        // press/down/release, otherwise a popup click can clear the selection
+        // before the spawn is handled (frame-order bug).
+        let spawn_ui_open = search_open || state.context_menu_open || state.node_menu_open;
 
         if response.hovered() && scroll.abs() > 0.0 {
             if let Some(pointer) = pointer_pos {
@@ -879,15 +999,25 @@ impl NodeCanvas {
         // A click on the canvas means the artist is done with any knob field in
         // the properties panel. Releasing its focus keeps `Ctrl+Z` flowing to
         // the canvas instead of being swallowed by the text edit.
-        if primary_pressed && press_starts_inside && state.tab_search.is_none() {
+        if primary_pressed && press_starts_inside && !spawn_ui_open {
             if let Some(focused_id) = ui.ctx().memory(|mem| mem.focused()) {
                 ui.ctx().memory_mut(|mem| mem.surrender_focus(focused_id));
             }
         }
 
-        if primary_pressed && press_starts_inside {
+        if primary_pressed && press_starts_inside && !spawn_ui_open {
             if let Some(pointer) = pointer_pos {
-                if let Some((to_node, to_port)) = hit_input_port(state, graph, pointer, rect) {
+                // A `Dot`'s circular body is a node drag handle. Test it before
+                // the port hit-test so its compact geometry can never turn a
+                // body click into a stray wire drag.
+                if let Some(node) = hit_dot_body(state, graph, pointer, rect) {
+                    apply_node_click(state, node, shift);
+                    state.dragging_nodes = true;
+                    state.box_selection = None;
+                    state.box_dragging = false;
+                    latch_drag_start(state, graph);
+                } else if let Some((to_node, to_port)) = hit_input_port(state, graph, pointer, rect)
+                {
                     // Grabbing a connected port rips the wire off, but the
                     // committed edge is only removed on release.
                     state.active_wire_drag = match graph.incoming_edge(to_node, to_port) {
@@ -900,6 +1030,7 @@ impl NodeCanvas {
                         None => Some(WireDrag::FromInput { to_node, to_port }),
                     };
                     state.box_selection = None;
+                    state.box_dragging = false;
                     state.dragging_nodes = false;
                 } else if let Some(from_node) = hit_output_port(state, graph, pointer, rect) {
                     state.active_wire_drag = Some(WireDrag::FromOutput {
@@ -907,23 +1038,58 @@ impl NodeCanvas {
                         from_port: PortId(0),
                     });
                     state.box_selection = None;
+                    state.box_dragging = false;
                     state.dragging_nodes = false;
                 } else if let Some(node) = hit_node(state, graph, pointer, rect) {
                     apply_node_click(state, node, shift);
                     state.dragging_nodes = true;
+                    state.box_selection = None;
+                    state.box_dragging = false;
                     // Latch the pre-drag position of every selected node from
                     // the mirror. Every frame of this gesture reports these as
                     // `from`, so undo returns the whole group to this exact
                     // spot even if the moves never coalesce.
-                    state.drag_start_positions.clear();
-                    for id in &state.selected_nodes {
-                        if let Some(node) = graph.node(*id) {
-                            state.drag_start_positions.insert(*id, (node.x, node.y));
-                        }
+                    latch_drag_start(state, graph);
+                } else if let Some(backdrop) =
+                    hit_backdrop_resize_handle(state, graph, pointer, rect)
+                {
+                    // Bottom-right grip: begin a corner-resize gesture.
+                    if !state.selected_nodes.contains(&backdrop) {
+                        state.selected_nodes.clear();
+                        state.selected_nodes.insert(backdrop);
+                    }
+                    state.primary_selected = Some(backdrop);
+                    let node = graph.node(backdrop);
+                    let (w, h) = node
+                        .map(|node| {
+                            let size = node_world_size(node);
+                            (size.x, size.y)
+                        })
+                        .unwrap_or((320.0, 200.0));
+                    state.resizing_backdrop = Some((backdrop, w, h));
+                    state.resize_preview = Some((backdrop, w, h));
+                    state.dragging_nodes = false;
+                    state.box_selection = None;
+                    state.box_dragging = false;
+                } else if let Some(backdrop) = hit_backdrop_header(state, graph, pointer, rect) {
+                    // Header bar: drag the backdrop and everything it encloses.
+                    apply_node_click(state, backdrop, shift);
+                    state.box_selection = None;
+                    state.box_dragging = false;
+                    if state.selected_nodes.contains(&backdrop) {
+                        state.dragging_nodes = true;
+                        // Capture the enclosed cards once, at mouse-down. The
+                        // drag loop only ever moves this latched set.
+                        latch_drag_start(state, graph);
+                    } else {
+                        // Shift-click deselected the backdrop: no drag starts.
+                        state.dragging_nodes = false;
+                        state.drag_start_positions.clear();
                     }
                 } else {
                     // Empty background: start a world-space box selection.
                     state.dragging_nodes = false;
+                    state.drag_start_positions.clear();
                     if !shift {
                         state.selected_nodes.clear();
                     } else {
@@ -935,11 +1101,22 @@ impl NodeCanvas {
             }
         }
 
-        if primary_down {
+        if primary_down && !spawn_ui_open {
             if state.box_dragging {
                 if let Some(pointer) = pointer_pos {
                     if let Some((start, _)) = state.box_selection {
                         state.box_selection = Some((start, pointer));
+                    }
+                }
+            } else if let Some((backdrop, _initial_w, _initial_h)) = state.resizing_backdrop {
+                // Corner resize: track the pointer in world space. The size is
+                // only committed to the kernel on release (one undo step).
+                if let Some(pointer) = pointer_pos {
+                    if let Some(position) = state.node_position(backdrop) {
+                        let world = state.screen_to_world(rect, pointer);
+                        let width = (world.x - position.x).max(140.0);
+                        let height = (world.y - position.y).max(90.0);
+                        state.resize_preview = Some((backdrop, width, height));
                     }
                 }
             } else if state.dragging_nodes {
@@ -956,9 +1133,6 @@ impl NodeCanvas {
                         .copied()
                         .collect::<Vec<_>>()
                     {
-                        if !state.selected_nodes.contains(&id) {
-                            continue;
-                        }
                         let Some(node) = graph.node(id) else {
                             continue;
                         };
@@ -989,7 +1163,29 @@ impl NodeCanvas {
             }
         }
 
-        if primary_released {
+        if primary_released && !spawn_ui_open {
+            // Commit a corner-resize as one atomic `Batch` of two `SetKnob`s.
+            if let Some((backdrop, initial_w, initial_h)) = state.resizing_backdrop.take() {
+                if let Some((id, width, height)) = state.resize_preview.take() {
+                    if id == backdrop && (width != initial_w || height != initial_h) {
+                        messages.push(KernelMessage::Execute(UndoableCommand::Batch(vec![
+                            UndoableCommand::SetKnob {
+                                node: backdrop,
+                                knob: "bdwidth".to_string(),
+                                value: KnobValue::Float(width as f64),
+                                previous: KnobValue::Float(initial_w as f64),
+                            },
+                            UndoableCommand::SetKnob {
+                                node: backdrop,
+                                knob: "bdheight".to_string(),
+                                value: KnobValue::Float(height as f64),
+                                previous: KnobValue::Float(initial_h as f64),
+                            },
+                        ])));
+                    }
+                }
+            }
+
             if let Some(drag) = state.active_wire_drag.take() {
                 if let Some(pointer) = pointer_pos {
                     let target_input = hit_input_port(state, graph, pointer, rect).or_else(|| {
@@ -1228,7 +1424,7 @@ impl NodeCanvas {
 
             if let Some(kind) = chosen {
                 let position = state.screen_to_world(rect, anchor);
-                messages.push(add_node_message(state, kind, position));
+                messages.push(spawn_node_message(graph, state, kind, position));
                 state.context_menu_open = false;
                 state.context_menu_pos = None;
             } else {
@@ -1243,14 +1439,28 @@ impl NodeCanvas {
         // value owns the keyboard.
         let keyboard_busy = keyboard_is_busy(ui);
 
-        // Nuke binds `1` to "view this node".
-        if ui.input(|input| input.key_pressed(Key::Num1))
-            && !keyboard_busy
-            && !search_open
-            && !modal_open
-        {
-            if let Some(selected) = state.primary_selected {
-                messages.push(viewer_message(graph, workflow, selected));
+        // Nuke binds `1` / `2` to the two viewer comparison slots.
+        if !keyboard_busy && !search_open && !modal_open {
+            let viewer_slot_key = ui.ctx().input_mut(|input| {
+                if input.consume_key(Modifiers::NONE, Key::Num1) {
+                    Some(0)
+                } else if input.consume_key(Modifiers::NONE, Key::Num2) {
+                    Some(1)
+                } else {
+                    None
+                }
+            });
+            if let Some(slot) = viewer_slot_key {
+                // A `BackdropNode` is a canvas container, never a viewer target.
+                let primary_is_backdrop = state
+                    .primary_selected
+                    .and_then(|id| graph.node(id))
+                    .is_some_and(|node| is_backdrop_node(&node.kind));
+                if !primary_is_backdrop {
+                    if let Some(target) = state.select_viewer_slot(slot) {
+                        messages.push(viewer_message(graph, workflow, target));
+                    }
+                }
             }
         }
 
@@ -1323,7 +1533,83 @@ impl NodeCanvas {
             }
         }
 
-        draw_grid(&painter, rect, state.pan, state.zoom);
+        // Default Nuke single-key spawning. Strict `Modifiers::NONE` keeps
+        // Ctrl+C / Ctrl+V / Ctrl+D for the app's clipboard shortcuts.
+        let spawn_guard = over_canvas
+            && pointer_pos.is_none_or(|pointer| {
+                ui.ctx()
+                    .layer_id_at(pointer)
+                    .is_none_or(|layer| layer == ui.layer_id())
+            })
+            && !ui.ctx().egui_wants_keyboard_input()
+            && !ui.memory(|memory| memory.focused().is_some())
+            && !search_open
+            && state.active_wire_drag.is_none()
+            && !modal_open;
+        if spawn_guard {
+            // `Shift+B` spawns a `BackdropNode` (plain `B` is `Blur`). Check it
+            // before the plain-key list so the shift modifier isn't ignored.
+            let mut spawn_kind: Option<&'static str> = None;
+            if ui.ctx().input_mut(|input| {
+                input.modifiers.shift && input.consume_key(Modifiers::SHIFT, Key::B)
+            }) {
+                spawn_kind = Some("BackdropNode");
+            } else {
+                let spawn_key = ui.ctx().input_mut(|input| {
+                    [
+                        Key::R,
+                        Key::W,
+                        Key::C,
+                        Key::G,
+                        Key::B,
+                        Key::T,
+                        Key::M,
+                        Key::Period,
+                        Key::Z,
+                    ]
+                    .into_iter()
+                    .find(|key| input.consume_key(Modifiers::NONE, *key))
+                });
+                if let Some(key) = spawn_key {
+                    spawn_kind = nuke_key_to_node_kind(key);
+                }
+            }
+            if let Some(kind) = spawn_kind {
+                let anchor_screen = pointer_pos
+                    .unwrap_or_else(|| rect.center())
+                    .clamp(rect.min, rect.max);
+                let world_pos = state.screen_to_world(rect, anchor_screen);
+                messages.push(spawn_node_message(graph, state, kind, world_pos));
+            }
+        }
+
+        let pal = palette(state.theme);
+
+        draw_grid(&painter, rect, state.pan, state.zoom, &pal);
+
+        // PASS 1 — Draw all `BackdropNode`s first, behind wires and nodes.
+        // They are canvas containers, not part of the image pipeline.
+        for node in graph.nodes() {
+            if !is_backdrop_node(&node.kind) {
+                continue;
+            }
+            let Some(position) = state.node_position(node.id) else {
+                continue;
+            };
+            let node_size = match state.resize_preview {
+                Some((id, w, h)) if id == node.id => Vec2::new(w, h),
+                _ => node_world_size(node),
+            };
+            let node_rect = node_screen_rect_at(state, position, node_size, rect);
+            draw_backdrop(
+                &painter,
+                node_rect,
+                node,
+                state.zoom,
+                &pal,
+                state.selected_nodes.contains(&node.id),
+            );
+        }
 
         // A detaching wire hides its committed edge until release.
         let detached = match state.active_wire_drag {
@@ -1346,21 +1632,46 @@ impl NodeCanvas {
             ) else {
                 continue;
             };
-            let from_rect = node_screen_rect_at(state, from_position, rect);
-            let to_rect = node_screen_rect_at(state, to_position, rect);
+            let from_size = graph
+                .node(edge.from_node)
+                .map_or(Vec2::new(NODE_W, NODE_H), node_world_size);
+            let to_size = node_world_size(to_node);
+            let from_rect = node_screen_rect_at(state, from_position, from_size, rect);
+            let to_rect = node_screen_rect_at(state, to_position, to_size, rect);
             let from = output_port(from_rect, state.zoom);
             let port_count = input_port_count(&to_node.kind);
-            let to = input_port(to_rect, edge.to_port, port_count);
+            let to = input_port(to_rect, &to_node.kind, port_count, edge.to_port);
+            let side = input_port_side(&to_node.kind, port_count, edge.to_port.0 as usize);
             let label = input_port_label(&to_node.kind, port_count, edge.to_port.0 as usize);
             let label = if label.is_empty() { None } else { Some(label) };
-            draw_wire(&painter, from, to, state.zoom, WIRE, label);
+            let wire_color = match side {
+                PortSide::Top => pal.wire_default,
+                PortSide::Left => pal.pin_a,
+                PortSide::Right => pal.pin_m,
+            };
+            draw_wire(&painter, from, to, side, state.zoom, wire_color, label);
         }
 
+        // PASS 3 — Draw all non-`BackdropNode`s and `Dot`s on top of wires.
         for node in graph.nodes() {
+            if is_backdrop_node(&node.kind) {
+                continue; // drawn in pass 1
+            }
             let Some(position) = state.node_position(node.id) else {
                 continue;
             };
-            let node_rect = node_screen_rect_at(state, position, rect);
+            let node_size = node_world_size(node);
+            let node_rect = node_screen_rect_at(state, position, node_size, rect);
+            if is_dot_node(&node.kind) {
+                draw_dot(
+                    &painter,
+                    node_rect,
+                    state.selected_nodes.contains(&node.id),
+                    state.zoom,
+                    &pal,
+                );
+                continue;
+            }
             let active_port = match state.active_wire_drag {
                 Some(WireDrag::FromInput { to_node, to_port }) if to_node == node.id => {
                     Some(to_port)
@@ -1374,20 +1685,31 @@ impl NodeCanvas {
             };
             let is_viewer = viewer == Some(node.id)
                 && (workflow != ViewerWorkflow::Nuke || node.kind == "Viewer");
+            let viewer_slot_label = is_viewer.then_some(if state.active_viewer_slot == 0 {
+                "VIEWER 1"
+            } else {
+                "VIEWER 2"
+            });
             draw_node(
                 &painter,
                 node_rect,
                 node,
                 state.selected_nodes.contains(&node.id),
-                is_viewer,
+                viewer_slot_label,
                 state.zoom,
+                &pal,
                 active_port,
             );
         }
 
         if let Some(pointer) = pointer_pos {
-            if let Some((from, to)) = live_wire_points(state, graph, rect, pointer) {
-                draw_wire(&painter, from, to, state.zoom, WIRE_ACTIVE, None);
+            if let Some((from, to, side)) = live_wire_points(state, graph, rect, pointer) {
+                let wire_color = match side {
+                    PortSide::Top => pal.wire_default,
+                    PortSide::Left => pal.pin_a,
+                    PortSide::Right => pal.pin_m,
+                };
+                draw_wire(&painter, from, to, side, state.zoom, wire_color, None);
             }
         }
 
@@ -1413,7 +1735,7 @@ impl NodeCanvas {
         painter.text(
             rect.left_bottom() + Vec2::new(12.0, -10.0),
             Align2::LEFT_BOTTOM,
-            "Tab: search  •  MMB: pan  •  Wheel: zoom  •  Shift: multi-select  •  Drag wire: connect/rip  •  RMB: menu  •  Del: remove  •  D: bypass  •  F: frame  •  Ctrl+C/V/D: copy/paste/dup",
+            "R/W/C/G/B/T/M/./Z: add node | Shift+B: backdrop | Tab: search | 1/2: view | D: bypass | F: frame",
             FontId::proportional(11.0),
             Color32::from_gray(110),
         );
@@ -1482,7 +1804,7 @@ pub fn nuke_workflow_binding_message(
 fn draw_tab_search(
     ui: &mut Ui,
     state: &mut NodeCanvasState,
-    _graph: &GraphMirror,
+    graph: &GraphMirror,
     workflow: ViewerWorkflow,
 ) -> Option<KernelMessage> {
     state.tab_search.as_ref()?;
@@ -1543,7 +1865,13 @@ fn draw_tab_search(
 
     if let Some(kind) = spawn {
         state.tab_search = None;
-        return Some(add_node_message(state, kind, search.world_pos));
+        // Restore the selection that existed when Tab opened, so spawning from
+        // the popup wraps the box-selected nodes instead of an empty set. The
+        // canvas pointer handler runs before this popup and would otherwise
+        // have cleared `selected_nodes` on an empty-canvas click.
+        state.selected_nodes = search.selected_snapshot.clone();
+        state.primary_selected = search.primary_snapshot;
+        return Some(spawn_node_message(graph, state, kind, search.world_pos));
     }
     if close {
         state.tab_search = None;
@@ -1554,7 +1882,11 @@ fn draw_tab_search(
 }
 
 /// Builds the viewer message for the active workflow.
-fn viewer_message(graph: &GraphMirror, workflow: ViewerWorkflow, node: NodeId) -> KernelMessage {
+pub fn viewer_message(
+    graph: &GraphMirror,
+    workflow: ViewerWorkflow,
+    node: NodeId,
+) -> KernelMessage {
     match workflow {
         ViewerWorkflow::Fusion => KernelMessage::SetViewerNode(Some(node)),
         ViewerWorkflow::Nuke => {
@@ -1571,6 +1903,9 @@ fn viewer_message(graph: &GraphMirror, workflow: ViewerWorkflow, node: NodeId) -
 }
 
 /// Builds an `AddNode` command using the canvas's monotonic node-id allocator.
+///
+/// Kept for direct callers and unit tests. Interactive spawns go through
+/// [`spawn_node_message`], which advances selection and auto-chains.
 fn add_node_message(state: &NodeCanvasState, kind: &str, position: Pos2) -> KernelMessage {
     KernelMessage::Execute(UndoableCommand::AddNode {
         id: NodeId(state.next_node_id),
@@ -1578,6 +1913,292 @@ fn add_node_message(state: &NodeCanvasState, kind: &str, position: Pos2) -> Kern
         x: position.x,
         y: position.y,
     })
+}
+
+/// Spawns `kind` at the cursor, or auto-chains it below the active node.
+///
+/// `BackdropNode` wraps the currently selected non-backdrop nodes in an
+/// atomic `AddNode` + `SetKnob`(`bdwidth`/`bdheight`) batch.
+///
+/// Processor and combiner nodes (`input_count >= 1`) chain vertically under a
+/// selected non-Viewer, non-Backdrop node, center-aligned so `Dot` nodes and
+/// standard cards share a dead-straight vertical spine. Sources (`Read`,
+/// `Constant`) and the `Viewer` always spawn unconnected at the cursor. The
+/// new node becomes the active selection so the next key in a fast
+/// `G` -> `B` -> `T` sequence chains from it.
+pub fn spawn_node_message(
+    mirror: &GraphMirror,
+    state: &mut NodeCanvasState,
+    kind: &str,
+    cursor_world: Pos2,
+) -> KernelMessage {
+    let max_id = mirror
+        .nodes()
+        .iter()
+        .map(|node| node.id.0)
+        .max()
+        .unwrap_or(0);
+    state.next_node_id = state.next_node_id.max(max_id.saturating_add(1));
+
+    let new_id = NodeId(state.next_node_id);
+    let input_count = input_port_count(kind);
+
+    // Case 0: `BackdropNode` wraps the selected non-backdrop nodes.
+    if kind == "BackdropNode" {
+        let selected_non_backdrop: Vec<NodeId> = state
+            .selected_nodes
+            .iter()
+            .copied()
+            .filter(|id| {
+                !mirror
+                    .node(*id)
+                    .is_some_and(|node| is_backdrop_node(&node.kind))
+            })
+            .collect();
+        if !selected_non_backdrop.is_empty() {
+            let mut bounds: Option<Rect> = None;
+            for id in &selected_non_backdrop {
+                let Some(node) = mirror.node(*id) else {
+                    continue;
+                };
+                // Use the mirror's authoritative world coordinates rather than
+                // the UI-side position cache, so the backdrop wraps the nodes
+                // where they actually are even after an undo/redo.
+                let position = Pos2::new(node.x, node.y);
+                let size = node_world_size(node);
+                let card = Rect::from_min_size(position, size);
+                bounds = Some(bounds.map_or(card, |current| current.union(card)));
+            }
+            if let Some(bounds) = bounds {
+                let x = bounds.min.x - 36.0;
+                let y = bounds.min.y - 44.0;
+                let bdwidth = (bounds.width() + 72.0).max(200.0);
+                let bdheight = (bounds.height() + 76.0).max(140.0);
+                state.next_node_id = state.next_node_id.saturating_add(1);
+                state.selected_nodes.clear();
+                state.selected_nodes.insert(new_id);
+                state.primary_selected = Some(new_id);
+                return KernelMessage::Execute(UndoableCommand::Batch(vec![
+                    UndoableCommand::AddNode {
+                        id: new_id,
+                        kind: "BackdropNode".to_string(),
+                        x,
+                        y,
+                    },
+                    UndoableCommand::SetKnob {
+                        node: new_id,
+                        knob: "bdwidth".to_string(),
+                        value: KnobValue::Float(bdwidth as f64),
+                        previous: KnobValue::Float(320.0),
+                    },
+                    UndoableCommand::SetKnob {
+                        node: new_id,
+                        knob: "bdheight".to_string(),
+                        value: KnobValue::Float(bdheight as f64),
+                        previous: KnobValue::Float(200.0),
+                    },
+                ]));
+            }
+        }
+        // Fall through to unconnected spawn when nothing is selected.
+    }
+
+    // Case 1: chain below the selected processor/combiner (center-aligned).
+    if let Some(up_id) = state.primary_selected {
+        if let Some(up_node) = mirror.find_node(up_id) {
+            if up_node.kind != "Viewer"
+                && kind != "Viewer"
+                && input_count >= 1
+                && !is_backdrop_node(&up_node.kind)
+            {
+                let up_size = node_world_size(up_node);
+                let new_size = if is_dot_node(kind) {
+                    DOT_SIZE
+                } else {
+                    NODE_SIZE
+                };
+                let x = up_node.x + (up_size.x - new_size.x) * 0.5;
+
+                // `Dot` and `Blur` are splice tools. When the selected card
+                // already feeds a downstream node on its main pipe, insert the
+                // new node into that wire instead of leaving the old wire
+                // dangling. Every other cartridge keeps the historical
+                // leaf/branch behavior so `G`/`B`/`T` chains stay at the 90px
+                // pitch the Milestone 17 tests pin down.
+                let splice = is_dot_node(kind) || kind == "Blur";
+                let downstream: Vec<CanvasEdge> = if splice {
+                    mirror
+                        .edges()
+                        .iter()
+                        .copied()
+                        .filter(|edge| edge.from_node == up_id && edge.from_port == PortId(0))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                if !downstream.is_empty() {
+                    // True pipe splice: keep the new node centered on the
+                    // spine, never nudge it sideways.
+                    let spacing = if is_dot_node(kind) || is_dot_node(&up_node.kind) {
+                        28.0
+                    } else {
+                        38.0
+                    };
+                    let y = up_node.y + up_size.y + spacing;
+
+                    let mut commands: Vec<UndoableCommand> = vec![
+                        UndoableCommand::AddNode {
+                            id: new_id,
+                            kind: kind.to_string(),
+                            x,
+                            y,
+                        },
+                        UndoableCommand::ConnectEdge {
+                            from_node: up_id,
+                            from_port: PortId(0),
+                            to_node: new_id,
+                            to_port: PortId(0),
+                        },
+                    ];
+                    for edge in &downstream {
+                        commands.push(UndoableCommand::DisconnectEdge {
+                            from_node: edge.from_node,
+                            from_port: edge.from_port,
+                            to_node: edge.to_node,
+                            to_port: edge.to_port,
+                        });
+                        commands.push(UndoableCommand::ConnectEdge {
+                            from_node: new_id,
+                            from_port: PortId(0),
+                            to_node: edge.to_node,
+                            to_port: edge.to_port,
+                        });
+                    }
+
+                    // Push the downstream column down so the freshly spliced
+                    // node never overlaps its neighbour. All moves ride in the
+                    // same atomic `Batch`, so one `Ctrl+Z` reverses the whole
+                    // splice.
+                    let new_center_x = x + new_size.x * 0.5;
+                    let in_column = |node: &CanvasNode| {
+                        !is_backdrop_node(&node.kind)
+                            && node.id != up_id
+                            && (node.x + node_world_size(node).x * 0.5 - new_center_x).abs() < 65.0
+                    };
+                    let overlapping_y = mirror
+                        .nodes()
+                        .iter()
+                        .filter(|node| in_column(node))
+                        .filter(|node| node.y >= up_node.y + up_size.y)
+                        .filter(|node| node.y < y + new_size.y + 24.0)
+                        .map(|node| node.y)
+                        .fold(f32::INFINITY, f32::min);
+                    if overlapping_y.is_finite() {
+                        let push_dy = (y + new_size.y + spacing) - overlapping_y;
+                        if push_dy > 0.0 {
+                            let mut pushed: Vec<(NodeId, f32, f32)> = mirror
+                                .nodes()
+                                .iter()
+                                .filter(|node| in_column(node))
+                                .filter(|node| node.y >= overlapping_y)
+                                .map(|node| (node.id, node.x, node.y))
+                                .collect();
+                            pushed.sort_by(|a, b| a.2.total_cmp(&b.2));
+                            for (id, node_x, node_y) in pushed {
+                                commands.push(UndoableCommand::MoveNode {
+                                    id,
+                                    from_x: node_x,
+                                    from_y: node_y,
+                                    to_x: node_x,
+                                    to_y: node_y + push_dy,
+                                });
+                            }
+                        }
+                    }
+
+                    state.next_node_id = state.next_node_id.saturating_add(1);
+                    state.selected_nodes.clear();
+                    state.selected_nodes.insert(new_id);
+                    state.primary_selected = Some(new_id);
+
+                    return KernelMessage::Execute(UndoableCommand::Batch(commands));
+                }
+
+                // Leaf / branch: centered chain, nudged sideways only when an
+                // unrelated card already owns the target slot.
+                let mut x = x;
+                let y = up_node.y + up_size.y + CHAIN_GAP;
+                while mirror
+                    .nodes()
+                    .iter()
+                    .any(|node| (node.x - x).abs() < 40.0 && (node.y - y).abs() < 30.0)
+                {
+                    x += 140.0;
+                }
+
+                state.next_node_id = state.next_node_id.saturating_add(1);
+                state.selected_nodes.clear();
+                state.selected_nodes.insert(new_id);
+                state.primary_selected = Some(new_id);
+
+                return KernelMessage::Execute(UndoableCommand::Batch(vec![
+                    UndoableCommand::AddNode {
+                        id: new_id,
+                        kind: kind.to_string(),
+                        x,
+                        y,
+                    },
+                    UndoableCommand::ConnectEdge {
+                        from_node: up_id,
+                        from_port: PortId(0),
+                        to_node: new_id,
+                        to_port: PortId(0),
+                    },
+                ]));
+            }
+        }
+    }
+
+    // Case 2: unconnected spawn at the cursor / anchor.
+    let (mut x, y) = (cursor_world.x, cursor_world.y);
+    // A `BackdropNode` is a container, not a card: never nudge it sideways or
+    // it can end up off to the side of the nodes it was meant to wrap.
+    if !is_backdrop_node(kind) {
+        while mirror
+            .nodes()
+            .iter()
+            .any(|node| (node.x - x).abs() < 40.0 && (node.y - y).abs() < 30.0)
+        {
+            x += 140.0;
+        }
+    }
+
+    let message = add_node_message(state, kind, Pos2::new(x, y));
+    state.next_node_id = state.next_node_id.saturating_add(1);
+    state.selected_nodes.clear();
+    state.selected_nodes.insert(new_id);
+    state.primary_selected = Some(new_id);
+    message
+}
+
+/// Maps a plain Nuke spawn key to its cartridge kind.
+///
+/// `Shift+B` is handled separately in the spawn handler (it spawns
+/// `BackdropNode`); plain `B` is `Blur`. Plain `Z` spawns `BackdropNode`.
+pub fn nuke_key_to_node_kind(key: Key) -> Option<&'static str> {
+    match key {
+        Key::R => Some("Read"),
+        Key::W => Some("Write"),
+        Key::C => Some("Constant"),
+        Key::G => Some("Grade"),
+        Key::B => Some("Blur"),
+        Key::T => Some("Transform"),
+        Key::M => Some("Merge2"),
+        Key::Period => Some("Dot"),
+        Key::Z => Some("BackdropNode"),
+        _ => None,
+    }
 }
 
 /// Applies one click to the deterministic multi-selection.
@@ -1686,37 +2307,52 @@ fn resolve_wire_release(
 }
 
 /// Screen-space endpoints of the live wire, if a drag is active.
+///
+/// The third value is the side of the destination pin, so the live Bezier
+/// enters a left/right mask pin horizontally instead of from above.
 fn live_wire_points(
     state: &NodeCanvasState,
     graph: &GraphMirror,
     rect: Rect,
     pointer: Pos2,
-) -> Option<(Pos2, Pos2)> {
+) -> Option<(Pos2, Pos2, PortSide)> {
     match state.active_wire_drag? {
         WireDrag::FromOutput { from_node, .. } => {
             let position = state.node_position(from_node)?;
+            let size = graph
+                .node(from_node)
+                .map_or(Vec2::new(NODE_W, NODE_H), node_world_size);
             Some((
-                output_port(node_screen_rect_at(state, position, rect), state.zoom),
+                output_port(node_screen_rect_at(state, position, size, rect), state.zoom),
                 pointer,
+                PortSide::Top,
             ))
         }
         WireDrag::FromInput { to_node, to_port } => {
             let position = state.node_position(to_node)?;
             let node = graph.node(to_node)?;
+            let count = input_port_count(&node.kind);
+            let side = input_port_side(&node.kind, count, to_port.0 as usize);
             Some((
                 pointer,
                 input_port(
-                    node_screen_rect_at(state, position, rect),
+                    node_screen_rect_at(state, position, node_world_size(node), rect),
+                    &node.kind,
+                    count,
                     to_port,
-                    input_port_count(&node.kind),
                 ),
+                side,
             ))
         }
         WireDrag::Detaching { from_node, .. } => {
             let position = state.node_position(from_node)?;
+            let size = graph
+                .node(from_node)
+                .map_or(Vec2::new(NODE_W, NODE_H), node_world_size);
             Some((
-                output_port(node_screen_rect_at(state, position, rect), state.zoom),
+                output_port(node_screen_rect_at(state, position, size, rect), state.zoom),
                 pointer,
+                PortSide::Top,
             ))
         }
     }
@@ -1734,25 +2370,106 @@ fn zoom_around(state: &mut NodeCanvasState, rect: Rect, pointer: Pos2, scroll: f
     state.pan = pointer - rect.min - world.to_vec2() * new_zoom;
 }
 
-fn node_screen_rect(state: &NodeCanvasState, id: NodeId, rect: Rect) -> Rect {
+fn node_screen_rect(state: &NodeCanvasState, id: NodeId, rect: Rect, graph: &GraphMirror) -> Rect {
     state.node_position(id).map_or(Rect::NOTHING, |position| {
-        node_screen_rect_at(state, position, rect)
+        let size = graph
+            .node(id)
+            .map_or(Vec2::new(NODE_W, NODE_H), node_world_size);
+        node_screen_rect_at(state, position, size, rect)
     })
 }
 
-fn node_screen_rect_at(state: &NodeCanvasState, position: Pos2, rect: Rect) -> Rect {
+fn node_screen_rect_at(state: &NodeCanvasState, position: Pos2, size: Vec2, rect: Rect) -> Rect {
     let min = state.world_to_screen(rect, position);
-    Rect::from_min_size(min, Vec2::new(NODE_W, NODE_H) * state.zoom)
+    Rect::from_min_size(min, size * state.zoom)
+}
+
+/// Which edge of a node card an input pin sits on.
+///
+/// Nuke's combiner layout puts the `B` pipe on top, the `A` pipe on the left,
+/// and the mask on the right. Two-input filters keep `in` on top and expose
+/// their mask on the right edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortSide {
+    /// Top edge (`B` / `in`).
+    Top,
+    /// Left edge (`A` on a combiner).
+    Left,
+    /// Right edge (`M` mask on filters and combiners).
+    Right,
+}
+
+/// Side of `port_index` for a node with `input_count` inputs.
+///
+/// Port 0 is always the top pipe. Two-input filters put their mask on the
+/// right, while three-or-more-input combiners put `A` on the left and every
+/// later pipe (the mask) on the right.
+pub fn input_port_side(kind: &str, input_count: usize, port_index: usize) -> PortSide {
+    if port_index == 0 || input_count <= 1 {
+        return PortSide::Top;
+    }
+    if input_count == 2 {
+        return PortSide::Right;
+    }
+    // `Merge2` and any other combiner: B top, A left, M right.
+    let combiner = kind == "Merge2" || input_count >= 3;
+    if combiner && port_index == 1 {
+        PortSide::Left
+    } else {
+        PortSide::Right
+    }
 }
 
 /// Number of input ports a cartridge exposes to the canvas.
 fn input_port_count(kind: &str) -> usize {
     match kind {
-        "Constant" | "Read" => 0,
+        "Constant" | "Read" | "BackdropNode" => 0,
         "Merge2" => 3,
         "Grade" => 2,
         _ => 1,
     }
+}
+
+/// `true` when `kind` is the `Dot` routing elbow.
+pub fn is_dot_node(kind: &str) -> bool {
+    kind == "Dot"
+}
+
+/// `true` when `kind` is the `BackdropNode` canvas container.
+pub fn is_backdrop_node(kind: &str) -> bool {
+    kind == "BackdropNode"
+}
+
+/// The canvas-space size of a node card: `22x22` for `Dot`, knob-driven for
+/// `BackdropNode`, and `NODE_W x NODE_H` for everything else.
+pub fn node_world_size(node: &CanvasNode) -> Vec2 {
+    if is_dot_node(&node.kind) {
+        return DOT_SIZE;
+    }
+    if is_backdrop_node(&node.kind) {
+        let width = node
+            .knobs
+            .get("bdwidth")
+            .and_then(|v| match v {
+                KnobValue::Float(v) => Some(*v as f32),
+                KnobValue::Int(v) => Some(*v as f32),
+                _ => None,
+            })
+            .unwrap_or(320.0)
+            .max(140.0);
+        let height = node
+            .knobs
+            .get("bdheight")
+            .and_then(|v| match v {
+                KnobValue::Float(v) => Some(*v as f32),
+                KnobValue::Int(v) => Some(*v as f32),
+                _ => None,
+            })
+            .unwrap_or(200.0)
+            .max(90.0);
+        return Vec2::new(width, height);
+    }
+    NODE_SIZE
 }
 
 fn node_accepts_inputs(graph: &GraphMirror, id: NodeId) -> bool {
@@ -1761,23 +2478,60 @@ fn node_accepts_inputs(graph: &GraphMirror, id: NodeId) -> bool {
         .is_some_and(|node| input_port_count(&node.kind) > 0)
 }
 
-/// Position of input `port` on the top edge of `rect`.
-fn input_port(rect: Rect, port: PortId, count: usize) -> Pos2 {
+/// Pin anchor for input `port` on the correct edge of `rect`.
+fn input_port(rect: Rect, kind: &str, count: usize, port: PortId) -> Pos2 {
     if count == 0 {
         return rect.center_top();
     }
-    let slot = (port.0 as usize).min(count - 1);
-    let step = rect.width() / (count as f32 + 1.0);
-    Pos2::new(rect.left() + step * (slot as f32 + 1.0), rect.top())
+    match input_port_side(kind, count, port.0 as usize) {
+        PortSide::Top => rect.center_top(),
+        PortSide::Left => rect.left_center(),
+        PortSide::Right => rect.right_center(),
+    }
+}
+
+/// Tip of the stem drawn outward from an input pin.
+fn input_port_stem_tip(pin: Pos2, side: PortSide, zoom: f32) -> Pos2 {
+    let lead = PORT_LEAD * zoom;
+    match side {
+        PortSide::Top => pin - Vec2::new(0.0, lead),
+        PortSide::Left => pin - Vec2::new(lead, 0.0),
+        PortSide::Right => pin + Vec2::new(lead, 0.0),
+    }
 }
 
 /// Anchor for an input port label, clear of the port stem.
 ///
 /// The stem rises [`PORT_LEAD`] pixels above the node's top edge, so the label
-/// sits `3 * zoom` pixels above its tip. `Align2::CENTER_BOTTOM` then keeps
-/// every glyph above the stem at any zoom level.
+/// Computes the label anchor sitting `(PORT_LEAD + 3.0) * zoom` above a pin,
+/// keeping every glyph clear of the stem tip. Used by `PortSide::Top` labels
+/// and directly tested by `port_labels_sit_above_the_stem_tip`.
+#[allow(dead_code)]
 fn port_label_position(position: Pos2, zoom: f32) -> Pos2 {
     position - Vec2::new(0.0, (PORT_LEAD + 3.0) * zoom)
+}
+
+/// Label anchor for an input pin on `side`.
+///
+/// `PortSide::Top` labels shift left of the vertical stem so incoming
+/// vertical wires pass cleanly to the right. `PortSide::Left` / `Right`
+/// labels sit below the horizontal stem so curving wires from above clear
+/// them.
+fn input_port_label_position(pin: Pos2, side: PortSide, zoom: f32) -> Pos2 {
+    match side {
+        PortSide::Top => Pos2::new(pin.x - 6.0 * zoom, pin.y - (PORT_LEAD + 3.0) * zoom),
+        PortSide::Left => pin - Vec2::new((PORT_LEAD + 2.0) * zoom, -5.0 * zoom),
+        PortSide::Right => pin + Vec2::new((PORT_LEAD + 2.0) * zoom, 5.0 * zoom),
+    }
+}
+
+/// Text alignment that keeps a side-aware port label clear of its stem.
+fn input_port_label_align(side: PortSide) -> Align2 {
+    match side {
+        PortSide::Top => Align2::RIGHT_BOTTOM,
+        PortSide::Left => Align2::RIGHT_TOP,
+        PortSide::Right => Align2::LEFT_TOP,
+    }
 }
 
 fn output_port(rect: Rect, zoom: f32) -> Pos2 {
@@ -1798,8 +2552,148 @@ fn hit_node(
         .nodes()
         .iter()
         .rev()
-        .find(|node| node_screen_rect(state, node.id, rect).contains(pointer))
+        // Backdrops are hit-tested separately, and only on their header or
+        // resize handle, so a card sitting inside one stays clickable.
+        .filter(|node| !is_backdrop_node(&node.kind))
+        .find(|node| node_screen_rect(state, node.id, rect, graph).contains(pointer))
         .map(|node| node.id)
+}
+
+/// Circular body of a `Dot` under the pointer, if any.
+///
+/// The `Dot` is deliberately compact, so its entire body is a drag handle.
+/// Wire drags only start from its stem tips (above `rect.top()` / below
+/// `rect.bottom()`), which keeps a body click from being hijacked by the
+/// generously sized port hit-test.
+fn hit_dot_body(
+    state: &NodeCanvasState,
+    graph: &GraphMirror,
+    pointer: Pos2,
+    rect: Rect,
+) -> Option<NodeId> {
+    graph
+        .nodes()
+        .iter()
+        .rev()
+        .filter(|node| is_dot_node(&node.kind))
+        .find(|node| {
+            let node_rect = node_screen_rect(state, node.id, rect, graph);
+            pointer.distance(node_rect.center()) <= node_rect.width() * 0.5
+        })
+        .map(|node| node.id)
+}
+
+/// Screen rect of a backdrop's draggable top header bar.
+fn backdrop_header_rect(rect: Rect, zoom: f32) -> Rect {
+    let header_h = (24.0 * zoom).clamp(12.0, 24.0);
+    Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.min.y + header_h))
+}
+
+/// Screen rect of a backdrop's bottom-right resize grip.
+fn backdrop_resize_handle_rect(rect: Rect, zoom: f32) -> Rect {
+    let grip = 16.0 * zoom;
+    Rect::from_min_size(rect.right_bottom() - Vec2::splat(grip), Vec2::splat(grip))
+}
+
+/// Topmost `BackdropNode` whose header bar contains `pointer`.
+fn hit_backdrop_header(
+    state: &NodeCanvasState,
+    graph: &GraphMirror,
+    pointer: Pos2,
+    rect: Rect,
+) -> Option<NodeId> {
+    graph
+        .nodes()
+        .iter()
+        .rev()
+        .filter(|node| is_backdrop_node(&node.kind))
+        .find(|node| {
+            let node_rect = node_screen_rect(state, node.id, rect, graph);
+            backdrop_header_rect(node_rect, state.zoom).contains(pointer)
+        })
+        .map(|node| node.id)
+}
+
+/// Topmost `BackdropNode` whose bottom-right resize grip contains `pointer`.
+fn hit_backdrop_resize_handle(
+    state: &NodeCanvasState,
+    graph: &GraphMirror,
+    pointer: Pos2,
+    rect: Rect,
+) -> Option<NodeId> {
+    graph
+        .nodes()
+        .iter()
+        .rev()
+        .filter(|node| is_backdrop_node(&node.kind))
+        .find(|node| {
+            let node_rect = node_screen_rect(state, node.id, rect, graph);
+            backdrop_resize_handle_rect(node_rect, state.zoom).contains(pointer)
+        })
+        .map(|node| node.id)
+}
+
+/// Non-backdrop nodes whose world-space center lies inside `backdrop`'s rect.
+///
+/// Used to move a backdrop's contents with it when its header is dragged.
+fn backdrop_enclosed_nodes(
+    state: &NodeCanvasState,
+    graph: &GraphMirror,
+    backdrop: NodeId,
+) -> Vec<NodeId> {
+    let Some(node) = graph.node(backdrop) else {
+        return Vec::new();
+    };
+    let Some(position) = state.node_position(backdrop) else {
+        return Vec::new();
+    };
+    let bounds = Rect::from_min_size(position, node_world_size(node));
+    graph
+        .nodes()
+        .iter()
+        .filter(|candidate| !is_backdrop_node(&candidate.kind))
+        .filter(|candidate| {
+            state.node_position(candidate.id).is_some_and(|position| {
+                let center = position + node_world_size(candidate) * 0.5;
+                bounds.contains(center)
+            })
+        })
+        .map(|candidate| candidate.id)
+        .collect()
+}
+
+/// Latches the exact set of nodes a drag gesture will move.
+///
+/// Runs once on the mouse-down frame. It records every selected node, plus the
+/// contents of every selected `BackdropNode` **as they are right now**. Nothing
+/// may add to this set while the button is held, so sweeping a backdrop across
+/// other cards can never vacuum them up.
+fn latch_drag_start(state: &mut NodeCanvasState, graph: &GraphMirror) {
+    state.drag_start_positions.clear();
+    let selected: Vec<NodeId> = state.selected_nodes.iter().copied().collect();
+    for id in &selected {
+        if let Some(node) = graph.node(*id) {
+            state.drag_start_positions.insert(*id, (node.x, node.y));
+        }
+    }
+    // A selected backdrop drags the cards it encloses at mouse-down. Those
+    // cards join the drag group but never the selection.
+    for id in selected {
+        let is_backdrop = graph
+            .node(id)
+            .is_some_and(|node| is_backdrop_node(&node.kind));
+        if !is_backdrop {
+            continue;
+        }
+        for enclosed in backdrop_enclosed_nodes(state, graph, id) {
+            if let Some(node) = graph.node(enclosed) {
+                state
+                    .drag_start_positions
+                    .entry(enclosed)
+                    .or_insert((node.x, node.y));
+            }
+        }
+    }
 }
 
 fn hit_input_port(
@@ -1810,10 +2704,21 @@ fn hit_input_port(
 ) -> Option<(NodeId, PortId)> {
     let radius = port_hit_radius(state.zoom);
     for node in graph.nodes().iter().rev() {
-        let node_rect = node_screen_rect(state, node.id, rect);
+        // A `BackdropNode` is a canvas container, never a wiring target.
+        if is_backdrop_node(&node.kind) {
+            continue;
+        }
+        let node_rect = node_screen_rect(state, node.id, rect, graph);
         let count = input_port_count(&node.kind);
         for port in 0..count {
-            let position = input_port(node_rect, PortId(port as u16), count);
+            let pin = input_port(node_rect, &node.kind, count, PortId(port as u16));
+            // A `Dot`'s compact body is a drag handle, so only its stem tip may
+            // start a wire drag; every other cartridge keeps the pin anchor.
+            let position = if is_dot_node(&node.kind) {
+                input_port_stem_tip(pin, input_port_side(&node.kind, count, port), state.zoom)
+            } else {
+                pin
+            };
             if pointer.distance(position) <= radius {
                 return Some((node.id, PortId(port as u16)));
             }
@@ -1833,8 +2738,9 @@ fn hit_output_port(
         .nodes()
         .iter()
         .rev()
+        .filter(|node| !is_backdrop_node(&node.kind))
         .find(|node| {
-            let node_rect = node_screen_rect(state, node.id, rect);
+            let node_rect = node_screen_rect(state, node.id, rect, graph);
             pointer.distance(output_port(node_rect, state.zoom)) <= radius
         })
         .map(|node| node.id)
@@ -1846,6 +2752,9 @@ fn hit_output_port(
 /// port 0 as the main `in` pipe and port 1 as the optional mask, so a mask can
 /// never be mistaken for the A pipe. Single-input nodes stay unlabeled.
 pub fn input_port_label(kind: &str, input_count: usize, port_index: usize) -> &'static str {
+    if kind == "Dot" {
+        return "";
+    }
     if kind == "Merge2" || input_count == 3 {
         return match port_index {
             0 => "B",
@@ -1864,41 +2773,173 @@ pub fn input_port_label(kind: &str, input_count: usize, port_index: usize) -> &'
     }
 }
 
-fn draw_grid(painter: &Painter, rect: Rect, pan: Vec2, zoom: f32) {
-    painter.rect_filled(rect, 0.0, BG);
+/// Draws a `Dot` routing elbow: a filled circle with a compact input stem above
+/// and an output stem below, so wires visibly pass through it.
+fn draw_dot(painter: &Painter, rect: Rect, selected: bool, zoom: f32, pal: &ThemePalette) {
+    let center = rect.center();
+    let radius = rect.width() * 0.5;
+    // Soft drop shadow behind the circle.
+    painter.circle_filled(
+        center + Vec2::new(1.5 * zoom, 2.5 * zoom),
+        radius,
+        pal.card_shadow,
+    );
+    // Filled circle body.
+    painter.circle_filled(center, radius, pal.pin_b);
+    let rim = if selected {
+        Stroke::new(2.0 * zoom, pal.selected_rim)
+    } else {
+        Stroke::new(1.0 * zoom, pal.card_border)
+    };
+    painter.circle_stroke(center, radius, rim);
 
-    let mut spacing = GRID_SPACING * zoom;
-    while spacing < 12.0 {
-        spacing *= 2.0;
+    // Top input stem and pin, mirroring the output side so both wire anchors
+    // sit clear of the circular body.
+    let input = rect.center_top() - Vec2::new(0.0, PORT_LEAD * zoom);
+    painter.line_segment(
+        [rect.center_top(), input],
+        Stroke::new((1.5 * zoom).max(0.6), pal.wire_default),
+    );
+    painter.circle_filled(input, 2.5 * zoom, pal.wire_default);
+    // Bottom output dot, joined to the wire anchor by a short stem.
+    let output = output_port(rect, zoom);
+    painter.line_segment(
+        [rect.center_bottom(), output],
+        Stroke::new((1.5 * zoom).max(0.6), pal.wire_default),
+    );
+    painter.circle_filled(output, 2.5 * zoom, pal.wire_default);
+}
+
+/// Draws a `BackdropNode` container: a tinted fill with a solid header bar
+/// showing the backdrop's label, plus a subtle resize grip in the bottom-right
+/// corner. Drawn behind wires and regular nodes (3-layer z-order).
+fn draw_backdrop(
+    painter: &Painter,
+    rect: Rect,
+    node: &CanvasNode,
+    zoom: f32,
+    pal: &ThemePalette,
+    selected: bool,
+) {
+    let color_name = node
+        .knobs
+        .get("color")
+        .and_then(|v| match v {
+            KnobValue::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .unwrap_or("slate");
+    let tint = backdrop_tint_color(color_name);
+
+    // Semi-transparent body fill.
+    painter.rect_filled(
+        rect,
+        CornerRadius::same((6.0 * zoom).clamp(1.0, 12.0) as u8),
+        Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 48),
+    );
+
+    // Solid header bar at the top.
+    let header_h = (24.0 * zoom).clamp(12.0, 24.0);
+    let header_rect = Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.min.y + header_h));
+    painter.rect_filled(
+        header_rect,
+        CornerRadius {
+            nw: (6.0 * zoom).clamp(1.0, 12.0) as u8,
+            ne: (6.0 * zoom).clamp(1.0, 12.0) as u8,
+            sw: 0,
+            se: 0,
+        },
+        Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 210),
+    );
+
+    // Outline border.
+    let border_width = if selected { 2.0 } else { 1.0 };
+    let border_color = if selected {
+        pal.selected_rim
+    } else {
+        Color32::from_black_alpha(120)
+    };
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same((6.0 * zoom).clamp(1.0, 12.0) as u8),
+        Stroke::new(border_width, border_color),
+        StrokeKind::Inside,
+    );
+
+    // Backdrop label in bold white inside the header bar.
+    let label = node
+        .knobs
+        .get("label")
+        .and_then(|v| match v {
+            KnobValue::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .unwrap_or("Backdrop");
+    painter.text(
+        header_rect.min + Vec2::new(10.0, header_h / 2.0),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional((11.0 * zoom).clamp(8.0, 14.0)),
+        Color32::WHITE,
+    );
+
+    // Subtle diagonal resize grip in the bottom-right corner.
+    let grip = 14.0 * zoom;
+    let grip_rect = Rect::from_min_size(rect.right_bottom() - Vec2::splat(grip), Vec2::splat(grip));
+    let grip_stroke = Stroke::new((1.0 * zoom).max(0.5), Color32::from_black_alpha(140));
+    for step in 1..=3 {
+        let offset = grip * step as f32 / 4.0;
+        painter.line_segment(
+            [
+                Pos2::new(grip_rect.right() - offset, grip_rect.bottom()),
+                Pos2::new(grip_rect.right(), grip_rect.bottom() - offset),
+            ],
+            grip_stroke,
+        );
     }
+}
+
+fn draw_grid(painter: &Painter, rect: Rect, pan: Vec2, zoom: f32, pal: &ThemePalette) {
+    painter.rect_filled(rect, 0.0, pal.canvas_bg);
+
+    let spacing = (GRID_SPACING * zoom).max(18.0);
     let origin = rect.min + pan;
 
-    let first_x = ((rect.left() - origin.x) / spacing).floor() as i64;
-    let last_x = ((rect.right() - origin.x) / spacing).ceil() as i64;
-    for index in first_x..=last_x {
-        let x = origin.x + index as f32 * spacing;
-        let major = index.rem_euclid(5) == 0;
-        painter.line_segment(
-            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            Stroke::new(
-                if major { 1.0 } else { 0.5 },
-                if major { GRID_MAJOR } else { GRID_MINOR },
-            ),
-        );
-    }
+    if pal.use_dot_grid {
+        // Fusion: dot grid at intersections.
+        let first_x = ((rect.left() - origin.x) / spacing).floor() as i64;
+        let last_x = ((rect.right() - origin.x) / spacing).ceil() as i64;
+        let first_y = ((rect.top() - origin.y) / spacing).floor() as i64;
+        let last_y = ((rect.bottom() - origin.y) / spacing).ceil() as i64;
+        for x in first_x..=last_x {
+            for y in first_y..=last_y {
+                let pos = Pos2::new(origin.x + x as f32 * spacing, origin.y + y as f32 * spacing);
+                if rect.contains(pos) {
+                    painter.circle_filled(pos, 1.5, pal.grid_line);
+                }
+            }
+        }
+    } else {
+        // Nuke / Natron: line grid.
+        let first_x = ((rect.left() - origin.x) / spacing).floor() as i64;
+        let last_x = ((rect.right() - origin.x) / spacing).ceil() as i64;
+        for index in first_x..=last_x {
+            let x = origin.x + index as f32 * spacing;
+            painter.line_segment(
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                Stroke::new(1.0, pal.grid_line),
+            );
+        }
 
-    let first_y = ((rect.top() - origin.y) / spacing).floor() as i64;
-    let last_y = ((rect.bottom() - origin.y) / spacing).ceil() as i64;
-    for index in first_y..=last_y {
-        let y = origin.y + index as f32 * spacing;
-        let major = index.rem_euclid(5) == 0;
-        painter.line_segment(
-            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-            Stroke::new(
-                if major { 1.0 } else { 0.5 },
-                if major { GRID_MAJOR } else { GRID_MINOR },
-            ),
-        );
+        let first_y = ((rect.top() - origin.y) / spacing).floor() as i64;
+        let last_y = ((rect.bottom() - origin.y) / spacing).ceil() as i64;
+        for index in first_y..=last_y {
+            let y = origin.y + index as f32 * spacing;
+            painter.line_segment(
+                [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                Stroke::new(1.0, pal.grid_line),
+            );
+        }
     }
 }
 
@@ -1908,30 +2949,73 @@ fn draw_node(
     rect: Rect,
     node: &CanvasNode,
     selected: bool,
-    is_viewer: bool,
+    viewer_slot_label: Option<&'static str>,
     zoom: f32,
+    pal: &ThemePalette,
     active_port: Option<PortId>,
 ) {
     let crashed = node.crashed.is_some();
     let disabled = node.disabled;
-    let (fill, header, border) = if crashed {
-        (CRASH_FILL, CRASH_HEADER, CRASH_BORDER)
-    } else if disabled {
-        (DISABLED_FILL, DISABLED_HEADER, NODE_BORDER)
-    } else {
-        (NODE_FILL, NODE_HEADER, NODE_BORDER)
-    };
-    // Bypassed nodes read as "muted" so the eye skips them.
-    let text_tint = if disabled {
-        Color32::from_gray(150)
-    } else {
-        Color32::from_gray(235)
-    };
-    let radius = CornerRadius::same((4.0 * zoom).clamp(1.0, 8.0) as u8);
+    let cat = node_category(&node.kind);
 
-    painter.rect_filled(rect, radius, fill);
-    let header_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), HEADER_H * zoom));
-    painter.rect_filled(header_rect, radius, header);
+    // Scaled corner radius, clamped to stay sensible at extreme zoom levels.
+    let r = (pal.card_corner_radius as f32 * zoom)
+        .round()
+        .clamp(1.0, 12.0) as u8;
+    let full_rounding = CornerRadius::same(r);
+    let top_only_rounding = CornerRadius {
+        nw: r,
+        ne: r,
+        sw: 0,
+        se: 0,
+    };
+
+    // Body fill: full-body category fill for Classic, otherwise dark body.
+    let body_fill = if crashed {
+        Color32::from_rgb(58, 22, 24)
+    } else if pal.full_body_category_fill && !disabled {
+        pal.category_color(cat)
+    } else if disabled {
+        pal.card_body_bg.linear_multiply(0.7)
+    } else {
+        pal.card_body_bg
+    };
+
+    // 1. Drop shadow behind the card.
+    painter.rect_filled(
+        rect.translate(Vec2::new(3.0 * zoom, 4.0 * zoom)),
+        full_rounding,
+        pal.card_shadow,
+    );
+
+    // 2. Card base body.
+    painter.rect_filled(rect, full_rounding, body_fill);
+
+    // Classic full-body cards: a slim dark footer strip at the bottom 32%
+    // behind #id and VIEWER badges so both the category color and badges
+    // read with high contrast.
+    if pal.full_body_category_fill && !crashed {
+        let footer_h = rect.height() * 0.32;
+        let footer_rect =
+            Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - footer_h), rect.max);
+        painter.rect_filled(footer_rect, 0.0, Color32::from_black_alpha(110));
+    }
+
+    // 3. Category header band: top-only rounding so the bottom edge sits flat.
+    let header_h = (rect.height() * 0.44).clamp(14.0 * zoom, 26.0 * zoom);
+    let header_rect = Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.min.y + header_h));
+
+    let header_color = if crashed {
+        Color32::from_rgb(230, 70, 70) // bright Airbag red
+    } else if disabled {
+        pal.category_color(cat).linear_multiply(0.7)
+    } else {
+        pal.category_color(cat)
+    };
+
+    painter.rect_filled(header_rect, top_only_rounding, header_color);
+
+    // 1 px dark separator along the header bottom edge.
     painter.line_segment(
         [
             Pos2::new(rect.left(), header_rect.bottom()),
@@ -1940,31 +3024,35 @@ fn draw_node(
         Stroke::new(1.0, Color32::from_black_alpha(90)),
     );
 
-    let output = output_port(rect, zoom);
-    let stub = Stroke::new((1.5 * zoom).max(0.6), border);
-
-    // Input ports: B (0), A (1), mask (2) laid out along the top edge.
+    // Input ports: role-colored pins by PortSide.
     let count = input_port_count(&node.kind);
     let box_size = (9.0 * zoom).max(5.0);
     for port in 0..count {
         let port_id = PortId(port as u16);
-        let position = input_port(rect, port_id, count);
-        painter.line_segment(
-            [position - Vec2::new(0.0, PORT_LEAD * zoom), position],
-            stub,
-        );
+        let side = input_port_side(&node.kind, count, port);
+        let position = input_port(rect, &node.kind, count, port_id);
+        let stem_tip = input_port_stem_tip(position, side, zoom);
+
+        let pin_color = match side {
+            PortSide::Top => pal.pin_b,
+            PortSide::Left => pal.pin_a,
+            PortSide::Right => pal.pin_m,
+        };
+
+        let stub = Stroke::new((1.5 * zoom).max(0.6), pin_color);
+        painter.line_segment([stem_tip, position], stub);
         let active = active_port == Some(port_id);
         let port_rect = Rect::from_center_size(position, Vec2::splat(box_size));
         painter.rect_filled(
             port_rect,
             CornerRadius::same(1),
-            if active { WIRE_ACTIVE } else { border },
+            if active { WIRE_ACTIVE } else { pin_color },
         );
         let label = input_port_label(&node.kind, count, port);
         if !label.is_empty() {
             painter.text(
-                port_label_position(position, zoom),
-                Align2::CENTER_BOTTOM,
+                input_port_label_position(position, side, zoom),
+                input_port_label_align(side),
                 label,
                 FontId::proportional((9.0 * zoom).clamp(7.0, 11.0)),
                 Color32::from_gray(200),
@@ -1972,16 +3060,28 @@ fn draw_node(
         }
     }
 
+    // Output port at bottom center.
+    let output = output_port(rect, zoom);
+    let stub = Stroke::new((1.5 * zoom).max(0.6), pal.card_border);
     painter.line_segment([rect.center_bottom(), output], stub);
-    painter.circle_filled(output, (4.0 * zoom).max(2.5), border);
+    painter.circle_filled(output, (4.0 * zoom).max(2.5), pal.card_border);
 
+    // 5. Crisp shadowed typography: 1 px dark drop-shadow behind bright white kind text.
     let header_font = FontId::proportional((13.0 * zoom).clamp(9.0, 17.0));
+    let kind_pos = rect.left_top() + Vec2::new(8.0 * zoom, 4.0 * zoom);
     painter.text(
-        rect.left_top() + Vec2::new(8.0 * zoom, 4.0 * zoom),
+        kind_pos + Vec2::new(1.0, 1.0),
+        Align2::LEFT_TOP,
+        node.kind.as_str(),
+        header_font.clone(),
+        Color32::from_black_alpha(160),
+    );
+    painter.text(
+        kind_pos,
         Align2::LEFT_TOP,
         node.kind.as_str(),
         header_font,
-        text_tint,
+        Color32::WHITE,
     );
 
     let body_font = FontId::proportional((12.0 * zoom).clamp(9.0, 16.0));
@@ -2007,7 +3107,30 @@ fn draw_node(
         );
     }
 
-    painter.rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
+    // 4. Card border & active selection rim on `rect` with full_rounding.
+    let (border_color, border_width) = if crashed {
+        (Color32::from_rgb(230, 70, 70), 2.0)
+    } else if selected {
+        (pal.selected_rim, 2.0)
+    } else {
+        (pal.card_border, 1.0)
+    };
+    painter.rect_stroke(
+        rect,
+        full_rounding,
+        Stroke::new(border_width, border_color),
+        StrokeKind::Inside,
+    );
+
+    // Additional outside selection rim for high visibility.
+    if selected {
+        painter.rect_stroke(
+            rect.expand(2.0),
+            full_rounding,
+            Stroke::new(2.0, pal.selected_rim),
+            StrokeKind::Outside,
+        );
+    }
 
     // Nuke's bypass marker: a bold diagonal `X` across the whole card.
     if disabled {
@@ -2016,31 +3139,22 @@ fn draw_node(
         painter.line_segment([rect.left_bottom(), rect.right_top()], stroke);
     }
 
-    if selected {
-        painter.rect_stroke(
-            rect.expand(2.0),
-            radius,
-            Stroke::new(2.0, SELECTED),
-            StrokeKind::Outside,
-        );
-    }
-
-    if is_viewer {
+    if let Some(label) = viewer_slot_label {
         painter.rect_stroke(
             rect.expand(4.0),
-            radius,
-            Stroke::new(2.0, VIEWER),
+            full_rounding,
+            Stroke::new(2.0, pal.viewer_badge_accent),
             StrokeKind::Outside,
         );
         let tag = Rect::from_min_size(
             rect.right_bottom() + Vec2::new(-58.0 * zoom, -16.0 * zoom),
             Vec2::new(54.0 * zoom, 13.0 * zoom),
         );
-        painter.rect_filled(tag, CornerRadius::same(2), VIEWER);
+        painter.rect_filled(tag, CornerRadius::same(2), pal.viewer_badge_accent);
         painter.text(
             tag.center(),
             Align2::CENTER_CENTER,
-            "VIEWER 1",
+            label,
             FontId::proportional((9.0 * zoom).clamp(7.0, 11.0)),
             Color32::from_rgb(30, 24, 8),
         );
@@ -2051,18 +3165,24 @@ fn draw_wire(
     painter: &Painter,
     from: Pos2,
     to: Pos2,
+    to_side: PortSide,
     zoom: f32,
     color: Color32,
     label: Option<&str>,
 ) {
-    let distance = (to.y - from.y).abs().max(40.0 * zoom);
+    let distance = match to_side {
+        PortSide::Top => (to.y - from.y).abs(),
+        PortSide::Left | PortSide::Right => (to.x - from.x).abs(),
+    }
+    .max(40.0 * zoom);
     let control = distance * 0.5;
-    let points = [
-        from,
-        from + Vec2::new(0.0, control),
-        to - Vec2::new(0.0, control),
-        to,
-    ];
+    let cp1 = from + Vec2::new(0.0, control);
+    let cp2 = match to_side {
+        PortSide::Top => to - Vec2::new(0.0, control),
+        PortSide::Left => to - Vec2::new(control, 0.0),
+        PortSide::Right => to + Vec2::new(control, 0.0),
+    };
+    let points = [from, cp1, cp2, to];
     painter.add(Shape::CubicBezier(CubicBezierShape::from_points_stroke(
         points,
         false,
@@ -2071,21 +3191,34 @@ fn draw_wire(
     )));
 
     let head = 6.0 * zoom.max(0.8);
-    let tip = to - Vec2::new(0.0, head * 0.5);
-    painter.add(Shape::convex_polygon(
-        vec![
-            tip,
-            tip + Vec2::new(-head * 0.6, -head),
-            tip + Vec2::new(head * 0.6, -head),
+    let arrow = match to_side {
+        PortSide::Top => vec![
+            to - Vec2::new(0.0, head * 0.5),
+            to + Vec2::new(-head * 0.6, -head * 1.5),
+            to + Vec2::new(head * 0.6, -head * 1.5),
         ],
-        color,
-        Stroke::NONE,
-    ));
+        PortSide::Left => vec![
+            to - Vec2::new(head * 0.5, 0.0),
+            to + Vec2::new(-head * 1.5, -head * 0.6),
+            to + Vec2::new(-head * 1.5, head * 0.6),
+        ],
+        PortSide::Right => vec![
+            to + Vec2::new(head * 0.5, 0.0),
+            to + Vec2::new(head * 1.5, -head * 0.6),
+            to + Vec2::new(head * 1.5, head * 0.6),
+        ],
+    };
+    painter.add(Shape::convex_polygon(arrow, color, Stroke::NONE));
 
     if let Some(label) = label {
+        let (anchor, align) = match to_side {
+            PortSide::Top => (to + Vec2::new(8.0, 2.0), Align2::LEFT_TOP),
+            PortSide::Left => (to - Vec2::new(8.0, 0.0), Align2::RIGHT_CENTER),
+            PortSide::Right => (to + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER),
+        };
         painter.text(
-            to + Vec2::new(8.0, 2.0),
-            Align2::LEFT_TOP,
+            anchor,
+            align,
             label,
             FontId::proportional((11.0 * zoom).clamp(9.0, 14.0)),
             color,
@@ -2433,13 +3566,18 @@ mod tests {
     }
 
     #[test]
-    fn input_ports_spread_across_the_node_top() {
+    fn input_ports_follow_side_aware_geometry() {
         let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(120.0, 72.0));
 
-        assert_eq!(input_port(rect, PortId(0), 1), Pos2::new(60.0, 0.0));
-        assert_eq!(input_port(rect, PortId(0), 2), Pos2::new(40.0, 0.0));
-        assert_eq!(input_port(rect, PortId(1), 2), Pos2::new(80.0, 0.0));
-        assert_eq!(input_port(rect, PortId(2), 3), Pos2::new(90.0, 0.0));
+        assert_eq!(input_port(rect, "Blur", 1, PortId(0)), rect.center_top());
+        assert_eq!(input_port(rect, "Grade", 2, PortId(0)), rect.center_top());
+        assert_eq!(input_port(rect, "Grade", 2, PortId(1)), rect.right_center());
+        assert_eq!(input_port(rect, "Merge2", 3, PortId(0)), rect.center_top());
+        assert_eq!(input_port(rect, "Merge2", 3, PortId(1)), rect.left_center());
+        assert_eq!(
+            input_port(rect, "Merge2", 3, PortId(2)),
+            rect.right_center()
+        );
     }
 
     #[test]
@@ -2534,6 +3672,101 @@ mod tests {
     }
 
     #[test]
+    fn nuke_keys_spawn_unconnected_sources_and_chain_processors_vertically() {
+        assert_eq!(nuke_key_to_node_kind(Key::R), Some("Read"));
+        assert_eq!(nuke_key_to_node_kind(Key::W), Some("Write"));
+        assert_eq!(nuke_key_to_node_kind(Key::C), Some("Constant"));
+        assert_eq!(nuke_key_to_node_kind(Key::G), Some("Grade"));
+        assert_eq!(nuke_key_to_node_kind(Key::B), Some("Blur"));
+        assert_eq!(nuke_key_to_node_kind(Key::T), Some("Transform"));
+        assert_eq!(nuke_key_to_node_kind(Key::M), Some("Merge2"));
+        assert_eq!(nuke_key_to_node_kind(Key::Q), None);
+
+        let mut graph = GraphMirror::default();
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(1),
+            kind: "Constant".to_string(),
+            x: 40.0,
+            y: 40.0,
+        });
+        let mut state = NodeCanvasState::default();
+
+        // No selection: a processor spawns unconnected at the cursor.
+        match spawn_node_message(&graph, &mut state, "Grade", Pos2::new(300.0, 200.0)) {
+            KernelMessage::Execute(UndoableCommand::AddNode { id, kind, x, y }) => {
+                assert_eq!(id, NodeId(2));
+                assert_eq!(kind, "Grade");
+                assert_eq!((x, y), (300.0, 200.0));
+            }
+            other => panic!("expected an unconnected AddNode, got {other:?}"),
+        }
+        assert_eq!(state.primary_selected, Some(NodeId(2)));
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(2),
+            kind: "Grade".to_string(),
+            x: 300.0,
+            y: 200.0,
+        });
+
+        // A selected processor chains below it at y + 90 in one atomic batch.
+        match spawn_node_message(&graph, &mut state, "Blur", Pos2::new(0.0, 0.0)) {
+            KernelMessage::Execute(UndoableCommand::Batch(commands)) => {
+                assert_eq!(commands.len(), 2);
+                match &commands[0] {
+                    UndoableCommand::AddNode { id, kind, x, y } => {
+                        assert_eq!(*id, NodeId(3));
+                        assert_eq!(kind, "Blur");
+                        assert_eq!((*x, *y), (300.0, 290.0));
+                    }
+                    other => panic!("expected AddNode first, got {other:?}"),
+                }
+                match &commands[1] {
+                    UndoableCommand::ConnectEdge {
+                        from_node,
+                        from_port,
+                        to_node,
+                        to_port,
+                    } => {
+                        assert_eq!(*from_node, NodeId(2));
+                        assert_eq!(*from_port, PortId(0));
+                        assert_eq!(*to_node, NodeId(3));
+                        assert_eq!(*to_port, PortId(0));
+                    }
+                    other => panic!("expected ConnectEdge second, got {other:?}"),
+                }
+            }
+            other => panic!("expected an atomic AddNode + ConnectEdge batch, got {other:?}"),
+        }
+        assert_eq!(state.primary_selected, Some(NodeId(3)));
+        for command in [
+            UndoableCommand::AddNode {
+                id: NodeId(3),
+                kind: "Blur".to_string(),
+                x: 300.0,
+                y: 290.0,
+            },
+            UndoableCommand::ConnectEdge {
+                from_node: NodeId(2),
+                from_port: PortId(0),
+                to_node: NodeId(3),
+                to_port: PortId(0),
+            },
+        ] {
+            graph.apply_command(&command);
+        }
+
+        // Sources never chain, even with a processor selected.
+        match spawn_node_message(&graph, &mut state, "Constant", Pos2::new(500.0, 500.0)) {
+            KernelMessage::Execute(UndoableCommand::AddNode { id, kind, x, y }) => {
+                assert_eq!(id, NodeId(4));
+                assert_eq!(kind, "Constant");
+                assert_eq!((x, y), (500.0, 500.0));
+            }
+            other => panic!("expected an unconnected source AddNode, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn search_open_flag_tracks_the_popup() {
         let mut state = NodeCanvasState::default();
         assert!(!state.is_search_open());
@@ -2543,6 +3776,8 @@ mod tests {
             world_pos: Pos2::ZERO,
             query: String::new(),
             just_opened: true,
+            selected_snapshot: HashSet::new(),
+            primary_snapshot: None,
         });
         assert!(state.is_search_open());
     }
@@ -2558,6 +3793,25 @@ mod tests {
         assert_ne!(input_port_label("Grade", 2, 1), "A");
 
         assert_eq!(input_port_label("Blur", 1, 0), "");
+    }
+
+    #[test]
+    fn pin_geometry_places_b_top_a_left_and_mask_right() {
+        assert_eq!(input_port_side("Merge2", 3, 0), PortSide::Top);
+        assert_eq!(input_port_side("Merge2", 3, 1), PortSide::Left);
+        assert_eq!(input_port_side("Merge2", 3, 2), PortSide::Right);
+        assert_eq!(input_port_side("Grade", 2, 0), PortSide::Top);
+        assert_eq!(input_port_side("Grade", 2, 1), PortSide::Right);
+
+        let rect = Rect::from_min_size(Pos2::new(100.0, 200.0), Vec2::new(NODE_W, NODE_H));
+        assert_eq!(input_port(rect, "Merge2", 3, PortId(0)), rect.center_top());
+        assert_eq!(input_port(rect, "Merge2", 3, PortId(1)), rect.left_center());
+        assert_eq!(
+            input_port(rect, "Merge2", 3, PortId(2)),
+            rect.right_center()
+        );
+        assert_eq!(input_port(rect, "Grade", 2, PortId(0)), rect.center_top());
+        assert_eq!(input_port(rect, "Grade", 2, PortId(1)), rect.right_center());
     }
 
     #[test]
@@ -2930,6 +4184,174 @@ mod tests {
         )
         .drop_without_applying_deltas();
         assert!(!canvas.dragging_nodes, "drag should end on release");
+    }
+
+    /// A `Dot`'s compact body must drag the node freely. Only its stem tips may
+    /// start a wire drag, so a body press can never be hijacked by the port
+    /// hit-test.
+    #[test]
+    fn dot_body_drag_moves_dot_without_starting_wire_drag() {
+        let ctx = egui::Context::default();
+        let mut graph = GraphMirror::default();
+        graph.apply_event(&KernelEvent::Applied(UndoableCommand::AddNode {
+            id: NodeId(1),
+            kind: "Dot".to_string(),
+            x: 200.0,
+            y: 200.0,
+        }));
+        let mut canvas = NodeCanvasState::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0));
+
+        let _ = run_canvas_pass(&ctx, screen, vec![], &mut canvas, &graph);
+        let rect = canvas
+            .last_canvas_rect
+            .expect("the canvas must be laid out");
+        let center = Pos2::new(200.0, 200.0) + DOT_SIZE * 0.5;
+        let press = canvas.world_to_screen(rect, center);
+        let dragged = press + Vec2::new(60.0, 20.0);
+
+        // Frame 1: press dead-center on the Dot body.
+        let messages = run_canvas_pass(
+            &ctx,
+            screen,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            &mut canvas,
+            &graph,
+        );
+        assert!(
+            canvas.dragging_nodes,
+            "a Dot body press must latch a node drag"
+        );
+        assert!(
+            canvas.active_wire_drag.is_none(),
+            "a Dot body press must not start a wire drag"
+        );
+        assert!(
+            messages.is_empty(),
+            "the press frame must not emit, got {messages:?}"
+        );
+
+        // Frame 2: drag by (+60, +20).
+        let messages = run_canvas_pass(
+            &ctx,
+            screen,
+            vec![egui::Event::PointerMoved(dragged)],
+            &mut canvas,
+            &graph,
+        );
+        assert!(
+            canvas.active_wire_drag.is_none(),
+            "dragging a Dot must never start a wire drag"
+        );
+        let mut moves = Vec::new();
+        for message in &messages {
+            if let KernelMessage::Execute(command) = message {
+                collect_moves(command, &mut moves);
+            }
+        }
+        assert!(
+            moves.iter().any(|(id, _, _, to_x, to_y)| {
+                *id == NodeId(1) && (*to_x - 260.0).abs() < 1e-3 && (*to_y - 220.0).abs() < 1e-3
+            }),
+            "the Dot must move by (+60, +20), got {moves:?}"
+        );
+    }
+
+    /// Sweeping an empty backdrop across existing cards must never capture or
+    /// move them: the enclosed set is latched once, at mouse-down.
+    #[test]
+    fn dragging_empty_backdrop_across_nodes_never_captures_or_moves_them() {
+        let ctx = egui::Context::default();
+        let mut graph = GraphMirror::default();
+        graph.apply_event(&KernelEvent::Applied(add_node(1, 0.0, 0.0)));
+        graph.apply_event(&KernelEvent::Applied(add_node(2, 0.0, 90.0)));
+        graph.apply_event(&KernelEvent::Applied(UndoableCommand::Batch(vec![
+            UndoableCommand::AddNode {
+                id: NodeId(3),
+                kind: "BackdropNode".to_string(),
+                x: 300.0,
+                y: 0.0,
+            },
+            UndoableCommand::SetKnob {
+                node: NodeId(3),
+                knob: "bdwidth".to_string(),
+                value: KnobValue::Float(200.0),
+                previous: KnobValue::Float(320.0),
+            },
+            UndoableCommand::SetKnob {
+                node: NodeId(3),
+                knob: "bdheight".to_string(),
+                value: KnobValue::Float(140.0),
+                previous: KnobValue::Float(200.0),
+            },
+        ])));
+
+        let mut canvas = NodeCanvasState::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0));
+        let _ = run_canvas_pass(&ctx, screen, vec![], &mut canvas, &graph);
+        let rect = canvas
+            .last_canvas_rect
+            .expect("the canvas must be laid out");
+
+        // Grab the empty backdrop's header and sweep it over both cards.
+        let press = canvas.world_to_screen(rect, Pos2::new(310.0, 8.0));
+        let release = canvas.world_to_screen(rect, Pos2::new(10.0, 8.0));
+
+        let messages = run_canvas_pass(
+            &ctx,
+            screen,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            &mut canvas,
+            &graph,
+        );
+        assert!(
+            canvas.dragging_nodes,
+            "a backdrop header press must latch a drag"
+        );
+        assert!(
+            messages.is_empty(),
+            "the press frame must not emit, got {messages:?}"
+        );
+
+        let messages = run_canvas_pass(
+            &ctx,
+            screen,
+            vec![egui::Event::PointerMoved(release)],
+            &mut canvas,
+            &graph,
+        );
+        let mut moves = Vec::new();
+        for message in &messages {
+            if let KernelMessage::Execute(command) = message {
+                collect_moves(command, &mut moves);
+            }
+        }
+        assert!(
+            moves.iter().all(|(id, _, _, _, _)| *id == NodeId(3)),
+            "only the backdrop may move, got {moves:?}"
+        );
+        assert!(
+            moves
+                .iter()
+                .any(|(id, _, _, to_x, _)| *id == NodeId(3) && to_x.abs() < 1.0),
+            "the backdrop must follow the pointer to x = 0, got {moves:?}"
+        );
     }
 
     /// Pre-select two nodes, drag on one body, and assert a single Batch MoveNode
