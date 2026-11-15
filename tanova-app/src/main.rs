@@ -1051,17 +1051,17 @@ impl TanovaApp {
                 ui.separator();
                 ui.label("Viewer Mode:");
                 let mut next_workflow = self.workflow;
-                ui.selectable_value(&mut next_workflow, ViewerWorkflow::Nuke, "Nuke Node");
-                ui.selectable_value(&mut next_workflow, ViewerWorkflow::Fusion, "Fusion Target");
+                ui.selectable_value(&mut next_workflow, ViewerWorkflow::Nuke, "Viewer Node");
+                ui.selectable_value(&mut next_workflow, ViewerWorkflow::Fusion, "Direct Target");
                 if next_workflow != self.workflow {
                     self.set_workflow(next_workflow);
                 }
                 ui.separator();
                 ui.label("Theme:");
                 let mut next_theme = self.canvas.theme;
-                ui.selectable_value(&mut next_theme, StudioTheme::Nuke, "Nuke");
-                ui.selectable_value(&mut next_theme, StudioTheme::Natron, "Natron");
-                ui.selectable_value(&mut next_theme, StudioTheme::Fusion, "Fusion");
+                ui.selectable_value(&mut next_theme, StudioTheme::Classic, "Classic");
+                ui.selectable_value(&mut next_theme, StudioTheme::Slate, "Slate");
+                ui.selectable_value(&mut next_theme, StudioTheme::Midnight, "Midnight");
                 if next_theme != self.canvas.theme {
                     self.canvas.theme = next_theme;
                 }
@@ -1093,6 +1093,7 @@ impl TanovaApp {
             .min_size(250.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.properties.theme = self.canvas.theme;
                     let messages = self.properties.show(
                         ui,
                         &self.graph,
@@ -5223,15 +5224,15 @@ mod tests {
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
-        // Default theme is Nuke.
-        assert_eq!(app.canvas.theme, StudioTheme::Nuke);
+        // Default theme is Classic.
+        assert_eq!(app.canvas.theme, StudioTheme::Classic);
 
-        // Switch to Fusion before script reset.
-        app.canvas.theme = StudioTheme::Fusion;
+        // Switch to Midnight before script reset.
+        app.canvas.theme = StudioTheme::Midnight;
 
         // Reset script - theme must persist (reset_for_script must not touch it).
         app.execute_new_script();
-        assert_eq!(app.canvas.theme, StudioTheme::Fusion);
+        assert_eq!(app.canvas.theme, StudioTheme::Midnight);
 
         // Add a Merge2 node after reset.
         app.graph.apply_command(&UndoableCommand::AddNode {
@@ -5262,7 +5263,11 @@ mod tests {
         let ctx = egui::Context::default();
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
 
-        for theme in [StudioTheme::Nuke, StudioTheme::Natron, StudioTheme::Fusion] {
+        for theme in [
+            StudioTheme::Classic,
+            StudioTheme::Slate,
+            StudioTheme::Midnight,
+        ] {
             app.canvas.theme = theme;
             run_app_frame(&ctx, &mut app, screen, vec![]);
             app.pump();

@@ -535,7 +535,7 @@ impl Default for NodeCanvasState {
             node_menu_pos: None,
             node_menu_node: None,
             node_menu_open: false,
-            theme: StudioTheme::Nuke,
+            theme: StudioTheme::Classic,
         }
     }
 }
@@ -2066,28 +2066,34 @@ fn input_port_stem_tip(pin: Pos2, side: PortSide, zoom: f32) -> Pos2 {
 /// Anchor for an input port label, clear of the port stem.
 ///
 /// The stem rises [`PORT_LEAD`] pixels above the node's top edge, so the label
-/// sits `3 * zoom` pixels above its tip. `Align2::CENTER_BOTTOM` then keeps
-/// every glyph above the stem at any zoom level.
+/// Computes the label anchor sitting `(PORT_LEAD + 3.0) * zoom` above a pin,
+/// keeping every glyph clear of the stem tip. Used by `PortSide::Top` labels
+/// and directly tested by `port_labels_sit_above_the_stem_tip`.
+#[allow(dead_code)]
 fn port_label_position(position: Pos2, zoom: f32) -> Pos2 {
     position - Vec2::new(0.0, (PORT_LEAD + 3.0) * zoom)
 }
 
 /// Label anchor for an input pin on `side`.
+///
+/// `PortSide::Top` labels shift left of the vertical stem so incoming
+/// vertical wires pass cleanly to the right. `PortSide::Left` / `Right`
+/// labels sit below the horizontal stem so curving wires from above clear
+/// them.
 fn input_port_label_position(pin: Pos2, side: PortSide, zoom: f32) -> Pos2 {
-    let gap = (PORT_LEAD + 3.0) * zoom;
     match side {
-        PortSide::Top => port_label_position(pin, zoom),
-        PortSide::Left => pin - Vec2::new(gap, 0.0),
-        PortSide::Right => pin + Vec2::new(gap, 0.0),
+        PortSide::Top => Pos2::new(pin.x - 6.0 * zoom, pin.y - (PORT_LEAD + 3.0) * zoom),
+        PortSide::Left => pin - Vec2::new((PORT_LEAD + 2.0) * zoom, -5.0 * zoom),
+        PortSide::Right => pin + Vec2::new((PORT_LEAD + 2.0) * zoom, 5.0 * zoom),
     }
 }
 
 /// Text alignment that keeps a side-aware port label clear of its stem.
 fn input_port_label_align(side: PortSide) -> Align2 {
     match side {
-        PortSide::Top => Align2::CENTER_BOTTOM,
-        PortSide::Left => Align2::RIGHT_CENTER,
-        PortSide::Right => Align2::LEFT_CENTER,
+        PortSide::Top => Align2::RIGHT_BOTTOM,
+        PortSide::Left => Align2::RIGHT_TOP,
+        PortSide::Right => Align2::LEFT_TOP,
     }
 }
 
@@ -2246,9 +2252,11 @@ fn draw_node(
         se: 0,
     };
 
-    // Body fill: dark crimson when crashed, dimmed when bypassed.
+    // Body fill: full-body category fill for Classic, otherwise dark body.
     let body_fill = if crashed {
         Color32::from_rgb(58, 22, 24)
+    } else if pal.full_body_category_fill && !disabled {
+        pal.category_color(cat)
     } else if disabled {
         pal.card_body_bg.linear_multiply(0.7)
     } else {
@@ -2264,6 +2272,16 @@ fn draw_node(
 
     // 2. Card base body.
     painter.rect_filled(rect, full_rounding, body_fill);
+
+    // Classic full-body cards: a slim dark footer strip at the bottom 32%
+    // behind #id and VIEWER badges so both the category color and badges
+    // read with high contrast.
+    if pal.full_body_category_fill && !crashed {
+        let footer_h = rect.height() * 0.32;
+        let footer_rect =
+            Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - footer_h), rect.max);
+        painter.rect_filled(footer_rect, 0.0, Color32::from_black_alpha(110));
+    }
 
     // 3. Category header band: top-only rounding so the bottom edge sits flat.
     let header_h = (rect.height() * 0.44).clamp(14.0 * zoom, 26.0 * zoom);
@@ -2407,14 +2425,14 @@ fn draw_node(
         painter.rect_stroke(
             rect.expand(4.0),
             full_rounding,
-            Stroke::new(2.0, VIEWER),
+            Stroke::new(2.0, pal.viewer_badge_accent),
             StrokeKind::Outside,
         );
         let tag = Rect::from_min_size(
             rect.right_bottom() + Vec2::new(-58.0 * zoom, -16.0 * zoom),
             Vec2::new(54.0 * zoom, 13.0 * zoom),
         );
-        painter.rect_filled(tag, CornerRadius::same(2), VIEWER);
+        painter.rect_filled(tag, CornerRadius::same(2), pal.viewer_badge_accent);
         painter.text(
             tag.center(),
             Align2::CENTER_CENTER,

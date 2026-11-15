@@ -23,12 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `GraphMirror` command application is idempotent: repeated `AddNode` events update `kind` / `x` / `y` in place while preserving knobs and project-format stamping, and `ConnectEdge` replaces the existing incoming edge on `(to_node, to_port)` instead of duplicating it.
   - `Tab` quick-search and context-menu spawns now share the `spawn_node_message` helper, and the canvas hint reads `R/W/C/G/B/T/M: add node | Tab: search | 1/2: view | D: bypass | F: frame`.
 - **Milestone 18 Part 1 — Studio Theme Engine & Node Category Colors (`tanova-ui`, `tanova-app`):**
-  - New `tanova-ui::theme` module with `StudioTheme` (`Nuke`, `Natron`, `Fusion`), `NodeCategory` (`Io`, `Color`, `Merge`, `Filter`, `Transform`, `Viewer`, `Other`), `ThemePalette`, `node_category()`, `palette()`, and cache-safe `apply_theme_visuals()`.
-  - Two-tone node cards: category-colored header band with top-only rounding, dark crimson crashed fill, dimmed disabled state, drop shadow, and `card_corner_radius` per theme (`2` Nuke, `3` Natron, `6` Fusion).
-  - Themed canvas background and grid: line grid for Nuke/Natron, dot grid for Fusion; spacing clamped to `.max(18.0)` at low zoom.
+  - New `tanova-ui::theme` module with `StudioTheme` (`Classic`, `Slate`, `Midnight`), `NodeCategory` (`Io`, `Color`, `Merge`, `Filter`, `Transform`, `Viewer`, `Other`), `ThemePalette`, `node_category()`, `palette()`, and cache-safe `apply_theme_visuals()`.
+  - Two-tone node cards: category-colored header band with top-only rounding, dark crimson crashed fill, dimmed disabled state, drop shadow, and `card_corner_radius` per theme (`2` Classic, `3` Slate, `7` Midnight).
+  - Themed canvas background and grid: line grid for Classic/Slate, dot grid for Midnight; spacing clamped to `.max(18.0)` at low zoom.
   - Role-colored input pins (`pin_b` / `pin_a` / `pin_m` by `PortSide`) and matching wire colors (`wire_default` for top/B, `pin_a` for left/A, `pin_m` for right/mask).
   - `NodeCanvasState.theme` persists across `execute_new_script()` / script reloads.
-  - Top-bar segmented theme selector: `Theme: [Nuke] [Natron] [Fusion]`.
+  - Top-bar segmented theme selector: `Theme: [Classic] [Slate] [Midnight]`.
+
+- **Milestone 18 Part 2 — Brand-Free Theme Naming, Visual Fixes & Two-Column Inspector (`tanova-ui`, `tanova-app`):**
+  - Renamed `StudioTheme` variants to brand-free names: `Classic` (Nuke muscle memory), `Slate` (Natron-inspired), `Midnight` (Fusion-inspired).
+  - Distinct visual silhouettes: `Classic` uses full-body category-fill cards with a warm grid; `Slate` uses two-tone header cards on a cool high-contrast grid; `Midnight` uses rounded capsule cards on a deep gunmetal dot grid.
+  - Port label wire-clearance fix: `B`/`in` labels shift left of the vertical stem; `A` and `M` labels sit below their horizontal stems so incoming wires no longer slice through them.
+  - Theme-coordinated active viewer ring and `VIEWER 1`/`2` badge using `viewer_badge_accent` per theme.
+  - Two-Column `PropertiesPanel` Inspector: category header banner with bypass toggle, aligned `egui::Grid` with labeled columns for all knob types (Float, Int, Bool, Text, ComboBox, Color, Vec2).
+  - Top-bar labels updated: `Viewer Mode: [Viewer Node] [Direct Target]`, `Theme: [Classic] [Slate] [Midnight]`.
+  - Added tests: `classic_slate_and_midnight_palettes_have_distinct_card_and_grid_styles` and `properties_panel_renders_two_column_grid_and_bypass_toggle_across_themes`.
 
 ### Changed
 

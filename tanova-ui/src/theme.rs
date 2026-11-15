@@ -1,15 +1,18 @@
-//! Studio theme engine: Nuke, Natron, and Fusion palettes for node cards,
+//! Studio theme engine: Classic, Slate, and Midnight palettes for node cards,
 //! canvas backgrounds, wires, and input pins.
 
 use egui::Color32;
 
-/// Available studio visual themes.
+/// Available studio visual themes (brand-free names).
+///
+/// `Classic` is familiar to Foundry Nuke artists, `Slate` to Natron artists,
+/// and `Midnight` to Blackmagic Fusion artists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StudioTheme {
     #[default]
-    Nuke,
-    Natron,
-    Fusion,
+    Classic,
+    Slate,
+    Midnight,
 }
 
 /// Functional category of a node cartridge, used for card header band color.
@@ -60,6 +63,13 @@ pub struct ThemePalette {
     pub color_transform: Color32,
     pub color_viewer: Color32,
     pub color_other: Color32,
+    /// When `true`, the node card body is filled with the category color
+    /// (Classic full-body cards). When `false`, a dark body with a top header
+    /// band is used (Slate / Midnight two-tone cards).
+    pub full_body_category_fill: bool,
+    /// Theme-coordinated color for the active viewer node ring and the
+    /// `VIEWER 1` / `VIEWER 2` pill badge.
+    pub viewer_badge_accent: Color32,
 }
 
 impl ThemePalette {
@@ -80,11 +90,11 @@ impl ThemePalette {
 /// Returns the complete palette for a studio theme.
 pub fn palette(theme: StudioTheme) -> ThemePalette {
     match theme {
-        StudioTheme::Nuke => ThemePalette {
-            // Foundry Nuke muscle-memory palette.
-            panel_bg: Color32::from_rgb(38, 38, 38),
-            canvas_bg: Color32::from_rgb(51, 51, 51),
-            grid_line: Color32::from_rgb(61, 61, 61),
+        StudioTheme::Classic => ThemePalette {
+            // Classic: Nuke muscle-memory look, full-body category cards.
+            panel_bg: Color32::from_rgb(43, 43, 43),
+            canvas_bg: Color32::from_rgb(58, 58, 58),
+            grid_line: Color32::from_rgb(70, 70, 70),
             use_dot_grid: false,
             card_body_bg: Color32::from_rgb(34, 36, 40),
             card_border: Color32::from_rgb(20, 20, 20),
@@ -102,14 +112,16 @@ pub fn palette(theme: StudioTheme) -> ThemePalette {
             color_transform: Color32::from_rgb(122, 80, 123),
             color_viewer: Color32::from_rgb(158, 142, 36),
             color_other: Color32::from_rgb(85, 90, 100),
+            full_body_category_fill: true,
+            viewer_badge_accent: Color32::from_rgb(229, 169, 59),
         },
-        StudioTheme::Natron => ThemePalette {
-            // Natron high-contrast dark palette.
-            panel_bg: Color32::from_rgb(31, 31, 34),
-            canvas_bg: Color32::from_rgb(40, 41, 45),
-            grid_line: Color32::from_rgb(51, 53, 58),
+        StudioTheme::Slate => ThemePalette {
+            // Slate: Natron-inspired high-contrast dark, two-tone header cards.
+            panel_bg: Color32::from_rgb(24, 25, 28),
+            canvas_bg: Color32::from_rgb(33, 35, 40),
+            grid_line: Color32::from_rgb(45, 48, 55),
             use_dot_grid: false,
-            card_body_bg: Color32::from_rgb(27, 28, 32),
+            card_body_bg: Color32::from_rgb(24, 26, 31),
             card_border: Color32::from_rgb(16, 16, 18),
             card_shadow: Color32::from_black_alpha(120),
             selected_rim: Color32::from_rgb(230, 126, 34),
@@ -125,18 +137,20 @@ pub fn palette(theme: StudioTheme) -> ThemePalette {
             color_transform: Color32::from_rgb(112, 69, 115),
             color_viewer: Color32::from_rgb(125, 150, 40),
             color_other: Color32::from_rgb(79, 84, 94),
+            full_body_category_fill: false,
+            viewer_badge_accent: Color32::from_rgb(140, 194, 59),
         },
-        StudioTheme::Fusion => ThemePalette {
-            // Blackmagic Fusion gunmetal palette.
-            panel_bg: Color32::from_rgb(22, 22, 26),
-            canvas_bg: Color32::from_rgb(16, 16, 20),
-            grid_line: Color32::from_rgb(42, 42, 54),
+        StudioTheme::Midnight => ThemePalette {
+            // Midnight: Fusion-inspired deep gunmetal dot grid, rounded capsules.
+            panel_bg: Color32::from_rgb(19, 19, 24),
+            canvas_bg: Color32::from_rgb(13, 13, 18),
+            grid_line: Color32::from_rgb(42, 42, 56),
             use_dot_grid: true,
             card_body_bg: Color32::from_rgb(29, 29, 36),
             card_border: Color32::from_rgb(10, 10, 14),
             card_shadow: Color32::from_black_alpha(100),
             selected_rim: Color32::from_rgb(58, 130, 246),
-            card_corner_radius: 6,
+            card_corner_radius: 7,
             wire_default: Color32::from_rgb(148, 163, 184),
             pin_b: Color32::from_rgb(250, 204, 21),
             pin_a: Color32::from_rgb(74, 222, 128),
@@ -146,8 +160,10 @@ pub fn palette(theme: StudioTheme) -> ThemePalette {
             color_merge: Color32::from_rgb(184, 107, 32),
             color_filter: Color32::from_rgb(181, 105, 50),
             color_transform: Color32::from_rgb(139, 63, 184),
-            color_viewer: Color32::from_rgb(34, 139, 230),
+            color_viewer: Color32::from_rgb(56, 189, 248),
             color_other: Color32::from_rgb(74, 78, 105),
+            full_body_category_fill: false,
+            viewer_badge_accent: Color32::from_rgb(56, 189, 248),
         },
     }
 }
@@ -184,7 +200,11 @@ mod tests {
         assert_eq!(node_category("Viewer"), NodeCategory::Viewer);
         assert_eq!(node_category("UnknownGizmo"), NodeCategory::Other);
 
-        for theme in [StudioTheme::Nuke, StudioTheme::Natron, StudioTheme::Fusion] {
+        for theme in [
+            StudioTheme::Classic,
+            StudioTheme::Slate,
+            StudioTheme::Midnight,
+        ] {
             let pal = palette(theme);
             let io = pal.category_color(NodeCategory::Io);
             let color = pal.category_color(NodeCategory::Color);
@@ -213,22 +233,61 @@ mod tests {
             );
         }
 
-        assert!(palette(StudioTheme::Fusion).use_dot_grid);
-        assert!(!palette(StudioTheme::Nuke).use_dot_grid);
-        assert!(!palette(StudioTheme::Natron).use_dot_grid);
+        assert!(palette(StudioTheme::Midnight).use_dot_grid);
+        assert!(!palette(StudioTheme::Classic).use_dot_grid);
+        assert!(!palette(StudioTheme::Slate).use_dot_grid);
+
+        // Distinct silhouettes.
+        assert!(palette(StudioTheme::Classic).full_body_category_fill);
+        assert!(!palette(StudioTheme::Slate).full_body_category_fill);
+        assert!(!palette(StudioTheme::Midnight).full_body_category_fill);
 
         // Palettes must differ between themes.
         assert_ne!(
-            palette(StudioTheme::Nuke).panel_bg,
-            palette(StudioTheme::Natron).panel_bg
+            palette(StudioTheme::Classic).canvas_bg,
+            palette(StudioTheme::Slate).canvas_bg
         );
         assert_ne!(
-            palette(StudioTheme::Natron).panel_bg,
-            palette(StudioTheme::Fusion).panel_bg
+            palette(StudioTheme::Slate).canvas_bg,
+            palette(StudioTheme::Midnight).canvas_bg
         );
         assert_ne!(
-            palette(StudioTheme::Nuke).selected_rim,
-            palette(StudioTheme::Fusion).selected_rim
+            palette(StudioTheme::Classic).viewer_badge_accent,
+            palette(StudioTheme::Midnight).viewer_badge_accent
         );
+        assert_ne!(
+            palette(StudioTheme::Slate).viewer_badge_accent,
+            palette(StudioTheme::Midnight).viewer_badge_accent
+        );
+    }
+
+    #[test]
+    fn classic_slate_and_midnight_palettes_have_distinct_card_and_grid_styles() {
+        // Classic: full-body category cards.
+        assert!(palette(StudioTheme::Classic).full_body_category_fill);
+        assert!(!palette(StudioTheme::Classic).use_dot_grid);
+
+        // Slate: two-tone header cards, no dot grid.
+        assert!(!palette(StudioTheme::Slate).full_body_category_fill);
+        assert!(!palette(StudioTheme::Slate).use_dot_grid);
+
+        // Midnight: two-tone header cards, dot grid.
+        assert!(!palette(StudioTheme::Midnight).full_body_category_fill);
+        assert!(palette(StudioTheme::Midnight).use_dot_grid);
+
+        // All three themes have distinct canvas_bg and viewer_badge_accent.
+        let classic_bg = palette(StudioTheme::Classic).canvas_bg;
+        let slate_bg = palette(StudioTheme::Slate).canvas_bg;
+        let midnight_bg = palette(StudioTheme::Midnight).canvas_bg;
+        assert_ne!(classic_bg, slate_bg);
+        assert_ne!(slate_bg, midnight_bg);
+        assert_ne!(classic_bg, midnight_bg);
+
+        let classic_accent = palette(StudioTheme::Classic).viewer_badge_accent;
+        let slate_accent = palette(StudioTheme::Slate).viewer_badge_accent;
+        let midnight_accent = palette(StudioTheme::Midnight).viewer_badge_accent;
+        assert_ne!(classic_accent, slate_accent);
+        assert_ne!(slate_accent, midnight_accent);
+        assert_ne!(classic_accent, midnight_accent);
     }
 }

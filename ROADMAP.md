@@ -65,7 +65,7 @@ Multi-Channel EXR `Write` Cartridge & Sequence Render Execution
 Nuke Pin Geometry (`B` Top, `A` Left, `M` Right), `1`/`2` Viewer Input Pinning, Single-Key Node Spawning & Vertical Auto-Chaining
 
 **Milestone 18: Node Category Colors, High-Contrast Dark Theme + Studio Palettes & Two-Column Inspector Grid (`tanova-ui` & `tanova-app`)**
-Node Category Colors, High-Contrast Dark Theme + Studio Palettes (`Nuke`, `Natron`, `Fusion`) & Two-Column Inspector Grid
+Node Category Colors, High-Contrast Dark Theme + Studio Palettes (`Classic`, `Slate`, `Midnight`) & Two-Column Inspector Grid
 
 **Milestone 19: Graph Organization Cartridges & Canvas Containers (`Dot` Routing Elbows & `Backdrop` Boxes) (`tanova-kernel`, `tanova-parse`, `tanova-ui`, `tanova-app`)**
 Graph Organization Cartridges & Canvas Containers (`Dot` Routing Elbows & `Backdrop` Boxes)
