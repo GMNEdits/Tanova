@@ -5,26 +5,34 @@
 
 pub mod backdrop;
 pub mod blur;
+pub mod color_correct;
 pub mod constant;
 pub mod dot;
 pub mod dummy;
 pub mod grade;
+pub mod invert;
 pub mod merge;
+pub mod premult;
 pub mod read;
 pub mod transform;
+pub mod unpremult;
 pub mod util;
 pub mod viewer;
 pub mod write;
 
 pub use backdrop::BackdropNode;
 pub use blur::BlurNode;
+pub use color_correct::ColorCorrectNode;
 pub use constant::{ConstantNode, DEFAULT_COLOR};
 pub use dot::DotNode;
 pub use dummy::{DEFAULT_MESSAGE, DummyNode, DummyPayload};
 pub use grade::{GradeNode, grade_op};
+pub use invert::InvertNode;
 pub use merge::Merge2Node;
+pub use premult::PremultNode;
 pub use read::ReadNode;
 pub use transform::TransformNode;
+pub use unpremult::UnpremultNode;
 pub use viewer::ViewerNode;
 pub use write::{WriteNode, default_knobs as write_default_knobs, export_packet_with_write_knobs};
 
