@@ -44,6 +44,7 @@ fn single_tile_raster(color: [f32; 4]) -> Raster2D {
 fn registry_links_every_core_cartridge() {
     ensure_linked();
     let kinds = registered_cartridge_kinds();
+    assert_eq!(kinds.len(), 15);
     for expected in [
         "BackdropNode",
         "Blur",
@@ -51,6 +52,11 @@ fn registry_links_every_core_cartridge() {
         "Dot",
         "Dummy",
         "Grade",
+        "Premult",
+        "Unpremult",
+        "ColorCorrect",
+        "Invert",
+        "Viewer",
         "Merge2",
         "Read",
         "Transform",
@@ -188,4 +194,53 @@ fn grade_unpremult_keeps_alpha_and_never_produces_nan() {
         let value = raster.sample(&channel, 0, 0);
         assert!(value.is_finite(), "{channel:?} became {value}");
     }
+}
+
+#[test]
+fn new_cartridges_process_dense_pixels_and_masks() {
+    use tanova_nodes::{ColorCorrectNode, InvertNode, PremultNode, UnpremultNode};
+    let governor = MemoryGovernor::new(32 * 1024 * 1024);
+    let mut ctx = EvalContext::new();
+    ctx.insert(governor.clone());
+    let mut input = single_tile_raster([0.2, 0.4, 0.8, 0.5]);
+    input
+        .set_pixel(Channel::RgbaRed, 3, 4, 0.6, Some(&governor))
+        .unwrap();
+    let premult = PremultNode::new()
+        .evaluate(&ctx, &[packet(input.clone())])
+        .unwrap();
+    let restored = UnpremultNode::new().evaluate(&ctx, &[premult]).unwrap();
+    assert_eq!(
+        restored.get::<Raster2D>().unwrap().sample_rgba(3, 4),
+        input.sample_rgba(3, 4)
+    );
+    let mut knobs = tanova_nodes::color_correct::default_knobs();
+    knobs.insert("gain", KnobValue::Float(2.0));
+    knobs.insert("mix", KnobValue::Float(0.5));
+    let mask = single_tile_raster([1.0, 1.0, 1.0, 0.5]);
+    let corrected = ColorCorrectNode::from_knobs(knobs)
+        .evaluate(&ctx, &[packet(input.clone()), packet(mask.clone())])
+        .unwrap();
+    assert!(
+        (corrected
+            .get::<Raster2D>()
+            .unwrap()
+            .sample(&Channel::RgbaRed, 3, 4)
+            - 0.75)
+            .abs()
+            < 1e-6
+    );
+    let inverted = InvertNode::new()
+        .evaluate(&ctx, &[packet(input), packet(mask)])
+        .unwrap();
+    assert!(
+        (inverted
+            .get::<Raster2D>()
+            .unwrap()
+            .sample(&Channel::RgbaRed, 3, 4)
+            - 0.5)
+            .abs()
+            < 1e-6
+    );
+    assert!(governor.allocated_bytes() > 0);
 }
