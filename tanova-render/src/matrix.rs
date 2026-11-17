@@ -4,6 +4,8 @@
 //! rotates counter-clockwise. Matrices are row-major and multiplied as
 //! `self * other`, which means `other` is applied to a point first.
 
+use crate::Raster2D;
+
 /// A row-major 3x3 matrix used for 2D affine transforms.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Mat3x3 {
@@ -110,6 +112,34 @@ impl Mat3x3 {
     }
 }
 
+/// A concatenated 2D affine transform chain carried inside a [`tanova_kernel::Packet`].
+#[derive(Debug, Clone)]
+pub struct TransformChain {
+    /// The upstream source raster before any spatial resampling in this chain.
+    pub source_raster: std::sync::Arc<Raster2D>,
+    /// The combined forward `Mat3x3` accumulated across contiguous `Transform` nodes.
+    pub combined_matrix: Mat3x3,
+}
+
+impl TransformChain {
+    /// Starts a new transform chain from `source_raster` and an initial `matrix`.
+    pub fn new(source_raster: std::sync::Arc<Raster2D>, matrix: Mat3x3) -> Self {
+        Self {
+            source_raster,
+            combined_matrix: matrix,
+        }
+    }
+
+    /// Concatenates a downstream `next_matrix` onto the accumulated chain
+    /// (`next_matrix * self.combined_matrix`).
+    pub fn chain(&self, next_matrix: &Mat3x3) -> Self {
+        Self {
+            source_raster: std::sync::Arc::clone(&self.source_raster),
+            combined_matrix: next_matrix.mul(&self.combined_matrix),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +187,33 @@ mod tests {
     #[test]
     fn singular_matrices_have_no_inverse() {
         assert!(Mat3x3::scale(0.0, 1.0).inverse().is_none());
+    }
+
+    #[test]
+    fn transform_chain_concatenates_scale_and_inverse_rotation_to_identity() {
+        let raster = std::sync::Arc::new(crate::Raster2D::new(
+            crate::coords::Format::hd_1080(),
+            crate::coords::BBox::new(0, 0, 10, 10),
+            crate::coords::EdgeMode::BlackOutside,
+        ));
+        let chain = TransformChain::new(raster.clone(), Mat3x3::scale(0.5, 0.5));
+        let chained = chain.chain(&Mat3x3::scale(2.0, 2.0));
+        assert!(std::sync::Arc::ptr_eq(
+            &chained.source_raster,
+            &chain.source_raster
+        ));
+        let mut max_diff = 0.0f32;
+        for row in 0..3 {
+            for column in 0..3 {
+                let diff = (chained.combined_matrix.rows[row][column]
+                    - Mat3x3::identity().rows[row][column])
+                    .abs();
+                max_diff = max_diff.max(diff);
+            }
+        }
+        assert!(
+            max_diff < 1e-6,
+            "combined matrix not identity: {chained:?}, max diff {max_diff}"
+        );
     }
 }

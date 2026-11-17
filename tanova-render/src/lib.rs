@@ -17,7 +17,7 @@ pub use coords::{
     BBox, EdgeMode, Format, RegionOfInterest, TILE_PIXELS, TILE_SIZE, TileCoord, TileRange,
     world_to_tile,
 };
-pub use matrix::Mat3x3;
+pub use matrix::{Mat3x3, TransformChain};
 pub use ops::{
     GradeOp, MergeOp, MergeRequest, blur_padded_rgba, blur_padded_tile, grade_raster,
     is_rgba_channel, mask_value, merge_pixel, merge_raster, rgba_at, transform_gathered_rgba,
