@@ -54,6 +54,10 @@ const OPERATIONS: &[&str] = &[
 const BBOX_MODES: &[&str] = &["union", "B", "A", "intersection"];
 /// Channel export modes for the `Write` node's `channels` knob.
 const CHANNELS_MODES: &[&str] = &["rgba", "all"];
+/// Alpha plane source modes for the `Premult` and `Unpremult` nodes' `alpha` knob.
+const ALPHA_MODES: &[&str] = &["rgba.alpha", "depth.Z", "none"];
+/// Channel modes for the `Invert` node's `channels` knob.
+const INVERT_CHANNELS: &[&str] = &["rgb", "rgba", "alpha", "none"];
 /// Tint presets for a `BackdropNode`'s `color` knob.
 const BACKDROP_COLORS: &[&str] = &[
     "slate", "blue", "teal", "amber", "purple", "crimson", "green",
@@ -231,6 +235,10 @@ impl PropertiesPanel {
                                 "operation" => Some(OPERATIONS),
                                 "bbox" => Some(BBOX_MODES),
                                 "channels" if node.kind == "Write" => Some(CHANNELS_MODES),
+                                "channels" if node.kind == "Invert" => Some(INVERT_CHANNELS),
+                                "alpha" if node.kind == "Premult" || node.kind == "Unpremult" => {
+                                    Some(ALPHA_MODES)
+                                }
                                 "color" if node.kind == "BackdropNode" => Some(BACKDROP_COLORS),
                                 _ => None,
                             };

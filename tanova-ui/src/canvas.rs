@@ -42,6 +42,10 @@ const CONTEXT_MENU_KINDS: &[&str] = &[
     "Read",
     "Constant",
     "Grade",
+    "ColorCorrect",
+    "Invert",
+    "Premult",
+    "Unpremult",
     "Transform",
     "Blur",
     "Merge2",
@@ -3230,6 +3234,7 @@ fn draw_wire(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::NodeCategory;
 
     fn add_node(id: u64, x: f32, y: f32) -> UndoableCommand {
         UndoableCommand::AddNode {
@@ -3631,6 +3636,11 @@ mod tests {
         let nuke = spawnable_kinds(ViewerWorkflow::Nuke);
         assert!(!nuke.contains(&"Dummy"), "Dummy is a test-only cartridge");
         assert!(nuke.contains(&"Viewer"));
+        // The Phase 6 color/alpha cartridges are offered to the artist.
+        assert!(nuke.contains(&"ColorCorrect"));
+        assert!(nuke.contains(&"Invert"));
+        assert!(nuke.contains(&"Premult"));
+        assert!(nuke.contains(&"Unpremult"));
 
         let fusion = spawnable_kinds(ViewerWorkflow::Fusion);
         assert!(!fusion.contains(&"Dummy"));
@@ -3638,6 +3648,26 @@ mod tests {
             !fusion.contains(&"Viewer"),
             "Fusion has no physical Viewer node"
         );
+    }
+
+    #[test]
+    fn phase_six_color_alpha_cartridges_are_spawnable_and_color_category() {
+        let kinds = ["ColorCorrect", "Invert", "Premult", "Unpremult"];
+        for kind in kinds {
+            assert!(
+                spawnable_kinds(ViewerWorkflow::Nuke).contains(&kind),
+                "{kind} must be offered in the Nuke spawn list"
+            );
+            assert!(
+                spawnable_kinds(ViewerWorkflow::Fusion).contains(&kind),
+                "{kind} must be offered in the Fusion spawn list"
+            );
+            assert_eq!(
+                node_category(kind),
+                NodeCategory::Color,
+                "{kind} must map to NodeCategory::Color"
+            );
+        }
     }
 
     #[test]

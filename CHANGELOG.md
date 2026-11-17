@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Viewer toolbar: channel solo buttons `[RGBA] [R] [G] [B] [A]` (highlighting the active channel) and a `Display transform` combo box (`Linear`, `sRGB`, `Rec.709`, `ACES`).
   - Pointer-scoped `R`/`G`/`B`/`A` hotkeys toggle channel soloing only when the pointer is inside the viewer viewport and no widget owns the keyboard — never conflicting with canvas node spawning. `NodeCanvas::over_canvas` now requires the pointer over the canvas rect, so hovering the viewer never spawns a `Read`/`Grade`/`Blur` node.
 
+- **Milestone 20 Part 3 — Core Color/Alpha Cartridges & UI Integration (`tanova-nodes`, `tanova-ui`):**
+  - New `"Premult"` cartridge: premultiplies RGB by a selected alpha plane (`rgba.alpha` / `depth.Z` / `none`) with a `mix` knob; `PropertiesPanel` renders a `ComboBox` for its `alpha` knob.
+  - New `"Unpremult"` cartridge: divides RGB by a selected alpha plane (`rgba.alpha` / `depth.Z` / `none`) with a `mix` knob; `PropertiesPanel` renders a `ComboBox` for its `alpha` knob.
+  - New `"Invert"` cartridge: inverts selected channels (`rgb` / `rgba` / `alpha` / `none`) with a `mix` knob; `PropertiesPanel` renders a `ComboBox` for its `channels` knob.
+  - New `"ColorCorrect"` cartridge: `saturation`, `contrast`, `gamma`, `gain`, `offset`, `unpremult`, and `mix` knobs.
+  - All four cartridges map to `NodeCategory::Color`, so they render the category header band color across `Classic`, `Slate`, and `Midnight` themes; they appear in the `+ Add Node` dropdown, right-click context menu, and `Tab` quick-search.
+
+### Fixed
+
+- **Viewer `Display transform` combo box showed a blank closed button (`tanova-ui`):** the combo box now sets `.selected_text(...)` from a `DisplayTransform` label helper, so the active transform (`Linear`, `sRGB`, `Rec.709`, or `ACES`) is always visible without opening the dropdown.
+
 ## [v0.4.5] - 2026-11-16
 
 ### Added

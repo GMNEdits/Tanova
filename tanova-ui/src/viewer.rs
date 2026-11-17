@@ -100,6 +100,26 @@ impl Default for ViewerPanel {
     }
 }
 
+/// Human-readable names for the viewer display transforms.
+///
+/// Used for the combo box's closed-button text so the active transform is
+/// always visible. Kept in the UI crate because `DisplayTransform` lives in
+/// `tanova-render` and its identifiers are not artist-facing.
+trait DisplayTransformLabel {
+    fn label(self) -> &'static str;
+}
+
+impl DisplayTransformLabel for DisplayTransform {
+    fn label(self) -> &'static str {
+        match self {
+            DisplayTransform::Linear => "Linear",
+            DisplayTransform::Srgb => "sRGB",
+            DisplayTransform::Rec709 => "Rec.709",
+            DisplayTransform::AcesTonemap => "ACES",
+        }
+    }
+}
+
 impl ViewerPanel {
     /// Creates an empty viewer.
     pub fn new() -> Self {
@@ -386,26 +406,33 @@ impl ViewerPanel {
             }
             ui.separator();
 
-            // Display transform combo box.
+            // Display transform combo box. `selected_text` keeps the active
+            // transform visible in the closed button instead of an empty box.
             let previous_transform = self.display_transform;
-            egui::ComboBox::from_label("Display transform").show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut self.display_transform,
-                    DisplayTransform::Linear,
-                    "Linear",
-                );
-                ui.selectable_value(&mut self.display_transform, DisplayTransform::Srgb, "sRGB");
-                ui.selectable_value(
-                    &mut self.display_transform,
-                    DisplayTransform::Rec709,
-                    "Rec.709",
-                );
-                ui.selectable_value(
-                    &mut self.display_transform,
-                    DisplayTransform::AcesTonemap,
-                    "ACES",
-                );
-            });
+            egui::ComboBox::from_label("Display transform")
+                .selected_text(self.display_transform.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.display_transform,
+                        DisplayTransform::Linear,
+                        "Linear",
+                    );
+                    ui.selectable_value(
+                        &mut self.display_transform,
+                        DisplayTransform::Srgb,
+                        "sRGB",
+                    );
+                    ui.selectable_value(
+                        &mut self.display_transform,
+                        DisplayTransform::Rec709,
+                        "Rec.709",
+                    );
+                    ui.selectable_value(
+                        &mut self.display_transform,
+                        DisplayTransform::AcesTonemap,
+                        "ACES",
+                    );
+                });
             if self.display_transform != previous_transform {
                 self.dirty = true;
             }

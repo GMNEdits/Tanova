@@ -5934,7 +5934,7 @@ mod tests {
         // Frame 3: click the "BackdropNode" popup button. Position estimated
         // as screen_pos + (~20, ~50) for the egui popup/TextEdit/button
         // geometry (TextEdit + separator + one button row).
-        let click_pos = Pos2::new(620.0, 450.0);
+        let click_pos = Pos2::new(620.0, 404.0);
         run_app_frame(
             &ctx,
             &mut app,

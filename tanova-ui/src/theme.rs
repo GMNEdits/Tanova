@@ -31,7 +31,9 @@ pub enum NodeCategory {
 pub fn node_category(kind: &str) -> NodeCategory {
     match kind {
         "Read" | "Write" => NodeCategory::Io,
-        "Constant" | "Grade" => NodeCategory::Color,
+        "Constant" | "Grade" | "ColorCorrect" | "Invert" | "Premult" | "Unpremult" => {
+            NodeCategory::Color
+        }
         "Merge2" => NodeCategory::Merge,
         "Blur" => NodeCategory::Filter,
         "Transform" => NodeCategory::Transform,
@@ -208,6 +210,10 @@ mod tests {
         assert_eq!(node_category("Write"), NodeCategory::Io);
         assert_eq!(node_category("Constant"), NodeCategory::Color);
         assert_eq!(node_category("Grade"), NodeCategory::Color);
+        assert_eq!(node_category("ColorCorrect"), NodeCategory::Color);
+        assert_eq!(node_category("Invert"), NodeCategory::Color);
+        assert_eq!(node_category("Premult"), NodeCategory::Color);
+        assert_eq!(node_category("Unpremult"), NodeCategory::Color);
         assert_eq!(node_category("Merge2"), NodeCategory::Merge);
         assert_eq!(node_category("Blur"), NodeCategory::Filter);
         assert_eq!(node_category("Transform"), NodeCategory::Transform);
