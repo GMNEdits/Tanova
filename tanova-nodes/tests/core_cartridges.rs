@@ -44,10 +44,11 @@ fn single_tile_raster(color: [f32; 4]) -> Raster2D {
 fn registry_links_every_core_cartridge() {
     ensure_linked();
     let kinds = registered_cartridge_kinds();
-    assert_eq!(kinds.len(), 21);
+    assert_eq!(kinds.len(), 24);
     for expected in [
         "BackdropNode",
         "Blur",
+        "CheckerBoard2",
         "Clamp",
         "Crop",
         "Constant",
@@ -62,7 +63,9 @@ fn registry_links_every_core_cartridge() {
         "Viewer",
         "Merge2",
         "Read",
+        "Reformat",
         "Saturation",
+        "Shuffle",
         "Switch",
         "TimeOffset",
         "Transform",

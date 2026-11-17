@@ -5,6 +5,7 @@
 
 pub mod backdrop;
 pub mod blur;
+pub mod checkerboard;
 pub mod clamp;
 pub mod color_correct;
 pub mod constant;
@@ -17,7 +18,9 @@ pub mod invert;
 pub mod merge;
 pub mod premult;
 pub mod read;
+pub mod reformat;
 pub mod saturation;
+pub mod shuffle;
 pub mod switch;
 pub mod time_offset;
 pub mod transform;
@@ -28,6 +31,7 @@ pub mod write;
 
 pub use backdrop::BackdropNode;
 pub use blur::BlurNode;
+pub use checkerboard::CheckerBoardNode;
 pub use clamp::ClampNode;
 pub use color_correct::ColorCorrectNode;
 pub use constant::{ConstantNode, DEFAULT_COLOR};
@@ -40,7 +44,9 @@ pub use invert::InvertNode;
 pub use merge::Merge2Node;
 pub use premult::PremultNode;
 pub use read::ReadNode;
+pub use reformat::ReformatNode;
 pub use saturation::SaturationNode;
+pub use shuffle::ShuffleNode;
 pub use switch::SwitchNode;
 pub use time_offset::TimeOffsetNode;
 pub use transform::TransformNode;
