@@ -4,9 +4,11 @@
 //! kernel commands and node state, plus the small math-expression evaluator
 //! Nuke scripts use inside knobs.
 
+pub mod curve;
 pub mod expr_tcl;
 pub mod nk_stack;
 
+pub use curve::{AnimationCurve, InterpMode, Keyframe, parse_nuke_curve};
 pub use expr_tcl::{TclEvalEnv, eval_tcl_expr, expand_tcl_string};
 pub use nk_stack::{ParsedNode, ParsedScript, load_nk_into_dag, parse_nk_script};
 
