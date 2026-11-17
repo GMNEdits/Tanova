@@ -331,10 +331,13 @@ fn bbox_contains(outer: BBox, inner: BBox) -> bool {
             && outer.max_y >= inner.max_y)
 }
 
-/// Convolves one padded RGBA tile with a normalized 2D Gaussian on the CPU.
+/// Convolves one padded RGBA tile with a normalized separable 1D Gaussian on the CPU.
 ///
-/// The math mirrors the `blur.wgsl` kernel: RGB is weighted, alpha is passed
-/// through from the center pixel. Returns one dense 256x256 interleaved tile.
+/// A 2D Gaussian is separable (`G(x, y) = G(x) * G(y)`), so a horizontal 1D pass
+/// followed by a vertical 1D pass costs `2 * (2 * radius + 1)` samples per pixel
+/// instead of `(2 * radius + 1)^2`, producing the same mathematical result.
+/// RGB is weighted; alpha is passed through from the center pixel.
+/// Returns one dense `TILE_SIZE x TILE_SIZE` interleaved tile.
 pub fn blur_padded_rgba(
     padded: &[[f32; 4]],
     radius: u32,
@@ -343,49 +346,59 @@ pub fn blur_padded_rgba(
 ) -> Vec<[f32; 4]> {
     let radius_i = radius as i32;
     let stride = padded_width as usize;
-    let denom = (2.0 * sigma * sigma).max(1e-10);
+    let padded_height = padded.len() / stride;
     let taps = (2 * radius + 1) as usize;
+    let denom = (2.0 * sigma * sigma).max(1e-10);
 
-    // The Gaussian weight depends only on the tap offset, so build the kernel
-    // once per tile instead of calling `exp` per pixel.
-    let mut weights = Vec::with_capacity(taps * taps);
+    // 1D Gaussian weights, normalized once per tile.
+    let mut weights = vec![0.0f32; taps];
     let mut weight_sum = 0.0f32;
-    for dy in -radius_i..=radius_i {
-        for dx in -radius_i..=radius_i {
-            let distance = (dx * dx + dy * dy) as f32;
-            let weight = (-distance / denom).exp();
-            weights.push(weight);
-            weight_sum += weight;
+    for dx in -radius_i..=radius_i {
+        let i = (dx + radius_i) as usize;
+        let weight = (-((dx as f32).powi(2)) / denom).exp();
+        weights[i] = weight;
+        weight_sum += weight;
+    }
+    let inv_weight_sum = 1.0 / weight_sum;
+
+    let tsize = TILE_SIZE as usize;
+    // Pass 1 output: one row per padded row, but only the inner TILE_SIZE columns.
+    let mut intermediate = vec![[0.0f32; 4]; padded_height * tsize];
+
+    // Pass 1: horizontal 1D convolution.
+    for in_y in 0..padded_height as u32 {
+        let row = in_y as usize * stride;
+        let out_row = in_y as usize * tsize;
+        for out_x in 0..TILE_SIZE {
+            let center_x = out_x as i32 + radius_i;
+            let center = padded[row + center_x as usize];
+            let mut rgb = [0.0f32; 3];
+            for dx in -radius_i..=radius_i {
+                let weight = weights[(dx + radius_i) as usize] * inv_weight_sum;
+                let sample = padded[row + (center_x + dx) as usize];
+                rgb[0] += sample[0] * weight;
+                rgb[1] += sample[1] * weight;
+                rgb[2] += sample[2] * weight;
+            }
+            intermediate[out_row + out_x as usize] = [rgb[0], rgb[1], rgb[2], center[3]];
         }
     }
 
+    // Pass 2: vertical 1D convolution, preserving the center pixel's alpha.
     let mut out = Vec::with_capacity(TILE_PIXELS);
-    for y in 0..TILE_SIZE {
-        for x in 0..TILE_SIZE {
-            let center_x = x as i32 + radius_i;
-            let center_y = y as i32 + radius_i;
-            let center = padded[center_y as usize * stride + center_x as usize];
-
+    for out_y in 0..TILE_SIZE {
+        let center_y = out_y as i32 + radius_i;
+        for out_x in 0..TILE_SIZE {
             let mut rgb = [0.0f32; 3];
-            let mut weight_index = 0usize;
             for dy in -radius_i..=radius_i {
-                let row = (center_y + dy) as usize * stride;
-                for dx in -radius_i..=radius_i {
-                    let weight = weights[weight_index];
-                    weight_index += 1;
-                    let sample = padded[row + (center_x + dx) as usize];
-                    rgb[0] += sample[0] * weight;
-                    rgb[1] += sample[1] * weight;
-                    rgb[2] += sample[2] * weight;
-                }
+                let weight = weights[(dy + radius_i) as usize] * inv_weight_sum;
+                let sample = intermediate[((center_y + dy) as usize) * tsize + out_x as usize];
+                rgb[0] += sample[0] * weight;
+                rgb[1] += sample[1] * weight;
+                rgb[2] += sample[2] * weight;
             }
-
-            out.push([
-                rgb[0] / weight_sum,
-                rgb[1] / weight_sum,
-                rgb[2] / weight_sum,
-                center[3],
-            ]);
+            let center_alpha = intermediate[center_y as usize * tsize + out_x as usize][3];
+            out.push([rgb[0], rgb[1], rgb[2], center_alpha]);
         }
     }
     out
@@ -787,5 +800,139 @@ mod tests {
             MergeOp::Mask => "Mask",
         }
         .to_string()
+    }
+
+    #[test]
+    fn separable_blur_matches_2d_gaussian_and_gpu_parity() {
+        let radius = 5u32;
+        let sigma = 2.0f32;
+        let padded_width = TILE_SIZE + 2 * radius;
+        let radius_i = radius as i32;
+        let stride = padded_width as usize;
+        let denom = (2.0 * sigma * sigma).max(1e-10);
+
+        // Ramp tile so every output pixel exercises the convolution.
+        let mut padded = vec![[0.0f32; 4]; (padded_width * padded_width) as usize];
+        for (index, pixel) in padded.iter_mut().enumerate() {
+            let x = (index as u32 % padded_width) as f32;
+            let y = (index as u32 / padded_width) as f32;
+            *pixel = [
+                (x * 0.013).sin() * 0.5 + 0.5,
+                (y * 0.017).cos() * 0.5 + 0.5,
+                ((x + y) * 0.007).fract(),
+                (x * 0.01 + y * 0.02).fract(),
+            ];
+        }
+
+        let cpu = blur_padded_rgba(&padded, radius, sigma, padded_width);
+        assert_eq!(cpu.len(), TILE_PIXELS);
+
+        // Reference: direct 2D Gaussian convolution (pre-separable math).
+        let mut ref_w = Vec::new();
+        let mut ref_sum = 0.0f32;
+        for dy in -radius_i..=radius_i {
+            for dx in -radius_i..=radius_i {
+                let w = (-((dx * dx + dy * dy) as f32) / denom).exp();
+                ref_w.push(w);
+                ref_sum += w;
+            }
+        }
+        for y in 0..TILE_SIZE {
+            for x in 0..TILE_SIZE {
+                let cx = x as i32 + radius_i;
+                let cy = y as i32 + radius_i;
+                let mut rgb = [0.0f32; 3];
+                let mut wi = 0usize;
+                for dy in -radius_i..=radius_i {
+                    let row = (cy + dy) as usize * stride;
+                    for dx in -radius_i..=radius_i {
+                        let w = ref_w[wi];
+                        wi += 1;
+                        let s = padded[row + (cx + dx) as usize];
+                        rgb[0] += s[0] * w;
+                        rgb[1] += s[1] * w;
+                        rgb[2] += s[2] * w;
+                    }
+                }
+                let center = padded[cy as usize * stride + cx as usize];
+                let expected = [
+                    rgb[0] / ref_sum,
+                    rgb[1] / ref_sum,
+                    rgb[2] / ref_sum,
+                    center[3],
+                ];
+                let actual = cpu[y as usize * TILE_SIZE as usize + x as usize];
+                for channel in 0..4 {
+                    assert!(
+                        (actual[channel] - expected[channel]).abs() < 1e-5,
+                        "separable vs 2d gaussian pixel {x},{y} ch {channel}: {} vs {}",
+                        actual[channel],
+                        expected[channel]
+                    );
+                }
+            }
+        }
+
+        // Impulse sanity: a single lit pixel blurs to the normalized Gaussian,
+        // and the center alpha passes through untouched.
+        let mut impulse = vec![[0.0f32; 4]; (padded_width * padded_width) as usize];
+        let impulse_x = (TILE_SIZE / 2) as i32 + radius_i;
+        let impulse_y = (TILE_SIZE / 2) as i32 + radius_i;
+        impulse[(impulse_y as usize * padded_width as usize) + impulse_x as usize] = [1.0; 4];
+        let out = blur_padded_rgba(&impulse, radius, sigma, padded_width);
+        let ox = (TILE_SIZE / 2) as usize;
+        let oy = (TILE_SIZE / 2) as usize;
+        let center = out[oy * TILE_SIZE as usize + ox];
+        let mut sum1d = 0.0f32;
+        for dx in -radius_i..=radius_i {
+            sum1d += (-(dx as f32).powi(2) / denom).exp();
+        }
+        let expected_center = 1.0 / (sum1d * sum1d);
+        assert!(
+            (center[0] - expected_center).abs() < 1e-5,
+            "impulse center rgb: {} vs {}",
+            center[0],
+            expected_center
+        );
+        assert!((center[3] - 1.0).abs() < 1e-5, "impulse alpha preserved");
+
+        // GPU vs CPU parity within 1e-4.
+        if let Some(engine) = test_render_engine() {
+            let gpu = blur_padded_tile(&padded, radius, sigma, padded_width, Some(&engine))
+                .expect("blur dispatch");
+            assert_eq!(gpu.len(), crate::shader::TILE_RGBA_VALUES);
+            for (i, (actual, expected)) in gpu.chunks_exact(4).zip(cpu.iter()).enumerate() {
+                for channel in 0..4 {
+                    assert!(
+                        (actual[channel] - expected[channel]).abs() <= 1e-4,
+                        "gpu/cpu pixel {i} ch {channel}: {} vs {}",
+                        actual[channel],
+                        expected[channel]
+                    );
+                }
+            }
+        } else {
+            eprintln!("no GPU adapter available; skipping blur GPU parity test");
+        }
+    }
+
+    fn test_render_engine() -> Option<crate::shader::GpuComputeEngine> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+            apply_limit_buckets: false,
+        }))
+        .ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("tanova-test-device"),
+            ..Default::default()
+        }))
+        .ok()?;
+        Some(crate::shader::GpuComputeEngine::new(
+            Arc::new(device),
+            Arc::new(queue),
+        ))
     }
 }
