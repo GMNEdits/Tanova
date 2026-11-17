@@ -31,12 +31,11 @@ pub enum NodeCategory {
 pub fn node_category(kind: &str) -> NodeCategory {
     match kind {
         "Read" | "Write" => NodeCategory::Io,
-        "Constant" | "Grade" | "ColorCorrect" | "Invert" | "Premult" | "Unpremult" => {
-            NodeCategory::Color
-        }
-        "Merge2" => NodeCategory::Merge,
-        "Blur" => NodeCategory::Filter,
-        "Transform" => NodeCategory::Transform,
+        "Constant" | "Grade" | "ColorCorrect" | "Invert" | "Premult" | "Unpremult" | "Clamp"
+        | "Saturation" => NodeCategory::Color,
+        "Merge2" | "Switch" => NodeCategory::Merge,
+        "Blur" | "TimeOffset" | "FrameHold" => NodeCategory::Filter,
+        "Transform" | "Crop" => NodeCategory::Transform,
         "Viewer" => NodeCategory::Viewer,
         _ => NodeCategory::Other,
     }

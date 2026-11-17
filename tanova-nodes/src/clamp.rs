@@ -88,7 +88,7 @@ impl NodeTrait for ClampNode {
         let output = if op.mix == 0.0 || !(op.minimum_enable || op.maximum_enable) {
             input.clone()
         } else {
-            crate::map_color_tiles(
+            crate::util::map_color_tiles(
                 ctx,
                 input,
                 mask,

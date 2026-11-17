@@ -44,7 +44,7 @@ fn single_tile_raster(color: [f32; 4]) -> Raster2D {
 fn registry_links_every_core_cartridge() {
     ensure_linked();
     let kinds = registered_cartridge_kinds();
-    assert_eq!(kinds.len(), 18);
+    assert_eq!(kinds.len(), 21);
     for expected in [
         "BackdropNode",
         "Blur",
@@ -53,6 +53,7 @@ fn registry_links_every_core_cartridge() {
         "Constant",
         "Dot",
         "Dummy",
+        "FrameHold",
         "Grade",
         "Premult",
         "Unpremult",
@@ -62,6 +63,8 @@ fn registry_links_every_core_cartridge() {
         "Merge2",
         "Read",
         "Saturation",
+        "Switch",
+        "TimeOffset",
         "Transform",
         "Write",
     ] {
@@ -291,4 +294,157 @@ fn clamp_and_saturation_sample_dense_masks_and_share_depth() {
                 .unwrap()
         ));
     }
+}
+
+#[test]
+fn switch_cartridge_skips_unselected_branch_in_dag() {
+    ensure_linked();
+
+    struct PanickingBranch;
+
+    impl NodeTrait for PanickingBranch {
+        fn evaluate(
+            &self,
+            _ctx: &EvalContext,
+            _inputs: &[tanova_kernel::Packet],
+        ) -> Result<tanova_kernel::Packet, tanova_kernel::NodeError> {
+            panic!("the unselected Switch branch must never evaluate");
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            "PanickingBranch {}".to_string()
+        }
+    }
+
+    let mut dag = Dag::new();
+    dag.add_node_with_implementation(NodeId(1), "PanickingBranch", Arc::new(PanickingBranch))
+        .unwrap();
+    dag.add_node(NodeId(2), "Constant").unwrap();
+    dag.add_node(NodeId(3), "Switch").unwrap();
+
+    let constant_color = [0.2, 0.4, 0.6, 1.0];
+    dag.set_knob(NodeId(2), "color", KnobValue::Color(constant_color))
+        .unwrap();
+    dag.set_knob(NodeId(3), "which", KnobValue::Int(1)).unwrap();
+
+    dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(3), PortId(0)))
+        .unwrap();
+    dag.connect_edge(Edge::new(NodeId(2), PortId(0), NodeId(3), PortId(1)))
+        .unwrap();
+
+    let governor = MemoryGovernor::new(64 * 1024 * 1024);
+    let epoch = RenderEpoch::new();
+    let output = dag
+        .evaluate_pull(
+            NodeId(3),
+            &EvalContext::new(),
+            &governor,
+            &epoch,
+            epoch.bump(),
+        )
+        .expect("Switch must evaluate its selected branch only");
+
+    let raster = output.get::<Raster2D>().expect("constant raster");
+    assert_eq!(
+        raster.sample_rgba(10, 10),
+        constant_color,
+        "Switch must return the Constant on PortId(1)"
+    );
+    assert_eq!(
+        dag.node(NodeId(1)).and_then(|node| node.crashed.as_deref()),
+        None,
+        "the panicking branch on PortId(0) must never run"
+    );
+}
+
+#[test]
+fn time_offset_and_frame_hold_cartridges_shift_upstream_read_time() {
+    use std::sync::Mutex;
+
+    ensure_linked();
+
+    struct TimeRecordingNode {
+        tag: u32,
+        seen: Arc<Mutex<Vec<(u32, f64)>>>,
+    }
+
+    impl NodeTrait for TimeRecordingNode {
+        fn evaluate(
+            &self,
+            ctx: &EvalContext,
+            _inputs: &[tanova_kernel::Packet],
+        ) -> Result<tanova_kernel::Packet, tanova_kernel::NodeError> {
+            let time = ctx
+                .time()
+                .ok_or_else(|| tanova_kernel::NodeError::Other("missing time".into()))?;
+            self.seen.lock().unwrap().push((self.tag, time));
+            let mut packet = tanova_kernel::Packet::new();
+            packet.insert(time);
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            format!("TimeRecordingNode {{ tag {} }}", self.tag)
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut dag = Dag::new();
+    for tag in [1u32, 2] {
+        dag.add_node_with_implementation(
+            NodeId(tag as u64),
+            "TimeRecorder",
+            Arc::new(TimeRecordingNode {
+                tag,
+                seen: Arc::clone(&seen),
+            }),
+        )
+        .unwrap();
+        dag.set_knob(NodeId(tag as u64), "tag", KnobValue::Int(tag as i64))
+            .unwrap();
+    }
+    dag.add_node(NodeId(3), "TimeOffset").unwrap();
+    dag.add_node(NodeId(4), "FrameHold").unwrap();
+    dag.set_knob(NodeId(3), "time_offset", KnobValue::Int(3))
+        .unwrap();
+    dag.set_knob(NodeId(4), "first_frame", KnobValue::Int(2))
+        .unwrap();
+
+    dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(3), PortId(0)))
+        .unwrap();
+    dag.connect_edge(Edge::new(NodeId(2), PortId(0), NodeId(4), PortId(0)))
+        .unwrap();
+
+    let mut ctx = EvalContext::new();
+    ctx.insert(tanova_kernel::Time(5.0));
+    let governor = MemoryGovernor::new(64 * 1024 * 1024);
+    let epoch = RenderEpoch::new();
+
+    let offset = dag
+        .evaluate_pull(NodeId(3), &ctx, &governor, &epoch, epoch.bump())
+        .unwrap();
+    assert_eq!(
+        offset.get::<f64>(),
+        Some(&2.0),
+        "TimeOffset(3) at frame 5 must sample upstream at frame 2"
+    );
+
+    let held = dag
+        .evaluate_pull(NodeId(4), &ctx, &governor, &epoch, epoch.bump())
+        .unwrap();
+    assert_eq!(
+        held.get::<f64>(),
+        Some(&2.0),
+        "FrameHold(first_frame = 2) must sample upstream at frame 2"
+    );
+
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.contains(&(1, 2.0)),
+        "the TimeOffset branch must evaluate upstream at Time(2.0), got {seen:?}"
+    );
+    assert!(
+        seen.contains(&(2, 2.0)),
+        "the FrameHold branch must evaluate upstream at Time(2.0), got {seen:?}"
+    );
 }

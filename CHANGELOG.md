@@ -37,6 +37,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Canvas `Shift+X` swaps `PortId(0)` and `PortId(1)` on every selected multi-input node as one `Batch`, so a single `Ctrl+Z` swaps the pipes back.
   - Dragging a single unconnected node onto a wire splices it into that pipe: the release emits one `Batch` of `MoveNode` + detach + two connects, so one `Ctrl+Z` unsplices and returns the node.
 
+- **Milestone 21 Part 2 — `Switch`, `TimeOffset` & `FrameHold` Cartridges (`tanova-nodes`, `tanova-ui`):**
+  - New `"Switch"` cartridge: two inputs (`0` / `1`) and a `which` knob; `upstream_inputs` requests only the selected port, so the unselected branch is never pulled, evaluated, or hashed. `evaluate` is a pure pass-through of the selected packet.
+  - New `"TimeOffset"` cartridge: `time_offset` rewrites the upstream `EvalContext` time to `t - offset`, so a positive offset delays the clip with zero pixel work in `evaluate`.
+  - New `"FrameHold"` cartridge: `first_frame` always requests that single upstream frame, freezing the clip for downstream nodes.
+  - `tanova-nodes/src/lib.rs` is now a pure module/re-export surface; the shared `map_color_tiles` helper moved into `tanova-nodes/src/util.rs`.
+  - `Switch` maps to `NodeCategory::Merge`; `TimeOffset` / `FrameHold` map to `NodeCategory::Filter`; all three appear in the `+ Add Node` menu, right-click context menu, and `Tab` quick-search. `Saturation` and `Clamp` now report their optional mask input.
+
+- **Milestone 21 Part 3 — `Crop`, `Clamp` & `Saturation` Cartridges (`tanova-nodes`, `tanova-ui`):** merged from `codex-nodes`.
+  - New `"Clamp"` cartridge: per-channel `minimum` / `maximum` with independent enables and a masked `mix`.
+  - New `"Saturation"` cartridge: `saturation`, luminance `mode` (`Rec709` / `Average` / `Maximum`), `unpremult`, and a masked `mix`.
+  - New `"Crop"` cartridge: `box_min` / `box_max`, `reformat`, and `intersect`, sharing interior AOV tiles with the input.
+  - `Clamp` and `Saturation` map to `NodeCategory::Color` and render their mask port; `Crop` maps to `NodeCategory::Transform`. The properties bin edits `box_min` / `box_max` as clean `X` / `Y` coordinates (never RGBA swatches) and offers a `mode` combo box for `Saturation`.
+
+- **Milestone 22 Part 1 — Nuke `{curve ...}` Keyframe Parser (`tanova-parse`):** merged from `kilo-parse`.
+  - New `AnimationCurve` / `Keyframe` / `InterpMode` types with Nuke-compatible smooth (Hermite), linear, and constant (hold) segments, plus frame-sorted evaluation and TCL serialization.
+  - `NkNode` collects `curves: HashMap<String, Vec<AnimationCurve>>`; an animated knob accepts both a single `{curve ...}` channel and a nested `{{curve ...} {curve ...} 1 1}` multi-channel tuple, coercing the frame-1.0 value into the schema knob type.
+
 ### Fixed
 
 - **Viewer `Display transform` combo box showed a blank closed button (`tanova-ui`):** the combo box now sets `.selected_text(...)` from a `DisplayTransform` label helper, so the active transform (`Linear`, `sRGB`, `Rec.709`, or `ACES`) is always visible without opening the dropdown.

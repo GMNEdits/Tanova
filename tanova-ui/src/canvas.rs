@@ -43,12 +43,18 @@ const CONTEXT_MENU_KINDS: &[&str] = &[
     "Constant",
     "Grade",
     "ColorCorrect",
+    "Clamp",
+    "Saturation",
     "Invert",
     "Premult",
     "Unpremult",
     "Transform",
+    "Crop",
     "Blur",
     "Merge2",
+    "Switch",
+    "TimeOffset",
+    "FrameHold",
     "Write",
     "Viewer",
     "Dot",
@@ -1943,11 +1949,18 @@ fn draw_tab_search(
                 if matches.is_empty() {
                     ui.weak("No matching node");
                 } else {
-                    for kind in matches {
-                        if ui.button(kind).clicked() {
-                            spawn = Some(kind);
-                        }
-                    }
+                    // The spawn list is long enough to overflow a short
+                    // window; cap it so the popup keeps a stable, on-screen
+                    // size instead of being pushed around by the constraint.
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for kind in matches {
+                                if ui.button(kind).clicked() {
+                                    spawn = Some(kind);
+                                }
+                            }
+                        });
                 }
             });
         });
@@ -2676,8 +2689,7 @@ fn input_port_count(kind: &str) -> usize {
     match kind {
         "Constant" | "Read" | "BackdropNode" => 0,
         "Merge2" => 3,
-        "Grade" => 2,
-        "Switch" => 2,
+        "Grade" | "Switch" | "Clamp" | "Saturation" => 2,
         _ => 1,
     }
 }
@@ -3910,6 +3922,40 @@ mod tests {
                 "{kind} must map to NodeCategory::Color"
             );
         }
+    }
+
+    #[test]
+    fn milestone_twenty_one_cartridges_are_spawnable_with_expected_ports() {
+        let expected = [
+            ("Clamp", 2, NodeCategory::Color),
+            ("Saturation", 2, NodeCategory::Color),
+            ("Crop", 1, NodeCategory::Transform),
+            ("Switch", 2, NodeCategory::Merge),
+            ("TimeOffset", 1, NodeCategory::Filter),
+            ("FrameHold", 1, NodeCategory::Filter),
+        ];
+        for (kind, ports, category) in expected {
+            assert!(
+                spawnable_kinds(ViewerWorkflow::Nuke).contains(&kind),
+                "{kind} must be offered in the Nuke spawn list"
+            );
+            assert!(
+                spawnable_kinds(ViewerWorkflow::Fusion).contains(&kind),
+                "{kind} must be offered in the Fusion spawn list"
+            );
+            assert_eq!(input_port_count(kind), ports, "{kind} input port count");
+            assert_eq!(node_category(kind), category, "{kind} category");
+        }
+        assert_eq!(
+            input_port_label("Switch", 2, 0),
+            "0",
+            "Switch input 0 is labelled 0"
+        );
+        assert_eq!(
+            input_port_label("Switch", 2, 1),
+            "1",
+            "Switch input 1 is labelled 1"
+        );
     }
 
     #[test]

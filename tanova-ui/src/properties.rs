@@ -58,6 +58,8 @@ const CHANNELS_MODES: &[&str] = &["rgba", "all"];
 const ALPHA_MODES: &[&str] = &["rgba.alpha", "depth.Z", "none"];
 /// Channel modes for the `Invert` node's `channels` knob.
 const INVERT_CHANNELS: &[&str] = &["rgb", "rgba", "alpha", "none"];
+/// Luminance modes for the `Saturation` node's `mode` knob.
+const SATURATION_MODES: &[&str] = &["Rec709", "Average", "Maximum"];
 /// Tint presets for a `BackdropNode`'s `color` knob.
 const BACKDROP_COLORS: &[&str] = &[
     "slate", "blue", "teal", "amber", "purple", "crimson", "green",
@@ -239,6 +241,7 @@ impl PropertiesPanel {
                                 "alpha" if node.kind == "Premult" || node.kind == "Unpremult" => {
                                     Some(ALPHA_MODES)
                                 }
+                                "mode" if node.kind == "Saturation" => Some(SATURATION_MODES),
                                 "color" if node.kind == "BackdropNode" => Some(BACKDROP_COLORS),
                                 _ => None,
                             };
@@ -280,7 +283,12 @@ impl PropertiesPanel {
                                 changed = true;
                             }
                         }
-                        KnobValue::Color(channels) if name == "translate" || name == "center" => {
+                        KnobValue::Color(channels)
+                            if (node.kind == "Crop"
+                                && (name == "box_min" || name == "box_max"))
+                                || name == "translate"
+                                || name == "center" =>
+                        {
                             // 2D spatial knobs keep `Color([x, y, z, w])`
                             // storage for cartridge compatibility but edit as
                             // coordinates, never as RGBA.
