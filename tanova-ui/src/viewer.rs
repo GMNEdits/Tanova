@@ -33,6 +33,8 @@ const JACK_ARROW_LENGTH: f32 = 45.0;
 const JACK_SHAFT_HIT_RADIUS: f32 = 8.0;
 const JACK_X_COLOR: Color32 = Color32::from_rgb(232, 72, 72);
 const JACK_Y_COLOR: Color32 = Color32::from_rgb(84, 210, 96);
+/// Gold tick marks for keyframes on the timeline rail.
+const KEYFRAME_TICK: Color32 = Color32::from_rgb(255, 200, 60);
 
 /// Restricts a jack drag to one Nuke axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +320,7 @@ impl ViewerPanel {
         end: i64,
         current: &mut f64,
         playing: &mut bool,
+        keyframes: &[i64],
     ) -> Vec<KernelMessage> {
         let mut messages = Vec::new();
         let (start, end) = if start <= end {
@@ -334,6 +337,21 @@ impl ViewerPanel {
                     *playing = !*playing;
                 }
 
+                // Jump to the nearest keyframe on either side of the playhead.
+                let frame = current.round() as i64;
+                if ui.button("[< Key]").clicked() {
+                    if let Some(previous) = keyframes.iter().rev().find(|key| **key < frame) {
+                        *current = *previous as f64;
+                        messages.push(KernelMessage::SetTime(*current));
+                    }
+                }
+                if ui.button("[Key >]").clicked() {
+                    if let Some(next) = keyframes.iter().find(|key| **key > frame) {
+                        *current = *next as f64;
+                        messages.push(KernelMessage::SetTime(*current));
+                    }
+                }
+
                 let mut frame = current.round() as i64;
                 let slider = ui.add(
                     egui::Slider::new(&mut frame, start..=end)
@@ -343,6 +361,25 @@ impl ViewerPanel {
                 if slider.changed() {
                     *current = frame as f64;
                     messages.push(KernelMessage::SetTime(*current));
+                }
+
+                // Gold ticks mark every keyframe on the slider rail.
+                let span = (end - start) as f32;
+                if span > 0.0 {
+                    for key in keyframes {
+                        if *key < start || *key > end {
+                            continue;
+                        }
+                        let t = (*key - start) as f32 / span;
+                        let x = slider.rect.left() + t * slider.rect.width();
+                        ui.painter().line_segment(
+                            [
+                                Pos2::new(x, slider.rect.center().y - 6.0),
+                                Pos2::new(x, slider.rect.center().y + 6.0),
+                            ],
+                            Stroke::new(2.0, KEYFRAME_TICK),
+                        );
+                    }
                 }
 
                 ui.separator();

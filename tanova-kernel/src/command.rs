@@ -10,6 +10,8 @@
 
 use crate::bus::{NodeId, PortId};
 use crate::knobs::KnobTable;
+use crate::types::AnimationCurve;
+use std::collections::BTreeMap;
 
 /// One connection captured at removal time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,6 +56,8 @@ pub struct NodeSnapshot {
     pub disabled: bool,
     /// Every knob value, including user edits.
     pub knobs: KnobTable,
+    /// Every per-knob animation curve, including user edits.
+    pub curves: BTreeMap<String, Vec<AnimationCurve>>,
     /// Every incoming and outgoing edge.
     pub edges: Vec<EdgeSnapshot>,
 }

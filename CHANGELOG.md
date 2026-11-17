@@ -54,6 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New `AnimationCurve` / `Keyframe` / `InterpMode` types with Nuke-compatible smooth (Hermite), linear, and constant (hold) segments, plus frame-sorted evaluation and TCL serialization.
   - `NkNode` collects `curves: HashMap<String, Vec<AnimationCurve>>`; an animated knob accepts both a single `{curve ...}` channel and a nested `{{curve ...} {curve ...} 1 1}` multi-channel tuple, coercing the frame-1.0 value into the schema knob type.
 
+- **Milestone 22 Part 2 — Live Keyframe Animation Engine (`tanova-kernel`, `tanova-parse`, `tanova-ui`, `tanova-app`):**
+  - Moved the curve types into `tanova-kernel::types` (`AnimationCurve`, `Keyframe`, `InterpMode`) and re-exported them from the kernel; `tanova-parse::curve` now aliases the kernel types and keeps only the Nuke parser.
+  - `DagNode` stores `curves: BTreeMap<String, Vec<AnimationCurve>>` (one curve per channel, deterministic order). `DagNode::evaluated_knobs_at(frame)` resolves Float/Int from channel 0, Color per channel with a channel-0/base fallback, and leaves statically stored knobs untouched.
+  - `Dag::pull` now injects the frame-resolved knobs into the node's `EvalContext`, and `hash_node` hashes those resolved values, so scrubbing a `{curve}` produces a distinct cache entry per frame.
+  - `export_to_tcl` writes `{curve ...}` for animated knobs (nested tuples for multi-channel colors) and the plain static scalar otherwise; `load_nk_into_dag` copies parsed curves onto the `DagNode`, so animation survives a save/load round trip.
+  - New `UndoableCommand::SetKnobCurve { node, name, curves, previous }` with an exact inverse; applying it updates the node curves and invalidates downstream cache entries.
+  - Properties bin `[Key]` controls: blue `[K]` when a key sits on the current frame, teal `[+K]` when the knob is animated but interpolated, and a neutral `[+K]` when it is static. Clicking toggles a key at the current frame; editing an animated knob auto-keys the new value.
+  - Timeline draws gold keyframe ticks on the frame slider and adds `[< Key]` / `[Key >]` buttons that jump the playhead to the previous/next keyframe (selected node's keys, or every node's keys when nothing is selected).
+  - `GraphMirror` mirrors curve state from `KernelEvent`s and exposes `keyframe_times(selected)`; the app syncs `PropertiesPanel::current_frame` from the timeline each frame.
+
 ### Fixed
 
 - **Viewer `Display transform` combo box showed a blank closed button (`tanova-ui`):** the combo box now sets `.selected_text(...)` from a `DisplayTransform` label helper, so the active transform (`Linear`, `sRGB`, `Rec.709`, or `ACES`) is always visible without opening the dropdown.

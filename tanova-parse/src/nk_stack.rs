@@ -386,6 +386,15 @@ impl<'a> Machine<'a> {
                 dag.set_disabled(id, true)
                     .map_err(|error| ParseError::Kernel(error.to_string()))?;
             }
+            // Animation curves live outside the knob table, so copy them onto
+            // the node once its knobs exist (the frame-1.0 value was already
+            // coerced into the knob type).
+            if let Some(node) = dag.node_mut(id) {
+                node.curves = curves
+                    .iter()
+                    .map(|(name, channel_curves)| (name.clone(), channel_curves.clone()))
+                    .collect();
+            }
             for (port, from) in input_nodes.iter().enumerate() {
                 let Some(from) = from else {
                     continue;
@@ -1068,5 +1077,91 @@ Grade {
 
         let mut dag = Dag::new();
         load_nk_into_dag(script, &mut dag).expect("dag load should succeed");
+    }
+
+    #[test]
+    fn animated_knob_evaluates_across_frames_in_dag_and_round_trips_tcl() {
+        use tanova_kernel::{EvalContext, MemoryGovernor, RenderEpoch, Time};
+        use tanova_render::Raster2D;
+
+        tanova_nodes::ensure_linked();
+        // Constant 0.2/0.4/0.6/1 graded by gain 2, with `mix` animated 0 -> 1.
+        // At frame 1 mix is 0 (original color), at frame 11 mix is 1 (graded),
+        // and frame 6 sits exactly halfway.
+        let script = "\
+version 15.0 v5
+Constant {
+ color {0.2 0.4 0.6 1}
+ format_width 64
+ format_height 64
+}
+Grade {
+ gain {2 2 2 1}
+ mix {curve l x1 0 x11 1}
+}
+";
+        let mut dag = Dag::new();
+        load_nk_into_dag(script, &mut dag).expect("dag load should succeed");
+
+        // Constant is node 1, Grade is node 2 in load order.
+        let grade = NodeId(2);
+        assert_eq!(
+            dag.node(grade).map(|node| node.curves.len()),
+            Some(1),
+            "the parsed mix curve must reach the DagNode"
+        );
+
+        let governor = MemoryGovernor::new(usize::MAX);
+        let epoch = RenderEpoch::new();
+        let target_epoch = epoch.bump();
+
+        let sample = |dag: &mut Dag, frame: f64| -> [f32; 4] {
+            let mut ctx = EvalContext::new();
+            ctx.insert(Time(frame));
+            let packet = dag
+                .evaluate_pull(grade, &ctx, &governor, &epoch, target_epoch)
+                .expect("Grade pulls");
+            let raster = packet.get::<Raster2D>().expect("Grade emits a Raster2D");
+            raster.sample_rgba(10, 10)
+        };
+
+        let assert_pixel = |actual: [f32; 4], expected: [f32; 4], frame: f64| {
+            for (channel, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "frame {frame} channel {channel}: expected {expected}, got {actual} (pixel {actual:?})"
+                );
+            }
+        };
+
+        let at_one = sample(&mut dag, 1.0);
+        assert_pixel(at_one, [0.2, 0.4, 0.6, 1.0], 1.0);
+        let at_six = sample(&mut dag, 6.0);
+        assert_pixel(at_six, [0.3, 0.6, 0.9, 1.0], 6.0);
+        let at_eleven = sample(&mut dag, 11.0);
+        assert_pixel(at_eleven, [0.4, 0.8, 1.2, 1.0], 11.0);
+
+        // The animated knob must survive an export/reload round trip.
+        let exported = dag.export_to_tcl();
+        assert!(
+            exported.contains("mix {curve")
+                && exported.contains("x1 0")
+                && exported.contains("x11 1"),
+            "mix must export as an animated curve: {exported}"
+        );
+        assert!(
+            !exported.contains("mix 0.0") && !exported.contains("mix 0\n"),
+            "an animated knob must not also export a static value: {exported}"
+        );
+
+        let mut reloaded = Dag::new();
+        load_nk_into_dag(&exported, &mut reloaded).expect("exported script reloads");
+        let mut ctx = EvalContext::new();
+        ctx.insert(Time(6.0));
+        let packet = reloaded
+            .evaluate_pull(grade, &ctx, &governor, &epoch, target_epoch)
+            .expect("reloaded Grade pulls");
+        let raster = packet.get::<Raster2D>().expect("Grade emits a Raster2D");
+        assert_pixel(raster.sample_rgba(10, 10), [0.3, 0.6, 0.9, 1.0], 6.0);
     }
 }

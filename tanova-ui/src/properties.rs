@@ -4,8 +4,10 @@
 //! `KernelMessage`s. Every edit carries the previous value so the kernel's undo
 //! stack stays mechanical.
 
-use egui::{Color32, ComboBox, DragValue, TextEdit, Ui};
-use tanova_kernel::{KernelMessage, KnobValue, NodeId, UndoableCommand};
+use egui::{Color32, ComboBox, DragValue, RichText, TextEdit, Ui};
+use tanova_kernel::{
+    AnimationCurve, InterpMode, KernelMessage, KnobValue, NodeId, UndoableCommand,
+};
 
 use crate::canvas::GraphMirror;
 use crate::theme::{StudioTheme, node_category, palette};
@@ -64,12 +66,21 @@ const SATURATION_MODES: &[&str] = &["Rec709", "Average", "Maximum"];
 const BACKDROP_COLORS: &[&str] = &[
     "slate", "blue", "teal", "amber", "purple", "crimson", "green",
 ];
+/// Nuke's keyframe blue: the knob has a key on the current frame.
+const KEYFRAME_BLUE: Color32 = Color32::from_rgb(80, 175, 255);
+/// Interpolated teal: the knob is animated but has no key on this frame.
+const INTERPOLATED_TEAL: Color32 = Color32::from_rgb(70, 210, 190);
+/// Default knob-label color.
+const KNOB_LABEL: Color32 = Color32::from_rgb(200, 205, 215);
 
 /// Draws controls for every knob on the selected node.
-#[derive(Default)]
 pub struct PropertiesPanel {
     /// Active studio theme, synced from `NodeCanvasState.theme`.
     pub theme: StudioTheme,
+    /// Current timeline frame, synced from `TanovaApp::timeline.current`.
+    ///
+    /// Drives the `[Key]` controls: a key is added or removed at this frame.
+    pub current_frame: f64,
     /// A `Write` node waiting to render its sequence to disk, set when the
     /// artist clicks `[Render Sequence to Disk]` and consumed by the app.
     pub pending_write_render: Option<NodeId>,
@@ -78,7 +89,22 @@ pub struct PropertiesPanel {
     pub pending_file_browse: Option<FileBrowseRequest>,
 }
 
+impl Default for PropertiesPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PropertiesPanel {
+    /// Creates an empty panel at frame 1.0.
+    pub fn new() -> Self {
+        Self {
+            theme: StudioTheme::default(),
+            current_frame: 1.0,
+            pending_write_render: None,
+            pending_file_browse: None,
+        }
+    }
     /// Consumes and returns the pending write-render node, if any.
     pub fn take_pending_write_render(&mut self) -> Option<NodeId> {
         self.pending_write_render.take()
@@ -184,6 +210,7 @@ impl PropertiesPanel {
                     let mut changed = false;
                     let mut row_active = false;
                     let mut widget_rect: Option<egui::Rect> = None;
+                    let mut key_toggle = false;
 
                     // Tracks the knob's interactive area and whether it
                     // still owns keyboard focus or an active pointer drag.
@@ -194,8 +221,50 @@ impl PropertiesPanel {
                         row_active |= response.has_focus() || response.dragged();
                     };
 
-                    // Column 1: knob name label.
-                    ui.label(egui::RichText::new(name).color(Color32::from_rgb(200, 205, 215)));
+                    // Animation state drives both the label tint and the
+                    // `[Key]` / `[+K]` toggle. Mirrors Nuke: blue means a key
+                    // sits on this frame, teal means interpolated.
+                    let animatable = matches!(
+                        value,
+                        KnobValue::Float(_) | KnobValue::Int(_) | KnobValue::Color(_)
+                    );
+                    let active_curves = node.curves.get(name);
+                    let is_animated = animatable
+                        && active_curves
+                            .is_some_and(|curves| curves.iter().any(|curve| !curve.is_empty()));
+                    let has_key_here = animatable
+                        && active_curves.is_some_and(|curves| {
+                            curves
+                                .iter()
+                                .any(|curve| curve.has_key_at(self.current_frame))
+                        });
+                    let label_color = if has_key_here {
+                        KEYFRAME_BLUE
+                    } else if is_animated {
+                        INTERPOLATED_TEAL
+                    } else {
+                        KNOB_LABEL
+                    };
+
+                    // Column 1: knob name label plus the `[Key]` toggle.
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name).color(label_color));
+                        if animatable {
+                            let (key_text, key_color) = if has_key_here {
+                                ("[K]", KEYFRAME_BLUE)
+                            } else if is_animated {
+                                ("[+K]", INTERPOLATED_TEAL)
+                            } else {
+                                ("[+K]", Color32::from_rgb(150, 155, 165))
+                            };
+                            if ui
+                                .small_button(RichText::new(key_text).color(key_color))
+                                .clicked()
+                            {
+                                key_toggle = true;
+                            }
+                        }
+                    });
 
                     // Column 2: knob widget(s).
                     match value {
@@ -344,6 +413,25 @@ impl PropertiesPanel {
                         }
                     }
 
+                    // `[Key]` toggles a keyframe at the current frame. Adding
+                    // one preserves the interpolated value when the knob is
+                    // already animated; removing clears the entry entirely
+                    // once every channel has no keys left.
+                    if key_toggle {
+                        let previous = node.curves.get(name).cloned().unwrap_or_default();
+                        let curves = if has_key_here {
+                            remove_keyframe(previous.clone(), self.current_frame)
+                        } else {
+                            insert_keyframe(previous.clone(), value, self.current_frame)
+                        };
+                        messages.push(KernelMessage::Execute(UndoableCommand::SetKnobCurve {
+                            node: node_id,
+                            name: name.to_string(),
+                            curves,
+                            previous,
+                        }));
+                    }
+
                     ui.end_row();
 
                     #[cfg(test)]
@@ -385,9 +473,24 @@ impl PropertiesPanel {
                         messages.push(KernelMessage::Execute(UndoableCommand::SetKnob {
                             node: node_id,
                             knob: name.to_string(),
-                            value: next,
+                            value: next.clone(),
                             previous: initial_value,
                         }));
+
+                        // Auto-key: dragging or typing on an already animated
+                        // knob writes the new value as a key at the current
+                        // frame, so animation editing stays one gesture.
+                        if is_animated {
+                            let previous = node.curves.get(name).cloned().unwrap_or_default();
+                            let curves =
+                                set_curve_values(previous.clone(), &next, self.current_frame);
+                            messages.push(KernelMessage::Execute(UndoableCommand::SetKnobCurve {
+                                node: node_id,
+                                name: name.to_string(),
+                                curves,
+                                previous,
+                            }));
+                        }
                     }
 
                     // A row that no longer holds keyboard focus or a pointer
@@ -417,6 +520,67 @@ impl PropertiesPanel {
 
         messages
     }
+}
+
+/// Numeric channels of an animatable knob: one for Float/Int, four for Color.
+fn knob_channel_values(value: &KnobValue) -> Vec<f64> {
+    match value {
+        KnobValue::Float(value) => vec![*value],
+        KnobValue::Int(value) => vec![*value as f64],
+        KnobValue::Color(rgba) => rgba.iter().map(|channel| *channel as f64).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Inserts a key at `frame` for every channel, preserving the current
+/// interpolated value when a channel is already animated.
+fn insert_keyframe(
+    mut curves: Vec<AnimationCurve>,
+    value: &KnobValue,
+    frame: f64,
+) -> Vec<AnimationCurve> {
+    let values = knob_channel_values(value);
+    if curves.len() < values.len() {
+        curves.resize(values.len(), AnimationCurve::new());
+    }
+    for (index, curve) in curves.iter_mut().enumerate() {
+        let value = if curve.is_empty() {
+            values.get(index).copied().unwrap_or(0.0)
+        } else {
+            curve.evaluate(frame)
+        };
+        curve.set_key(frame, value, InterpMode::Smooth);
+    }
+    curves
+}
+
+/// Removes the key at `frame` from every channel. Returns an empty vector once
+/// every channel is empty, so `SetKnobCurve` clears the knob's animation.
+fn remove_keyframe(mut curves: Vec<AnimationCurve>, frame: f64) -> Vec<AnimationCurve> {
+    for curve in &mut curves {
+        curve.remove_key(frame);
+    }
+    if curves.iter().all(|curve| curve.is_empty()) {
+        Vec::new()
+    } else {
+        curves
+    }
+}
+
+/// Writes concrete channel values at `frame`, used for auto-key after an edit.
+fn set_curve_values(
+    mut curves: Vec<AnimationCurve>,
+    value: &KnobValue,
+    frame: f64,
+) -> Vec<AnimationCurve> {
+    let values = knob_channel_values(value);
+    if curves.len() < values.len() {
+        curves.resize(values.len(), AnimationCurve::new());
+    }
+    for (curve, value) in curves.iter_mut().zip(values) {
+        curve.set_key(frame, value, InterpMode::Smooth);
+    }
+    curves
 }
 
 fn to_u8(value: f32) -> u8 {
@@ -639,5 +803,99 @@ mod tests {
             repeat: false,
             modifiers: Modifiers::NONE,
         }
+    }
+
+    /// Builds a one-channel curve with the given `(frame, value)` keys.
+    fn curve(keys: &[(f64, f64)]) -> Vec<AnimationCurve> {
+        let mut curve = AnimationCurve::new();
+        for (frame, value) in keys {
+            curve.set_key(*frame, *value, InterpMode::Smooth);
+        }
+        vec![curve]
+    }
+
+    #[test]
+    fn set_knob_curve_undo_redo_and_keyframe_jump() {
+        let mut knobs = KnobTable::new();
+        knobs.insert("mix", KnobValue::Float(0.0));
+
+        let mut mirror = GraphMirror::default();
+        mirror.apply_event(&KernelEvent::Applied(UndoableCommand::RestoreNode {
+            id: NODE,
+            kind: "Grade".to_string(),
+            x: 0.0,
+            y: 0.0,
+            disabled: false,
+            knobs: Box::new(knobs.clone()),
+            edges: Vec::new(),
+        }));
+        let mut dag = Dag::new();
+        dag.restore_node(NODE, "Grade", 0.0, 0.0, false, &knobs, &[])
+            .expect("dag node #2");
+        let mut undo = UndoStack::new();
+
+        assert!(
+            mirror.keyframe_times(Some(NODE)).is_empty(),
+            "a fresh node starts with no keys"
+        );
+
+        // Key 1: frame 5.
+        let first = curve(&[(5.0, 0.0)]);
+        feed(
+            vec![KernelMessage::Execute(UndoableCommand::SetKnobCurve {
+                node: NODE,
+                name: "mix".to_string(),
+                curves: first.clone(),
+                previous: Vec::new(),
+            })],
+            &mut mirror,
+            &mut dag,
+            &mut undo,
+        );
+        assert_eq!(mirror.keyframe_times(Some(NODE)), vec![5]);
+
+        // Key 2 extends the same curve to frame 20.
+        let second = curve(&[(5.0, 0.0), (20.0, 1.0)]);
+        feed(
+            vec![KernelMessage::Execute(UndoableCommand::SetKnobCurve {
+                node: NODE,
+                name: "mix".to_string(),
+                curves: second.clone(),
+                previous: first.clone(),
+            })],
+            &mut mirror,
+            &mut dag,
+            &mut undo,
+        );
+        assert_eq!(
+            mirror.keyframe_times(Some(NODE)),
+            vec![5, 20],
+            "the timeline must see both keys"
+        );
+        // With nothing selected the timeline gathers every node's keys.
+        assert_eq!(mirror.keyframe_times(None), vec![5, 20]);
+
+        // Undo unwinds the second key, then the first.
+        undo_once(&mut undo, &mut dag, &mut mirror);
+        assert_eq!(mirror.keyframe_times(Some(NODE)), vec![5]);
+        undo_once(&mut undo, &mut dag, &mut mirror);
+        assert!(
+            mirror.keyframe_times(Some(NODE)).is_empty(),
+            "undoing both edits must clear the animation"
+        );
+        assert!(
+            dag.node(NODE).is_some_and(|node| node.curves.is_empty()),
+            "the kernel node must lose its curves too"
+        );
+
+        // Redo restores both keys in order.
+        redo_once(&mut undo, &mut dag, &mut mirror);
+        assert_eq!(mirror.keyframe_times(Some(NODE)), vec![5]);
+        redo_once(&mut undo, &mut dag, &mut mirror);
+        assert_eq!(
+            mirror.keyframe_times(Some(NODE)),
+            vec![5, 20],
+            "redo must restore the full animation"
+        );
     }
 }

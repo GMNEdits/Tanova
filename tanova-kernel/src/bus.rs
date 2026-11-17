@@ -15,7 +15,7 @@ use crate::dag::Dag;
 use crate::governor::{MemoryGovernor, RenderEpoch};
 use crate::knobs::{KnobTable, KnobValue};
 use crate::registry::find_cartridge;
-use crate::types::{EvalContext, NodeError, Packet, Time};
+use crate::types::{AnimationCurve, EvalContext, NodeError, Packet, Time};
 
 /// Identifies a node instance in the graph.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -128,6 +128,21 @@ pub enum UndoableCommand {
         value: KnobValue,
         /// Value before this command.
         previous: KnobValue,
+    },
+    /// Set (or clear) one knob's animation curves.
+    ///
+    /// An empty `curves` vector removes the knob's animation entirely. Each
+    /// channel is one [`AnimationCurve`]; Float/Int knobs use channel 0 and
+    /// Color knobs use up to four.
+    SetKnobCurve {
+        /// Owning node.
+        node: NodeId,
+        /// Knob name.
+        name: String,
+        /// New curves, or empty to clear the animation.
+        curves: Vec<AnimationCurve>,
+        /// Curves before this command, for exact undo.
+        previous: Vec<AnimationCurve>,
     },
     /// Move a node from one canvas position to another.
     MoveNode {
@@ -255,6 +270,17 @@ impl UndoableCommand {
                 knob: knob.clone(),
                 value: previous.clone(),
                 previous: value.clone(),
+            },
+            Self::SetKnobCurve {
+                node,
+                name,
+                curves,
+                previous,
+            } => Self::SetKnobCurve {
+                node: *node,
+                name: name.clone(),
+                curves: previous.clone(),
+                previous: curves.clone(),
             },
             Self::SetDisabled { node, disabled } => Self::SetDisabled {
                 node: *node,

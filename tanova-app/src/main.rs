@@ -1100,6 +1100,7 @@ impl TanovaApp {
             .default_size(400.0)
             .min_size(200.0)
             .show(ui, |ui| {
+                let keyframes = self.graph.keyframe_times(self.canvas.primary_selected);
                 let mut messages = self
                     .viewer
                     .show(ui, &self.graph, self.canvas.primary_selected);
@@ -1109,6 +1110,7 @@ impl TanovaApp {
                     self.timeline.end,
                     &mut self.timeline.current,
                     &mut self.timeline.playing,
+                    &keyframes,
                 ));
                 self.dispatch(messages);
             });
@@ -1120,6 +1122,7 @@ impl TanovaApp {
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     self.properties.theme = self.canvas.theme;
+                    self.properties.current_frame = self.timeline.current;
                     let messages = self.properties.show(
                         ui,
                         &self.graph,

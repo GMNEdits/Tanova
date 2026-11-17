@@ -4,7 +4,7 @@
 //! recursively pulls its inputs, hashes the whole upstream chain, and consults
 //! the cache before any cartridge runs.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,7 +16,7 @@ use crate::command::{EdgeSnapshot, NodeSnapshot};
 use crate::governor::{MemoryGovernor, RenderEpoch, evaluate_with_airbag};
 use crate::knobs::{KnobTable, KnobValue, canonical_f64};
 use crate::registry::find_cartridge;
-use crate::types::{EvalContext, NodeError, NodeTrait, Packet, ProjectFormat};
+use crate::types::{AnimationCurve, EvalContext, NodeError, NodeTrait, Packet, ProjectFormat};
 
 /// Static cartridge default width for source nodes (`Constant`).
 ///
@@ -78,6 +78,11 @@ pub struct DagNode {
     pub kind: String,
     /// User-facing parameters.
     pub knobs: KnobTable,
+    /// Per-knob animation curves, one curve per channel.
+    ///
+    /// `BTreeMap` keeps iteration deterministic so `export_to_tcl` and the
+    /// operation hash are stable across runs and platforms.
+    pub curves: BTreeMap<String, Vec<AnimationCurve>>,
     /// The cartridge itself; `None` until a registry resolves `kind`.
     pub implementation: Option<Arc<dyn NodeTrait>>,
     /// Last panic message, if evaluation crashed this node.
@@ -98,6 +103,7 @@ impl DagNode {
             id,
             kind: kind.into(),
             knobs: KnobTable::new(),
+            curves: BTreeMap::new(),
             implementation: None,
             crashed: None,
             x: 0.0,
@@ -111,6 +117,46 @@ impl DagNode {
         self.implementation = Some(implementation);
         self
     }
+
+    /// Returns the knob table with every animated knob evaluated at `frame`.
+    ///
+    /// Static knobs are copied verbatim. Float knobs read channel 0, Int knobs
+    /// round channel 0, and Color knobs evaluate each channel from its own
+    /// curve (falling back to channel 0, then to the static base value).
+    /// Knobs with no non-empty curve stay exactly as stored.
+    pub fn evaluated_knobs_at(&self, frame: f64) -> KnobTable {
+        let mut knobs = self.knobs.clone();
+        for (name, channel_curves) in &self.curves {
+            if channel_curves.is_empty() || channel_curves.iter().all(|curve| curve.is_empty()) {
+                continue;
+            }
+            let Some(base) = self.knobs.get(name) else {
+                continue;
+            };
+            let evaluated = match base {
+                KnobValue::Float(_) => KnobValue::Float(channel_curves[0].evaluate(frame)),
+                KnobValue::Int(_) => {
+                    KnobValue::Int(channel_curves[0].evaluate(frame).round() as i64)
+                }
+                KnobValue::Color(base) => {
+                    let mut channels = *base;
+                    for (index, channel) in channels.iter_mut().enumerate() {
+                        let curve = channel_curves
+                            .get(index)
+                            .filter(|curve| !curve.is_empty())
+                            .or_else(|| channel_curves.first().filter(|curve| !curve.is_empty()));
+                        if let Some(curve) = curve {
+                            *channel = curve.evaluate(frame) as f32;
+                        }
+                    }
+                    KnobValue::Color(channels)
+                }
+                _ => continue,
+            };
+            knobs.insert(name.clone(), evaluated);
+        }
+        knobs
+    }
 }
 
 impl fmt::Debug for DagNode {
@@ -119,6 +165,7 @@ impl fmt::Debug for DagNode {
             .field("id", &self.id)
             .field("kind", &self.kind)
             .field("knobs", &self.knobs)
+            .field("curves", &self.curves)
             .field("has_implementation", &self.implementation.is_some())
             .field("crashed", &self.crashed)
             .field("x", &self.x)
@@ -523,6 +570,10 @@ impl Dag {
                 if name == "xpos" || name == "ypos" || name == "disable" {
                     continue;
                 }
+                if let Some(serialized) = serialize_animated_knob(node.curves.get(name), value) {
+                    let _ = writeln!(out, " {name} {serialized}");
+                    continue;
+                }
                 let _ = writeln!(out, " {name} {}", format_knob_value(value));
             }
             out.push_str("}\n");
@@ -715,6 +766,7 @@ impl Dag {
             y: node.y,
             disabled: node.disabled,
             knobs: node.knobs.clone(),
+            curves: node.curves.clone(),
             edges,
         })
     }
@@ -988,6 +1040,29 @@ impl Dag {
                 self.set_disabled(node, disabled)?;
                 Ok(UndoableCommand::SetDisabled { node, disabled })
             }
+            UndoableCommand::SetKnobCurve {
+                node,
+                name,
+                curves,
+                previous,
+            } => {
+                let target = self
+                    .nodes
+                    .get_mut(&node)
+                    .ok_or(NodeError::UnknownNode(node.0))?;
+                if curves.is_empty() {
+                    target.curves.remove(&name);
+                } else {
+                    target.curves.insert(name.clone(), curves.clone());
+                }
+                self.invalidate_downstream(node);
+                Ok(UndoableCommand::SetKnobCurve {
+                    node,
+                    name,
+                    curves,
+                    previous,
+                })
+            }
             UndoableCommand::MoveNode {
                 id,
                 from_x: _,
@@ -1116,7 +1191,7 @@ impl Dag {
         // frame time for the port it requests.
         let mut node_ctx = ctx.clone();
         if let Some(node) = self.nodes.get(&id) {
-            node_ctx.insert(node.knobs.clone());
+            node_ctx.insert(node.evaluated_knobs_at(ctx.time().unwrap_or(1.0)));
         }
         node_ctx.insert(governor.clone());
 
@@ -1275,15 +1350,18 @@ impl Dag {
 
         // Cartridges choose their inputs from the node's own context (live
         // knobs plus the requested frame), so build it exactly like `pull`.
+        // Animated knobs are resolved at the requested frame, which makes the
+        // frame-accurate value part of the operation hash.
+        let resolved_knobs = node.evaluated_knobs_at(ctx.time().unwrap_or(1.0));
         let mut node_ctx = ctx.clone();
-        node_ctx.insert(node.knobs.clone());
+        node_ctx.insert(resolved_knobs.clone());
         if let Some(time) = node_ctx.time() {
             // Frame time is part of the operation: the same node at a
             // different frame must never reuse a packet.
             hasher.update(b"time");
             hasher.update(&canonical_f64(time).to_bits().to_le_bytes());
         }
-        node.knobs.feed_hash(&mut hasher);
+        resolved_knobs.feed_hash(&mut hasher);
         feed_eval_context(&mut hasher, &node_ctx);
 
         let mut edges: Vec<Edge> = self
@@ -1349,6 +1427,39 @@ impl Default for Dag {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Serializes a knob as Nuke `{curve ...}` syntax when it is animated.
+///
+/// Returns `None` for static knobs so the caller keeps the exact scalar text
+/// it has always emitted. A single-channel animation serializes as one curve;
+/// a multi-channel (Color) animation serializes as the nested
+/// `{{curve ...} {curve ...} <static> <static>}` tuple the parser reads back.
+fn serialize_animated_knob(
+    curves: Option<&Vec<AnimationCurve>>,
+    value: &KnobValue,
+) -> Option<String> {
+    let curves = curves?;
+    if curves.is_empty() || curves.iter().all(|curve| curve.is_empty()) {
+        return None;
+    }
+    if curves.len() == 1 {
+        return Some(curves[0].to_nuke_tcl());
+    }
+
+    let mut channels = Vec::with_capacity(curves.len());
+    for (index, curve) in curves.iter().enumerate() {
+        if curve.is_empty() {
+            let static_value = match value {
+                KnobValue::Color(rgba) => rgba.get(index).copied().unwrap_or(0.0) as f64,
+                _ => 0.0,
+            };
+            channels.push(static_value.to_string());
+        } else {
+            channels.push(curve.to_nuke_tcl());
+        }
+    }
+    Some(format!("{{ {} }}", channels.join(" ")))
 }
 
 /// Formats one knob value for `.nk` serialization.

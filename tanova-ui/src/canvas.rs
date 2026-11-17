@@ -11,8 +11,8 @@ use egui::{
     Sense, Shape, Stroke, StrokeKind, Ui, Vec2, epaint::CubicBezierShape,
 };
 use tanova_kernel::{
-    EdgeSnapshot, KernelEvent, KernelMessage, KnobTable, KnobValue, NodeId, PortId, ProjectFormat,
-    UndoableCommand, find_cartridge,
+    AnimationCurve, EdgeSnapshot, KernelEvent, KernelMessage, KnobTable, KnobValue, NodeId, PortId,
+    ProjectFormat, UndoableCommand, find_cartridge,
 };
 
 use crate::theme::{StudioTheme, ThemePalette, backdrop_tint_color, node_category, palette};
@@ -77,6 +77,8 @@ pub struct CanvasNode {
     pub crashed: Option<String>,
     /// UI-side copy of the node's knobs, updated from `KernelEvent`s.
     pub knobs: KnobTable,
+    /// UI-side copy of the node's animation curves, updated from `KernelEvent`s.
+    pub curves: BTreeMap<String, Vec<AnimationCurve>>,
     /// Canvas-space X position carried by the `AddNode` command.
     pub x: f32,
     /// Canvas-space Y position carried by the `AddNode` command.
@@ -143,6 +145,7 @@ impl GraphMirror {
                 kind: node.kind.clone(),
                 crashed: None,
                 knobs: node.knobs.clone(),
+                curves: node.curves.clone(),
                 x: node.x,
                 y: node.y,
                 disabled: node.disabled,
@@ -228,6 +231,36 @@ impl GraphMirror {
             .find(|edge| edge.to_node == to_node && edge.to_port == to_port)
     }
 
+    /// Keyframe times (rounded, sorted, deduplicated) used by the timeline.
+    ///
+    /// Reads `selected`'s curves, or every node's curves when nothing is
+    /// selected.
+    pub fn keyframe_times(&self, selected: Option<NodeId>) -> Vec<i64> {
+        let mut times = Vec::new();
+        let mut collect = |node: &CanvasNode| {
+            for curves in node.curves.values() {
+                for curve in curves {
+                    times.extend(curve.keyframe_times());
+                }
+            }
+        };
+        match selected {
+            Some(id) => {
+                if let Some(node) = self.node(id) {
+                    collect(node);
+                }
+            }
+            None => {
+                for node in &self.nodes {
+                    collect(node);
+                }
+            }
+        }
+        times.sort_unstable();
+        times.dedup();
+        times
+    }
+
     /// Builds a full-state `RemoveNode` from the mirrored node and its wires.
     pub fn removal_command(&self, id: NodeId) -> Option<UndoableCommand> {
         let node = self.node(id)?;
@@ -308,6 +341,7 @@ impl GraphMirror {
                         kind: kind.clone(),
                         crashed: None,
                         knobs,
+                        curves: BTreeMap::new(),
                         x: *x,
                         y: *y,
                         disabled: false,
@@ -334,6 +368,7 @@ impl GraphMirror {
                         kind: kind.clone(),
                         crashed: None,
                         knobs: knobs.as_ref().clone(),
+                        curves: BTreeMap::new(),
                         x: *x,
                         y: *y,
                         disabled: *disabled,
@@ -392,6 +427,21 @@ impl GraphMirror {
                     .find(|candidate| candidate.id == *node)
                 {
                     node.knobs.insert(knob.clone(), value.clone());
+                }
+            }
+            UndoableCommand::SetKnobCurve {
+                node, name, curves, ..
+            } => {
+                if let Some(node) = self
+                    .nodes
+                    .iter_mut()
+                    .find(|candidate| candidate.id == *node)
+                {
+                    if curves.is_empty() {
+                        node.curves.remove(name);
+                    } else {
+                        node.curves.insert(name.clone(), curves.clone());
+                    }
                 }
             }
             UndoableCommand::SetDisabled { node, disabled } => {
