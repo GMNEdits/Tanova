@@ -10,6 +10,7 @@
 
 use std::any::Any;
 
+use crate::PortId;
 use crate::governor::MemoryGovernor;
 use crate::knobs::KnobTable;
 
@@ -263,6 +264,24 @@ pub trait NodeTrait: Send + Sync {
     /// Pulls data from `inputs`, using `ctx` for render state, and returns the
     /// resulting packet. Must not mutate the node.
     fn evaluate(&self, ctx: &EvalContext, inputs: &[Packet]) -> Result<Packet, NodeError>;
+
+    /// Declares which connected input ports to pull and the `EvalContext` for
+    /// each port.
+    ///
+    /// Defaults to pulling all connected ports with `ctx` unchanged. Cartridges
+    /// that only read some inputs (a `Switch`) override this to skip the
+    /// inactive branch, and time-warping cartridges (a `TimeOffset`) rewrite the
+    /// context for the port they request.
+    fn upstream_inputs(
+        &self,
+        ctx: &EvalContext,
+        connected_ports: &[PortId],
+    ) -> Vec<(PortId, EvalContext)> {
+        connected_ports
+            .iter()
+            .map(|&port| (port, ctx.clone()))
+            .collect()
+    }
 
     /// Writes the node's state back into `.nk` / TCL syntax.
     fn serialize_to_tcl(&self) -> String;

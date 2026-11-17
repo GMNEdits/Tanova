@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New `"ColorCorrect"` cartridge: `saturation`, `contrast`, `gamma`, `gain`, `offset`, `unpremult`, and `mix` knobs.
   - All four cartridges map to `NodeCategory::Color`, so they render the category header band color across `Classic`, `Slate`, and `Midnight` themes; they appear in the `+ Add Node` dropdown, right-click context menu, and `Tab` quick-search.
 
+- **Milestone 21 Part 1 — Demand-Driven Inputs, Temporal Hooks & Pipe Splicing (`tanova-kernel`, `tanova-ui`):**
+  - New `NodeTrait::upstream_inputs` default method: a cartridge declares exactly which connected ports to pull and the `EvalContext` for each. The default still pulls every connected port with the caller's context, so existing cartridges are unchanged.
+  - `Dag::pull` now honors `upstream_inputs` (and bypassed nodes pull only `PortId(0)`), assembling per-port inputs from just the requested branches. `OpHash` hashes only those pulled inputs plus the node's frame time, so an unselected `Switch` branch is never evaluated and never invalidates the active branch.
+  - `CacheEntry` records its `node_id`; `invalidate_downstream` now drops every cache entry owned by a downstream node (not just the last hash), keeping multi-frame `TimeOffset` entries from serving stale frames.
+  - `Switch` pin geometry: input `0` on the top edge, input `1` on the left `A` edge, with `0` / `1` labels; the cartridge accepts two inputs.
+  - Canvas `Shift+X` swaps `PortId(0)` and `PortId(1)` on every selected multi-input node as one `Batch`, so a single `Ctrl+Z` swaps the pipes back.
+  - Dragging a single unconnected node onto a wire splices it into that pipe: the release emits one `Batch` of `MoveNode` + detach + two connects, so one `Ctrl+Z` unsplices and returns the node.
+
 ### Fixed
 
 - **Viewer `Display transform` combo box showed a blank closed button (`tanova-ui`):** the combo box now sets `.selected_text(...)` from a `DisplayTransform` label helper, so the active transform (`Linear`, `sRGB`, `Rec.709`, or `ACES`) is always visible without opening the dropdown.

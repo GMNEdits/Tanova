@@ -1281,10 +1281,15 @@ impl NodeCanvas {
             }
 
             // The per-frame `MoveNode` stream already reached the kernel, so
-            // releasing only clears the latched drag.
+            // releasing only clears the latched drag. One special case: a sole
+            // unconnected node dropped on a wire splices itself into that pipe.
             if state.dragging_nodes {
                 state.dragging_nodes = false;
+                let splice = dragged_node_splice(state, graph, rect);
                 state.drag_start_positions.clear();
+                if let Some(batch) = splice {
+                    messages.push(KernelMessage::Execute(batch));
+                }
             }
         }
 
@@ -1535,6 +1540,95 @@ impl NodeCanvas {
                 .input_mut(|input| input.consume_key(Modifiers::NONE, Key::F));
             if frame_pressed {
                 state.frame_nodes(graph, rect);
+            }
+        }
+
+        // `Shift+X` swaps the `B` / `A` inputs of every selected multi-input
+        // node. Collecting the disconnects and reconnects into one batch means
+        // a single `Ctrl+Z` swaps the pipes straight back.
+        if !keyboard_busy
+            && !search_open
+            && !modal_open
+            && state.active_wire_drag.is_none()
+            && state.box_selection.is_none()
+        {
+            let swap_pressed = ui
+                .ctx()
+                .input_mut(|input| input.consume_key(Modifiers::SHIFT, Key::X));
+            if swap_pressed {
+                let mut ids: Vec<NodeId> = state.selected_nodes.iter().copied().collect();
+                ids.sort();
+                let mut swaps: Vec<UndoableCommand> = Vec::new();
+                for id in ids {
+                    let accepts_two = graph
+                        .node(id)
+                        .is_some_and(|node| input_port_count(&node.kind) >= 2);
+                    if !accepts_two {
+                        continue;
+                    }
+                    let edge_0 = graph.incoming_edge(id, PortId(0));
+                    let edge_1 = graph.incoming_edge(id, PortId(1));
+                    match (edge_0, edge_1) {
+                        (Some(a), Some(b)) => {
+                            swaps.push(UndoableCommand::DisconnectEdge {
+                                from_node: a.from_node,
+                                from_port: a.from_port,
+                                to_node: a.to_node,
+                                to_port: a.to_port,
+                            });
+                            swaps.push(UndoableCommand::DisconnectEdge {
+                                from_node: b.from_node,
+                                from_port: b.from_port,
+                                to_node: b.to_node,
+                                to_port: b.to_port,
+                            });
+                            swaps.push(UndoableCommand::ConnectEdge {
+                                from_node: a.from_node,
+                                from_port: a.from_port,
+                                to_node: id,
+                                to_port: PortId(1),
+                            });
+                            swaps.push(UndoableCommand::ConnectEdge {
+                                from_node: b.from_node,
+                                from_port: b.from_port,
+                                to_node: id,
+                                to_port: PortId(0),
+                            });
+                        }
+                        (Some(a), None) => {
+                            swaps.push(UndoableCommand::DisconnectEdge {
+                                from_node: a.from_node,
+                                from_port: a.from_port,
+                                to_node: a.to_node,
+                                to_port: a.to_port,
+                            });
+                            swaps.push(UndoableCommand::ConnectEdge {
+                                from_node: a.from_node,
+                                from_port: a.from_port,
+                                to_node: id,
+                                to_port: PortId(1),
+                            });
+                        }
+                        (None, Some(b)) => {
+                            swaps.push(UndoableCommand::DisconnectEdge {
+                                from_node: b.from_node,
+                                from_port: b.from_port,
+                                to_node: b.to_node,
+                                to_port: b.to_port,
+                            });
+                            swaps.push(UndoableCommand::ConnectEdge {
+                                from_node: b.from_node,
+                                from_port: b.from_port,
+                                to_node: id,
+                                to_port: PortId(0),
+                            });
+                        }
+                        (None, None) => {}
+                    }
+                }
+                if let Some(batch) = UndoableCommand::from_vec(swaps) {
+                    messages.push(KernelMessage::Execute(batch));
+                }
             }
         }
 
@@ -2389,6 +2483,149 @@ fn node_screen_rect_at(state: &NodeCanvasState, position: Pos2, size: Vec2, rect
     Rect::from_min_size(min, size * state.zoom)
 }
 
+/// Screen-space endpoints and downstream edge side of `edge`.
+///
+/// Returns `None` when either endpoint has not been laid out yet.
+fn edge_screen_geometry(
+    state: &NodeCanvasState,
+    graph: &GraphMirror,
+    rect: Rect,
+    edge: &CanvasEdge,
+) -> Option<(Pos2, Pos2, PortSide)> {
+    if state.node_position(edge.from_node).is_none() || state.node_position(edge.to_node).is_none()
+    {
+        return None;
+    }
+    let from_rect = node_screen_rect(state, edge.from_node, rect, graph);
+    let to_rect = node_screen_rect(state, edge.to_node, rect, graph);
+    let to_node = graph.node(edge.to_node)?;
+    let port_count = input_port_count(&to_node.kind);
+    let from = output_port(from_rect, state.zoom);
+    let to = input_port(to_rect, &to_node.kind, port_count, edge.to_port);
+    let side = input_port_side(&to_node.kind, port_count, edge.to_port.0 as usize);
+    Some((from, to, side))
+}
+
+/// The four cubic Bezier control points of a wire, in screen space.
+fn wire_curve(from: Pos2, to: Pos2, to_side: PortSide, zoom: f32) -> [Pos2; 4] {
+    let distance = match to_side {
+        PortSide::Top => (to.y - from.y).abs(),
+        PortSide::Left | PortSide::Right => (to.x - from.x).abs(),
+    }
+    .max(40.0 * zoom);
+    let control = distance * 0.5;
+    let cp1 = from + Vec2::new(0.0, control);
+    let cp2 = match to_side {
+        PortSide::Top => to - Vec2::new(0.0, control),
+        PortSide::Left => to - Vec2::new(control, 0.0),
+        PortSide::Right => to + Vec2::new(control, 0.0),
+    };
+    [from, cp1, cp2, to]
+}
+
+/// Point at `t` in `0..=1` along a cubic Bezier.
+fn cubic_bezier_point(points: [Pos2; 4], t: f32) -> Pos2 {
+    let u = 1.0 - t;
+    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    Pos2::new(
+        a * points[0].x + b * points[1].x + c * points[2].x + d * points[3].x,
+        a * points[0].y + b * points[1].y + c * points[2].y + d * points[3].y,
+    )
+}
+
+/// Screen-space radius for "dropped on a wire" splicing.
+const SPLICE_RADIUS: f32 = 16.0;
+
+/// Builds the one-batch command that splices a just-dragged, unconnected node
+/// into the wire under its center.
+///
+/// Returns `None` unless the gesture moved exactly one node, that node accepts
+/// an input, is not a `BackdropNode` or `Viewer`, and has no wires yet. The
+/// batch holds the drag's `MoveNode` plus the three wire edits, so a single
+/// `Ctrl+Z` removes the node from the pipe and returns it to its start.
+fn dragged_node_splice(
+    state: &NodeCanvasState,
+    graph: &GraphMirror,
+    rect: Rect,
+) -> Option<UndoableCommand> {
+    if state.selected_nodes.len() != 1 {
+        return None;
+    }
+    let dragged_id = *state.selected_nodes.iter().next()?;
+    let node = graph.node(dragged_id)?;
+    if is_backdrop_node(&node.kind) || node.kind == "Viewer" || input_port_count(&node.kind) < 1 {
+        return None;
+    }
+    if graph
+        .edges()
+        .iter()
+        .any(|edge| edge.from_node == dragged_id || edge.to_node == dragged_id)
+    {
+        return None;
+    }
+
+    let (from_x, from_y) = state
+        .drag_start_positions
+        .get(&dragged_id)
+        .copied()
+        .unwrap_or((node.x, node.y));
+    let (to_x, to_y) = state
+        .node_position(dragged_id)
+        .map_or((node.x, node.y), |position| (position.x, position.y));
+    // A click that never moved is not a splice gesture.
+    if (to_x - from_x).abs() < 1e-3 && (to_y - from_y).abs() < 1e-3 {
+        return None;
+    }
+
+    let center = node_screen_rect(state, dragged_id, rect, graph).center();
+    let threshold = SPLICE_RADIUS * state.zoom;
+    let mut closest: Option<(CanvasEdge, f32)> = None;
+    for edge in graph.edges() {
+        let Some((from, to, side)) = edge_screen_geometry(state, graph, rect, edge) else {
+            continue;
+        };
+        let points = wire_curve(from, to, side, state.zoom);
+        let mut distance = f32::INFINITY;
+        for step in 0..=16 {
+            let t = step as f32 / 16.0;
+            distance = distance.min(cubic_bezier_point(points, t).distance(center));
+        }
+        let better = closest.is_none_or(|(_, best)| distance < best);
+        if distance <= threshold && better {
+            closest = Some((*edge, distance));
+        }
+    }
+    let (edge, _) = closest?;
+
+    Some(UndoableCommand::Batch(vec![
+        UndoableCommand::MoveNode {
+            id: dragged_id,
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+        },
+        UndoableCommand::DisconnectEdge {
+            from_node: edge.from_node,
+            from_port: edge.from_port,
+            to_node: edge.to_node,
+            to_port: edge.to_port,
+        },
+        UndoableCommand::ConnectEdge {
+            from_node: edge.from_node,
+            from_port: edge.from_port,
+            to_node: dragged_id,
+            to_port: PortId(0),
+        },
+        UndoableCommand::ConnectEdge {
+            from_node: dragged_id,
+            from_port: PortId(0),
+            to_node: edge.to_node,
+            to_port: edge.to_port,
+        },
+    ]))
+}
+
 /// Which edge of a node card an input pin sits on.
 ///
 /// Nuke's combiner layout puts the `B` pipe on top, the `A` pipe on the left,
@@ -2410,6 +2647,15 @@ pub enum PortSide {
 /// right, while three-or-more-input combiners put `A` on the left and every
 /// later pipe (the mask) on the right.
 pub fn input_port_side(kind: &str, input_count: usize, port_index: usize) -> PortSide {
+    if kind == "Switch" {
+        // Input 0 is the top `B` pipe; input 1 enters from the left `A` side so
+        // the selected input reads as a swap partner, not a mask.
+        return if port_index == 1 {
+            PortSide::Left
+        } else {
+            PortSide::Top
+        };
+    }
     if port_index == 0 || input_count <= 1 {
         return PortSide::Top;
     }
@@ -2431,6 +2677,7 @@ fn input_port_count(kind: &str) -> usize {
         "Constant" | "Read" | "BackdropNode" => 0,
         "Merge2" => 3,
         "Grade" => 2,
+        "Switch" => 2,
         _ => 1,
     }
 }
@@ -2759,6 +3006,13 @@ fn hit_output_port(
 pub fn input_port_label(kind: &str, input_count: usize, port_index: usize) -> &'static str {
     if kind == "Dot" {
         return "";
+    }
+    if kind == "Switch" {
+        return match port_index {
+            0 => "0",
+            1 => "1",
+            _ => "",
+        };
     }
     if kind == "Merge2" || input_count == 3 {
         return match port_index {
@@ -3175,19 +3429,7 @@ fn draw_wire(
     color: Color32,
     label: Option<&str>,
 ) {
-    let distance = match to_side {
-        PortSide::Top => (to.y - from.y).abs(),
-        PortSide::Left | PortSide::Right => (to.x - from.x).abs(),
-    }
-    .max(40.0 * zoom);
-    let control = distance * 0.5;
-    let cp1 = from + Vec2::new(0.0, control);
-    let cp2 = match to_side {
-        PortSide::Top => to - Vec2::new(0.0, control),
-        PortSide::Left => to - Vec2::new(control, 0.0),
-        PortSide::Right => to + Vec2::new(control, 0.0),
-    };
-    let points = [from, cp1, cp2, to];
+    let points = wire_curve(from, to, to_side, zoom);
     painter.add(Shape::CubicBezier(CubicBezierShape::from_points_stroke(
         points,
         false,
@@ -4844,6 +5086,282 @@ mod tests {
         assert!(
             (laid_out.x - start_1.0).abs() < 1e-3 && (laid_out.y - start_1.1).abs() < 1e-3,
             "canvas must follow the undo back to {start_1:?}, got {laid_out:?}"
+        );
+    }
+
+    #[test]
+    fn shift_x_swaps_merge2_inputs_atomically() {
+        let mut graph = GraphMirror::default();
+        for (id, kind, y) in [
+            (1u64, "Constant", 0.0f32),
+            (2, "Grade", 120.0),
+            (3, "Merge2", 240.0),
+        ] {
+            graph.apply_event(&KernelEvent::Applied(UndoableCommand::AddNode {
+                id: NodeId(id),
+                kind: kind.to_string(),
+                x: 0.0,
+                y,
+            }));
+        }
+        // A = #1 on PortId(0), B = #2 on PortId(1).
+        graph.apply_event(&KernelEvent::Applied(UndoableCommand::ConnectEdge {
+            from_node: NodeId(1),
+            from_port: PortId(0),
+            to_node: NodeId(3),
+            to_port: PortId(0),
+        }));
+        graph.apply_event(&KernelEvent::Applied(UndoableCommand::ConnectEdge {
+            from_node: NodeId(2),
+            from_port: PortId(0),
+            to_node: NodeId(3),
+            to_port: PortId(1),
+        }));
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0));
+        let mut canvas = NodeCanvasState::default();
+        canvas.selected_nodes.insert(NodeId(3));
+        canvas.primary_selected = Some(NodeId(3));
+
+        let messages = run_canvas_pass(
+            &ctx,
+            screen,
+            vec![egui::Event::Key {
+                key: Key::X,
+                physical_key: Some(Key::X),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::SHIFT,
+            }],
+            &mut canvas,
+            &graph,
+        );
+
+        let commands = messages
+            .iter()
+            .find_map(|message| match message {
+                KernelMessage::Execute(UndoableCommand::Batch(commands)) => Some(commands),
+                _ => None,
+            })
+            .expect("Shift+X must emit one atomic batch");
+
+        assert_eq!(
+            commands.len(),
+            4,
+            "both pipes must be disconnected and reconnected, got {commands:?}"
+        );
+        assert!(
+            matches!(
+                &commands[0],
+                UndoableCommand::DisconnectEdge {
+                    from_node,
+                    to_node,
+                    to_port,
+                    ..
+                } if *from_node == NodeId(1) && *to_node == NodeId(3) && *to_port == PortId(0)
+            ),
+            "#1 must detach from PortId(0), got {:?}",
+            commands[0]
+        );
+        assert!(
+            matches!(
+                &commands[1],
+                UndoableCommand::DisconnectEdge {
+                    from_node,
+                    to_node,
+                    to_port,
+                    ..
+                } if *from_node == NodeId(2) && *to_node == NodeId(3) && *to_port == PortId(1)
+            ),
+            "#2 must detach from PortId(1), got {:?}",
+            commands[1]
+        );
+        assert!(
+            matches!(
+                &commands[2],
+                UndoableCommand::ConnectEdge {
+                    from_node,
+                    to_node,
+                    to_port,
+                    ..
+                } if *from_node == NodeId(1) && *to_node == NodeId(3) && *to_port == PortId(1)
+            ),
+            "#1 must reconnect on PortId(1), got {:?}",
+            commands[2]
+        );
+        assert!(
+            matches!(
+                &commands[3],
+                UndoableCommand::ConnectEdge {
+                    from_node,
+                    to_node,
+                    to_port,
+                    ..
+                } if *from_node == NodeId(2) && *to_node == NodeId(3) && *to_port == PortId(0)
+            ),
+            "#2 must reconnect on PortId(0), got {:?}",
+            commands[3]
+        );
+    }
+
+    #[test]
+    fn dropping_unconnected_node_on_wire_splices_pipe_in_single_batch() {
+        use tanova_kernel::{Dag, UndoStack};
+
+        let ctx = egui::Context::default();
+        let mut graph = GraphMirror::default();
+        for (id, kind, x, y) in [
+            (1u64, "Constant", 100.0f32, 100.0f32),
+            (2, "Grade", 600.0, 100.0),
+            (3, "Viewer", 300.0, 300.0),
+        ] {
+            graph.apply_event(&KernelEvent::Applied(UndoableCommand::AddNode {
+                id: NodeId(id),
+                kind: kind.to_string(),
+                x,
+                y,
+            }));
+        }
+        graph.apply_event(&KernelEvent::Applied(UndoableCommand::ConnectEdge {
+            from_node: NodeId(1),
+            from_port: PortId(0),
+            to_node: NodeId(3),
+            to_port: PortId(0),
+        }));
+
+        let mut dag = Dag::new();
+        dag.add_node_at(NodeId(1), "Constant", 100.0, 100.0)
+            .unwrap();
+        dag.add_node_at(NodeId(2), "Grade", 600.0, 100.0).unwrap();
+        dag.add_node_at(NodeId(3), "Viewer", 300.0, 300.0).unwrap();
+        dag.connect_edge(tanova_kernel::Edge::new(
+            NodeId(1),
+            PortId(0),
+            NodeId(3),
+            PortId(0),
+        ))
+        .unwrap();
+
+        let mut canvas = NodeCanvasState::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0));
+        let mut undo = UndoStack::new();
+        let mut emitted: Vec<UndoableCommand> = Vec::new();
+
+        let _ = run_canvas_pass(&ctx, screen, vec![], &mut canvas, &graph);
+        let rect = canvas.last_canvas_rect.expect("canvas laid out");
+
+        // Aim at the wire's midpoint between Constant and Viewer.
+        let from_rect = node_screen_rect(&canvas, NodeId(1), rect, &graph);
+        let to_rect = node_screen_rect(&canvas, NodeId(3), rect, &graph);
+        let from = output_port(from_rect, canvas.zoom);
+        let viewer_ports = input_port_count("Viewer");
+        let to = input_port(to_rect, "Viewer", viewer_ports, PortId(0));
+        let side = input_port_side("Viewer", viewer_ports, 0);
+        let mid = cubic_bezier_point(wire_curve(from, to, side, canvas.zoom), 0.5);
+
+        let press = node_screen_rect(&canvas, NodeId(2), rect, &graph).center();
+
+        // Frame 1: grab Grade. Nothing is emitted on the press frame.
+        let messages = run_canvas_pass(
+            &ctx,
+            screen,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            &mut canvas,
+            &graph,
+        );
+        assert!(canvas.dragging_nodes, "press must latch the drag");
+        assert!(messages.is_empty(), "the press frame emits no move");
+
+        // Frame 2: drag Grade onto the wire.
+        let messages = run_canvas_pass(
+            &ctx,
+            screen,
+            vec![egui::Event::PointerMoved(mid)],
+            &mut canvas,
+            &graph,
+        );
+        assert!(!messages.is_empty(), "the moving frame must emit a move");
+        feed_commands(&messages, &mut graph, &mut dag, &mut undo, &mut emitted);
+
+        // Frame 3: release over the wire: one batch splices Grade in.
+        let messages = run_canvas_pass(
+            &ctx,
+            screen,
+            vec![egui::Event::PointerButton {
+                pos: mid,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+            &mut canvas,
+            &graph,
+        );
+
+        let commands = messages
+            .iter()
+            .find_map(|message| match message {
+                KernelMessage::Execute(UndoableCommand::Batch(commands)) => Some(commands),
+                _ => None,
+            })
+            .expect("dropping on a wire must emit one atomic batch");
+
+        assert_eq!(
+            commands.len(),
+            4,
+            "MoveNode + Disconnect + two Connects, got {commands:?}"
+        );
+        assert!(
+            matches!(&commands[0], UndoableCommand::MoveNode { id, .. } if *id == NodeId(2)),
+            "the batch must carry the drag's MoveNode first, got {:?}",
+            commands[0]
+        );
+        assert!(
+            matches!(
+                &commands[1],
+                UndoableCommand::DisconnectEdge {
+                    from_node,
+                    to_node,
+                    to_port,
+                    ..
+                } if *from_node == NodeId(1) && *to_node == NodeId(3) && *to_port == PortId(0)
+            ),
+            "the old Constant -> Viewer wire must be detached, got {:?}",
+            commands[1]
+        );
+        assert!(
+            matches!(
+                &commands[2],
+                UndoableCommand::ConnectEdge {
+                    from_node,
+                    to_node,
+                    to_port,
+                    ..
+                } if *from_node == NodeId(1) && *to_node == NodeId(2) && *to_port == PortId(0)
+            ),
+            "Constant must feed the dropped Grade, got {:?}",
+            commands[2]
+        );
+        assert!(
+            matches!(
+                &commands[3],
+                UndoableCommand::ConnectEdge {
+                    from_node,
+                    to_node,
+                    to_port,
+                    ..
+                } if *from_node == NodeId(2) && *to_node == NodeId(3) && *to_port == PortId(0)
+            ),
+            "the dropped Grade must feed the Viewer, got {:?}",
+            commands[3]
         );
     }
 }
