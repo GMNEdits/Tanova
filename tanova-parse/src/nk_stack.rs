@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use tanova_kernel::{Dag, Edge, KnobTable, KnobValue, NodeId, PortId, find_cartridge};
 
 use crate::ParseError;
+use crate::curve::{AnimationCurve, parse_nuke_curve};
 use crate::expr_tcl::{TclEvalEnv, eval_tcl_expr};
 
 /// Classes that produce pixels without consuming an input.
@@ -51,6 +52,9 @@ pub struct ParsedNode {
     pub disabled: bool,
     /// Knobs explicitly present in the script.
     pub knobs: KnobTable,
+    /// Parsed `{curve ...}` animation curves keyed by knob name, one curve per
+    /// knob channel (single-channel knobs store one curve).
+    pub curves: HashMap<String, Vec<AnimationCurve>>,
     /// Declared input count (ports `0..inputs`).
     pub inputs: usize,
     /// Upstream node for each input port; `None` means intentionally empty.
@@ -252,6 +256,7 @@ impl<'a> Machine<'a> {
         let env = self.knob_env();
 
         let mut knobs = KnobTable::new();
+        let mut curves = HashMap::new();
         let mut name = None;
         let mut explicit_inputs = None;
         let mut xpos: Option<f32> = None;
@@ -307,7 +312,13 @@ impl<'a> Machine<'a> {
             let Some((knob, raw_value)) = split_knob(trimmed) else {
                 return Err(self.syntax(*body_line, format!("invalid knob line `{trimmed}`")));
             };
-            let value = parse_knob_value(defaults.as_ref(), knob, raw_value, *body_line, &env)?;
+            let value = if let Some(animated) =
+                parse_animated_knob(defaults.as_ref(), knob, raw_value, &mut curves)
+            {
+                animated
+            } else {
+                parse_knob_value(defaults.as_ref(), knob, raw_value, *body_line, &env)?
+            };
             if knob == "name" {
                 if let KnobValue::Text(text) = &value {
                     name = Some(text.clone());
@@ -317,7 +328,16 @@ impl<'a> Machine<'a> {
         }
 
         let total_inputs = explicit_inputs.unwrap_or_else(|| default_input_count(class));
-        self.create_node(class, total_inputs, knobs, name, xpos, ypos, disabled)
+        self.create_node(
+            class,
+            total_inputs,
+            knobs,
+            curves,
+            name,
+            xpos,
+            ypos,
+            disabled,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -326,6 +346,7 @@ impl<'a> Machine<'a> {
         class: &str,
         total_inputs: usize,
         knobs: KnobTable,
+        curves: HashMap<String, Vec<AnimationCurve>>,
         name: Option<String>,
         xpos: Option<f32>,
         ypos: Option<f32>,
@@ -382,6 +403,7 @@ impl<'a> Machine<'a> {
             ypos,
             disabled,
             knobs,
+            curves,
             inputs: total_inputs,
             input_nodes: input_nodes.clone(),
         });
@@ -573,6 +595,115 @@ fn parse_number_list(raw: &str, line: usize) -> Result<Vec<f64>, ParseError> {
         numbers.push(value);
     }
     Ok(numbers)
+}
+
+/// Tries to read a knob's raw value as a Nuke `{curve ...}` animation — either
+/// a single animated channel `{curve x1 0 x10 1}` or a nested multi-channel
+/// tuple `{{curve ...} {curve ...} 1 1}`.
+///
+/// Returns the coerced static knob value at frame 1.0 and records every
+/// parsed channel curve in `curves` so the node's animation survives the
+/// parse. Returns `None` for plain static values, which fall through to the
+/// existing knob parser untouched.
+fn parse_animated_knob(
+    defaults: Option<&KnobTable>,
+    knob: &str,
+    raw_value: &str,
+    curves: &mut HashMap<String, Vec<AnimationCurve>>,
+) -> Option<KnobValue> {
+    let raw_value = raw_value.trim();
+
+    // Case 1: a single `{curve ...}` channel.
+    if let Some(curve) = parse_nuke_curve(raw_value) {
+        let value = curve.evaluate(1.0);
+        curves.insert(knob.to_string(), vec![curve]);
+        return Some(coerce_curve_value(defaults, knob, value));
+    }
+
+    // Case 2: a nested `{ {curve ...} {curve ...} 1 1 }` multi-channel tuple:
+    // one outer pair of knob-value braces around brace-depth-isolated channels.
+    let inner = raw_value
+        .strip_prefix('{')
+        .and_then(|text| text.strip_suffix('}'))
+        .map(str::trim)?;
+    let elements = split_brace_depth_elements(inner);
+    if elements.is_empty() {
+        return None;
+    }
+    let mut channel_curves = Vec::with_capacity(elements.len());
+    let mut any_animated = false;
+    for element in elements {
+        let element = element.trim();
+        if element.is_empty() {
+            continue;
+        }
+        if let Some(curve) = parse_nuke_curve(element) {
+            any_animated = true;
+            channel_curves.push(curve);
+        } else if let Ok(number) = element.parse::<f64>() {
+            channel_curves.push(AnimationCurve::from_constant(number));
+        } else {
+            // A non-curve, non-numeric channel: not an animated knob.
+            return None;
+        }
+    }
+    if !any_animated {
+        return None;
+    }
+    let values: Vec<f64> = channel_curves
+        .iter()
+        .map(|curve| curve.evaluate(1.0))
+        .collect();
+    curves.insert(knob.to_string(), channel_curves);
+    let default_alpha = defaults
+        .and_then(|table| table.get(knob))
+        .and_then(|value| match value {
+            KnobValue::Color(color) => Some(color[3] as f64),
+            _ => None,
+        })
+        .unwrap_or(1.0);
+    Some(color_from_numbers(&values, default_alpha as f32))
+}
+
+/// Splits `text` into whitespace-separated elements, keeping braced groups
+/// intact by tracking brace depth.
+fn split_brace_depth_elements(text: &str) -> Vec<&str> {
+    let mut elements = Vec::new();
+    let mut depth: u32 = 0;
+    let mut start: usize = 0;
+    for (byte_index, character) in text.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ if character.is_whitespace() && depth == 0 => {
+                if byte_index > start {
+                    elements.push(&text[start..byte_index]);
+                }
+                start = byte_index + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < text.len() {
+        elements.push(&text[start..]);
+    }
+    elements
+}
+
+/// Coerces an evaluated curve value at frame 1.0 into the schema knob type
+/// declared by `default_knobs()`, mirroring the static-number coercion rules:
+/// Color defaults expand a single number across all channels, Int defaults
+/// round, everything else stays a Float.
+fn coerce_curve_value(defaults: Option<&KnobTable>, knob: &str, value: f64) -> KnobValue {
+    let default = defaults.and_then(|table| table.get(knob));
+    match default {
+        Some(KnobValue::Color(_)) => {
+            let channel = value as f32;
+            KnobValue::Color([channel, channel, channel, channel])
+        }
+        Some(KnobValue::Int(_)) => KnobValue::Int(value.round() as i64),
+        _ => KnobValue::Float(value),
+    }
 }
 
 fn eval_number(raw: &str, env: &TclEvalEnv) -> Result<f64, ParseError> {
@@ -886,5 +1017,56 @@ set N4 [stack 0]
             Some(grade_id),
             "Grade -> Dot must survive a backdrop in between"
         );
+    }
+
+    #[test]
+    fn nk_script_parses_single_and_multi_channel_animated_curves() {
+        tanova_nodes::ensure_linked();
+        let script = "\
+version 15.0 v5
+Constant {
+ color {0.2 0.4 0.6 1}
+}
+Blur {
+ size {curve x1 4 x11 24}
+}
+Grade {
+ multiply {{curve l x1 0.5 x11 1.5} {curve l x1 1.0 x11 2.0} 1 1}
+ mix {curve k x1 0.25 x10 1.0}
+}
+";
+        let parsed = parse_nk_script(script).expect("parse should succeed");
+
+        let blur = parsed
+            .nodes
+            .iter()
+            .find(|node| node.class == "Blur")
+            .expect("Blur parsed");
+        assert_eq!(blur.curves["size"].len(), 1);
+        assert_eq!(blur.curves["size"][0].evaluate(1.0), 4.0);
+        assert_eq!(blur.curves["size"][0].evaluate(6.0), 14.0);
+        assert_eq!(blur.knobs.get("size"), Some(&KnobValue::Float(4.0)));
+
+        let grade = parsed
+            .nodes
+            .iter()
+            .find(|node| node.class == "Grade")
+            .expect("Grade parsed");
+        let multiply_curves = grade
+            .curves
+            .get("multiply")
+            .expect("multiply curves parsed");
+        assert_eq!(multiply_curves.len(), 4);
+        assert_eq!(multiply_curves[0].evaluate(6.0), 1.0);
+        assert_eq!(multiply_curves[1].evaluate(6.0), 1.5);
+        assert_eq!(
+            grade.knobs.get("multiply"),
+            Some(&KnobValue::Color([0.5, 1.0, 1.0, 1.0]))
+        );
+        assert_eq!(grade.knobs.get("mix"), Some(&KnobValue::Float(0.25)));
+        assert_eq!(grade.curves.get("mix").expect("mix curve").len(), 1);
+
+        let mut dag = Dag::new();
+        load_nk_into_dag(script, &mut dag).expect("dag load should succeed");
     }
 }
