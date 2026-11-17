@@ -44,10 +44,12 @@ fn single_tile_raster(color: [f32; 4]) -> Raster2D {
 fn registry_links_every_core_cartridge() {
     ensure_linked();
     let kinds = registered_cartridge_kinds();
-    assert_eq!(kinds.len(), 15);
+    assert_eq!(kinds.len(), 18);
     for expected in [
         "BackdropNode",
         "Blur",
+        "Clamp",
+        "Crop",
         "Constant",
         "Dot",
         "Dummy",
@@ -59,6 +61,7 @@ fn registry_links_every_core_cartridge() {
         "Viewer",
         "Merge2",
         "Read",
+        "Saturation",
         "Transform",
         "Write",
     ] {
@@ -243,4 +246,49 @@ fn new_cartridges_process_dense_pixels_and_masks() {
             < 1e-6
     );
     assert!(governor.allocated_bytes() > 0);
+}
+
+#[test]
+fn clamp_and_saturation_sample_dense_masks_and_share_depth() {
+    use tanova_nodes::{ClampNode, SaturationNode, saturation};
+
+    let mut input = single_tile_raster([2.0, 0.0, 0.0, 0.5]);
+    let tile = TileCoord::new(0, 0);
+    let depth = Arc::new(TileBuffer::new_uniform(42.0));
+    let mut plane = ChannelPlane::new();
+    plane.insert(tile, Arc::clone(&depth));
+    input.insert_channel(Channel::DepthZ, plane);
+
+    let governor = MemoryGovernor::new(4 * 1024 * 1024);
+    let mut ctx = EvalContext::new();
+    ctx.insert(governor.clone());
+    let mut mask = single_tile_raster([0.0; 4]);
+    mask.set_pixel(Channel::RgbaAlpha, 3, 4, 0.5, Some(&governor))
+        .unwrap();
+
+    let mut knobs = saturation::default_knobs();
+    knobs.insert("saturation", KnobValue::Float(0.0));
+    knobs.insert("mode", KnobValue::Text("Maximum".into()));
+    let inputs = [packet(input), packet(mask)];
+    let clamped = ClampNode::new().evaluate(&ctx, &inputs).unwrap();
+    let saturated = SaturationNode::from_knobs(knobs)
+        .evaluate(&ctx, &inputs)
+        .unwrap();
+
+    for (output, expected) in [
+        (clamped, [1.5, 0.0, 0.0, 0.5]),
+        (saturated, [2.0, 1.0, 1.0, 0.5]),
+    ] {
+        let raster = output.get::<Raster2D>().unwrap();
+        assert_eq!(raster.sample_rgba(3, 4), expected);
+        assert_eq!(raster.sample_rgba(4, 4), [2.0, 0.0, 0.0, 0.5]);
+        assert!(Arc::ptr_eq(
+            &depth,
+            raster
+                .channel(&Channel::DepthZ)
+                .unwrap()
+                .get(&tile)
+                .unwrap()
+        ));
+    }
 }
