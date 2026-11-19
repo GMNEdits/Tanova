@@ -392,6 +392,16 @@ struct TanovaApp {
     pub properties: PropertiesPanel,
     /// Last render status message (pure ASCII).
     pub last_render_status: Option<String>,
+    /// Last frame handed to the kernel as `SetTime`.
+    ///
+    /// Deduplicates scrub/playback traffic at UI frame rate.
+    last_sent_time: Option<f64>,
+    /// Knob edits sent to the kernel that it has not yet echoed back.
+    ///
+    /// While this is non-zero (or a knob drag is live) an `Applied` echo of an
+    /// older drag step must never overwrite the newer optimistic mirror value:
+    /// doing so would snap the thumb backwards, or freeze it until release.
+    in_flight_knob_edits: u64,
 }
 
 impl TanovaApp {
@@ -420,6 +430,8 @@ impl TanovaApp {
             paste_cascade: 0,
             properties: PropertiesPanel::default(),
             last_render_status: None,
+            last_sent_time: None,
+            in_flight_knob_edits: 0,
         };
         app.seed_graph();
         app
@@ -536,6 +548,14 @@ impl TanovaApp {
         if frame_received || graph_updated {
             self.awaiting_kernel = false;
         }
+        // The worker drains every queued message before rendering, so a
+        // delivered frame means all knob edits sent before it already echoed.
+        // Retire any leftover slots: message coalescing means the 1:1 count
+        // above can over-count, and a stuck counter would suppress echoes for
+        // the rest of the session.
+        if frame_received && !self.properties.is_dragging_knob() {
+            self.in_flight_knob_edits = 0;
+        }
     }
 
     /// Folds one kernel event into the UI mirror.
@@ -592,6 +612,25 @@ impl TanovaApp {
             }
             _ => {}
         }
+
+        // Every knob echo retires one in-flight edit. Only once none are
+        // outstanding (and no drag is live) may an echo touch the mirror:
+        // otherwise replaying an older drag step would snap the thumb back.
+        if let KernelEvent::Applied(command) = &event
+            && Self::command_touches_knob(command)
+        {
+            self.in_flight_knob_edits = self.in_flight_knob_edits.saturating_sub(1);
+            if self.in_flight_knob_edits > 0 || self.properties.is_dragging_knob() {
+                return;
+            }
+        }
+        if let KernelEvent::CommandFailed { command, .. } = &event
+            && Self::command_touches_knob(command)
+        {
+            // A rejected edit never echoes, but it must still retire its slot.
+            self.in_flight_knob_edits = self.in_flight_knob_edits.saturating_sub(1);
+        }
+
         self.graph.apply_event(&event);
     }
 
@@ -819,7 +858,27 @@ impl TanovaApp {
             if let KernelMessage::SetViewerNode(node) = &message {
                 self.viewer.bind(*node);
             }
+            // Scrub/playback traffic can repeat the same frame at UI frame
+            // rate. Sending it again would queue a redundant render behind the
+            // one already in flight, so drop exact repeats.
+            if let KernelMessage::SetTime(frame) = &message {
+                if self.last_sent_time == Some(*frame) {
+                    continue;
+                }
+                self.last_sent_time = Some(*frame);
+                // Keep the timeline's dedupe state in sync with what the
+                // kernel actually has.
+                self.viewer.note_frame_sent(*frame);
+                // A render already in flight is showing an older frame now.
+                self.kernel.render_epoch().bump();
+            }
             if let KernelMessage::Execute(command) = &message {
+                // Track every knob edit until its echo returns, and preempt a
+                // render the worker already started for an older drag step.
+                if Self::command_touches_knob(command) {
+                    self.in_flight_knob_edits = self.in_flight_knob_edits.saturating_add(1);
+                    self.kernel.render_epoch().bump();
+                }
                 let optimistic = command.clone();
                 self.apply_optimistic_mirror_update(&optimistic);
             }
@@ -831,9 +890,11 @@ impl TanovaApp {
 
     /// Optimistically applies a command's effect to the local `GraphMirror`.
     ///
-    /// Handles `SetKnob`, `MoveNode`, and `Batch` recursively so that the UI
-    /// mirrors knob edits and node moves immediately, before the kernel
-    /// round-trips.
+    /// Handles `SetKnob`, `SetKnobCurve`, `MoveNode`, and `Batch` recursively so
+    /// the UI mirrors knob edits and node moves immediately, before the kernel
+    /// round-trips. Recursing into `Batch` is what lets an auto-keyed
+    /// `Batch([SetKnob, SetKnobCurve])` update both the value and the curve on
+    /// the exact same UI frame.
     fn apply_optimistic_mirror_update(&mut self, command: &UndoableCommand) {
         match command {
             UndoableCommand::Batch(cmds) => {
@@ -842,6 +903,7 @@ impl TanovaApp {
                 }
             }
             UndoableCommand::SetKnob { .. }
+            | UndoableCommand::SetKnobCurve { .. }
             | UndoableCommand::MoveNode { .. }
             | UndoableCommand::SetDisabled { .. }
             | UndoableCommand::AddNode { .. }
@@ -849,6 +911,18 @@ impl TanovaApp {
                 self.graph.apply_command(command);
             }
             _ => {}
+        }
+    }
+
+    /// `true` when `command` edits a node's knob value or its animation curves.
+    ///
+    /// Used to drop stale kernel echoes while the artist is actively dragging a
+    /// knob: the optimistic mirror already holds the newest step of the gesture.
+    fn command_touches_knob(command: &UndoableCommand) -> bool {
+        match command {
+            UndoableCommand::SetKnob { .. } | UndoableCommand::SetKnobCurve { .. } => true,
+            UndoableCommand::Batch(commands) => commands.iter().any(Self::command_touches_knob),
+            _ => false,
         }
     }
 
@@ -863,12 +937,8 @@ impl TanovaApp {
             self.timeline.current = self.timeline.start as f64;
         }
 
-        if let Err(error) = self
-            .kernel
-            .send(KernelMessage::SetTime(self.timeline.current))
-        {
-            self.failure = Some(format!("kernel send failed: {error}"));
-        }
+        // Routed through `dispatch` so duplicate frames are dropped.
+        self.dispatch(vec![KernelMessage::SetTime(self.timeline.current)]);
     }
 
     fn shutdown(self) {
@@ -1100,6 +1170,7 @@ impl TanovaApp {
             .default_size(400.0)
             .min_size(200.0)
             .show(ui, |ui| {
+                let keyframes = self.graph.keyframe_times(self.canvas.primary_selected);
                 let mut messages = self
                     .viewer
                     .show(ui, &self.graph, self.canvas.primary_selected);
@@ -1109,6 +1180,7 @@ impl TanovaApp {
                     self.timeline.end,
                     &mut self.timeline.current,
                     &mut self.timeline.playing,
+                    &keyframes,
                 ));
                 self.dispatch(messages);
             });
@@ -1118,16 +1190,15 @@ impl TanovaApp {
             .default_size(300.0)
             .min_size(250.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.properties.theme = self.canvas.theme;
-                    let messages = self.properties.show(
-                        ui,
-                        &self.graph,
-                        self.canvas.primary_selected,
-                        self.viewer.viewer_node(),
-                    );
-                    self.dispatch(messages);
-                });
+                self.properties.theme = self.canvas.theme;
+                self.properties.current_frame = self.timeline.current;
+                let messages = self.properties.show(
+                    ui,
+                    &self.graph,
+                    self.canvas.primary_selected,
+                    self.viewer.viewer_node(),
+                );
+                self.dispatch(messages);
 
                 if let Some(write_node_id) = self.properties.take_pending_write_render() {
                     self.dispatch(vec![KernelMessage::ExecuteWriteNode {
@@ -1171,6 +1242,10 @@ impl TanovaApp {
 
         // The kernel runs on its own thread; poll it at display cadence.
         if self.awaiting_kernel {
+            ui.ctx().request_repaint();
+        }
+        // Playback must tick even while the pointer is motionless.
+        if self.timeline.playing {
             ui.ctx().request_repaint();
         }
         ui.ctx().request_repaint_after(Duration::from_millis(16));
@@ -2350,6 +2425,26 @@ mod tests {
     use egui::{Modifiers, PointerButton, Pos2, Rect, Vec2};
     use tanova_ui::{DOT_SIZE, NODE_SIZE, spawn_node_message};
 
+    /// Serializes GPU-backed tests.
+    ///
+    /// Every GPU test builds its own device and compute pipelines. Letting the
+    /// test harness drive several of them at once makes the Intel Vulkan driver
+    /// segfault, so each test holds this lock for its whole run. Tests that
+    /// never touch the GPU still run in parallel.
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Initializes a GPU context while holding [`GPU_TEST_LOCK`].
+    ///
+    /// Bind the guard for the test's lifetime, e.g.
+    /// `let (_gpu_lock, gpu) = test_gpu();`.
+    fn test_gpu() -> (std::sync::MutexGuard<'static, ()>, GpuContext) {
+        let guard = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        (guard, gpu)
+    }
+
     fn ctrl() -> egui::Modifiers {
         egui::Modifiers {
             ctrl: true,
@@ -2911,7 +3006,7 @@ mod tests {
     fn live_app_ui_drag_and_ctrl_z_restores_node_position() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -3044,7 +3139,7 @@ mod tests {
     fn end_to_end_save_new_script_and_open_tnv_round_trip() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -3150,7 +3245,7 @@ mod tests {
     fn end_to_end_save_new_script_and_open_nk_round_trip() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -3302,7 +3397,7 @@ mod tests {
     fn unsaved_changes_close_guard_sets_pending() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -3340,7 +3435,7 @@ mod tests {
     fn file_modal_cancel_and_escape_close_modal() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -3386,7 +3481,7 @@ mod tests {
     fn file_modal_save_and_open_close_modal_on_success() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -3486,7 +3581,7 @@ mod tests {
     fn project_badge_and_file_modal_labels_are_pure_ascii() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -3520,7 +3615,7 @@ mod tests {
     fn modals_are_centered_in_viewport() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -3559,7 +3654,7 @@ mod tests {
     fn ctrl_v_replaces_default_filename_once_without_double_paste() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -3629,7 +3724,7 @@ mod tests {
     fn sub_graph_copy_paste_and_single_step_undo() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -3795,7 +3890,7 @@ mod tests {
     fn duplicate_and_frame_nodes() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
         // Let the seeded starter comp round-trip into the mirror.
@@ -3858,7 +3953,7 @@ mod tests {
     fn canvas_copy_and_paste_via_egui_copy_and_paste_events() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -3941,7 +4036,7 @@ mod tests {
     fn canvas_copy_and_paste_via_ctrl_c_and_ctrl_v_key_events() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -4029,7 +4124,7 @@ mod tests {
     fn write_node_interactive_passthrough_and_sequence_render() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -4219,7 +4314,7 @@ mod tests {
     fn write_and_read_exr_browse_modals_create_folder_and_auto_detect_sequence() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -4522,7 +4617,7 @@ mod tests {
     fn write_with_plain_filename_renders_distinct_numbered_sequence_files() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -4686,7 +4781,7 @@ mod tests {
     fn read_browse_updates_first_and_last_without_leaving_default_100() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -4884,7 +4979,7 @@ mod tests {
     fn viewer_slots_1_and_2_support_ab_comparison_with_and_without_selection() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -5040,7 +5135,7 @@ mod tests {
     fn single_key_spawning_auto_chains_g_b_t_vertically_and_undoes_atomically() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -5178,7 +5273,7 @@ mod tests {
     fn dot_node_spawns_via_period_key_centers_on_spine_and_passes_packet_through() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -5310,7 +5405,7 @@ mod tests {
     fn spawning_dot_and_blur_on_wired_constant_splices_pipe_and_pushes_downstream_grade() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -5430,7 +5525,7 @@ mod tests {
     fn backdrop_wraps_selected_nodes_moves_enclosed_nodes_and_round_trips_tcl() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -5665,7 +5760,7 @@ mod tests {
     fn single_key_c_spawns_unconnected_constant_with_project_format_and_ctrl_c_copies() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -5741,7 +5836,7 @@ mod tests {
     fn tab_search_enter_wraps_box_selected_nodes_in_backdrop_not_at_cursor() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -5867,7 +5962,7 @@ mod tests {
     fn tab_search_mouse_click_on_backdrop_row_wraps_selected_nodes_without_clearing_selection() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -5934,7 +6029,7 @@ mod tests {
         // Frame 3: click the "BackdropNode" popup button. Position estimated
         // as screen_pos + (~20, ~50) for the egui popup/TextEdit/button
         // geometry (TextEdit + separator + one button row).
-        let click_pos = Pos2::new(620.0, 450.0);
+        let click_pos = Pos2::new(620.0, 404.0);
         run_app_frame(
             &ctx,
             &mut app,
@@ -6002,7 +6097,7 @@ mod tests {
     fn theme_persists_across_script_reset_and_preserves_pin_geometry() {
         tanova_nodes::ensure_linked();
 
-        let gpu = pollster::block_on(init_gpu()).expect("GPU should initialize");
+        let (_gpu_lock, gpu) = test_gpu();
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
         let mut app = TanovaApp::new(kernel, gpu);
 
@@ -6058,6 +6153,258 @@ mod tests {
             assert_eq!(node.x, merge2_x, "{theme:?}: Merge2 x must be preserved");
             assert_eq!(node.y, merge2_y, "{theme:?}: Merge2 y must be preserved");
         }
+
+        app.kernel.shutdown();
+    }
+
+    /// Asks the kernel for `frame` and returns the newest viewer pixel.
+    ///
+    /// Frames already queued for an earlier time are dropped, then a short
+    /// settle window lets any in-flight render finish so a stale frame can
+    /// never win the race against the new one.
+    fn settle_viewer_pixel(app: &mut TanovaApp, frame: f64) -> [f32; 4] {
+        while app.kernel.frames().try_recv().is_ok() {}
+        app.dispatch(vec![KernelMessage::SetTime(frame)]);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut newest: Option<Arc<Packet>> = None;
+        std::thread::sleep(Duration::from_millis(60));
+        while Instant::now() < deadline {
+            let mut received = false;
+            while let Ok(notification) = app.kernel.frames().try_recv() {
+                newest = Some(Arc::clone(&notification.packet));
+                app.viewer.set_frame(&notification);
+                app.last_frame = Some(notification);
+                received = true;
+            }
+            if received {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Keep the newest of any follow-up frames from the same batch.
+        std::thread::sleep(Duration::from_millis(40));
+        while let Ok(notification) = app.kernel.frames().try_recv() {
+            newest = Some(Arc::clone(&notification.packet));
+            app.last_frame = Some(notification);
+        }
+
+        let packet = newest.expect("the viewer must render a frame");
+        let raster = packet
+            .get::<Raster2D>()
+            .expect("the viewer frame carries a raster");
+        raster.sample_rgba(128, 128)
+    }
+
+    #[test]
+    fn live_app_keyframe_animation_changes_rendered_viewer_pixels_across_frames() {
+        use tanova_kernel::{AnimationCurve, InterpMode};
+
+        tanova_nodes::ensure_linked();
+
+        let (_gpu_lock, gpu) = test_gpu();
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Let the starter Constant -> Grade -> Viewer comp reach the mirror.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "starter comp must load");
+
+        // Make Grade #2 visibly redder so the mix animation is measurable.
+        app.dispatch(vec![KernelMessage::Execute(UndoableCommand::SetKnob {
+            node: GRADE,
+            knob: "multiply".to_string(),
+            value: KnobValue::Color([3.0, 1.0, 1.0, 1.0]),
+            previous: KnobValue::Color([1.0, 1.0, 1.0, 1.0]),
+        })]);
+
+        // mix animates 0 -> 1 across frames 1..11, linear.
+        let mut mix_curve = AnimationCurve::new();
+        mix_curve.set_key(1.0, 0.0, InterpMode::Linear);
+        mix_curve.set_key(11.0, 1.0, InterpMode::Linear);
+        app.dispatch(vec![KernelMessage::Execute(
+            UndoableCommand::SetKnobCurve {
+                node: GRADE,
+                name: "mix".to_string(),
+                curves: vec![mix_curve],
+                previous: Vec::new(),
+            },
+        )]);
+
+        let r_at_1 = settle_viewer_pixel(&mut app, 1.0)[0];
+        let r_at_6 = settle_viewer_pixel(&mut app, 6.0)[0];
+        let r_at_11 = settle_viewer_pixel(&mut app, 11.0)[0];
+
+        assert!(
+            r_at_1 < r_at_6 && r_at_6 < r_at_11,
+            "Grade mix must animate the red channel: {r_at_1} -> {r_at_6} -> {r_at_11}"
+        );
+
+        // The properties bin reads the same curve at the current frame.
+        let mut panel = PropertiesPanel::new();
+        panel.current_frame = 6.0;
+        let grade = app.graph.node(GRADE).expect("Grade #2 in mirror");
+        let resolved = panel.effective_knob_value(grade, "mix", &KnobValue::Float(1.0));
+        match resolved {
+            KnobValue::Float(value) => assert!(
+                (value - 0.5).abs() < 1e-6,
+                "effective mix at frame 6 must be 0.5, got {value}"
+            ),
+            other => panic!("mix should resolve to a Float, got {other:?}"),
+        }
+
+        app.kernel.shutdown();
+    }
+
+    /// A single `Batch([SetKnob, SetKnobCurve])` must land on the mirror in
+    /// full, before the worker thread replies, and stay put when an older
+    /// echo arrives.
+    #[test]
+    fn optimistic_batch_updates_both_knob_and_curve_without_snapback() {
+        use tanova_kernel::{AnimationCurve, InterpMode};
+
+        tanova_nodes::ensure_linked();
+
+        let (_gpu_lock, gpu) = test_gpu();
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "starter comp must load");
+        // Drain the starter echoes so only this test's batch is in play.
+        std::thread::sleep(Duration::from_millis(100));
+        app.pump();
+
+        let mut mix_curve = AnimationCurve::new();
+        mix_curve.set_key(1.0, 0.0, InterpMode::Linear);
+        mix_curve.set_key(20.0, 1.0, InterpMode::Linear);
+
+        app.dispatch(vec![KernelMessage::Execute(UndoableCommand::Batch(vec![
+            UndoableCommand::SetKnob {
+                node: GRADE,
+                knob: "mix".to_string(),
+                value: KnobValue::Float(0.25),
+                previous: KnobValue::Float(1.0),
+            },
+            UndoableCommand::SetKnobCurve {
+                node: GRADE,
+                name: "mix".to_string(),
+                curves: vec![mix_curve],
+                previous: Vec::new(),
+            },
+        ]))]);
+
+        // Same UI frame, before the kernel has replied: both halves must be set.
+        let node = app.graph.node(GRADE).expect("Grade #2 in mirror");
+        match node.knobs.get("mix") {
+            Some(KnobValue::Float(value)) => assert!(
+                (value - 0.25).abs() < 1e-6,
+                "optimistic SetKnob must land immediately, got {value}"
+            ),
+            other => panic!("mix should be a Float knob, got {other:?}"),
+        }
+        let curves = node.curves.get("mix").expect("optimistic curve must land");
+        assert!(
+            curves.iter().any(|curve| curve.len() >= 2),
+            "both curve keys must be present immediately"
+        );
+
+        // After the worker echoes the batch, the mirror must still hold the
+        // optimistic value instead of snapping back.
+        std::thread::sleep(Duration::from_millis(150));
+        app.pump();
+        let node = app.graph.node(GRADE).expect("Grade #2 still in mirror");
+        match node.knobs.get("mix") {
+            Some(KnobValue::Float(value)) => assert!(
+                (value - 0.25).abs() < 1e-6,
+                "kernel echo must not snap the knob back, got {value}"
+            ),
+            other => panic!("mix should be a Float knob, got {other:?}"),
+        }
+        assert!(
+            node.curves.contains_key("mix"),
+            "the mirrored curve must survive the kernel echo"
+        );
+
+        app.kernel.shutdown();
+    }
+
+    /// An echo from an earlier step of a drag must never move the mirror
+    /// backward, no matter when it lands.
+    #[test]
+    fn stale_knob_echo_cannot_roll_the_mirror_back_while_edits_are_in_flight() {
+        tanova_nodes::ensure_linked();
+
+        let (_gpu_lock, gpu) = test_gpu();
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "starter comp must load");
+        // Drain the starter echoes so only this test's edits are in play.
+        std::thread::sleep(Duration::from_millis(100));
+        app.pump();
+
+        let set_mix = |value: f64| UndoableCommand::SetKnob {
+            node: GRADE,
+            knob: "mix".to_string(),
+            value: KnobValue::Float(value),
+            previous: KnobValue::Float(0.0),
+        };
+        let mirrored_mix =
+            |app: &TanovaApp| match app.graph.node(GRADE).and_then(|node| node.knobs.get("mix")) {
+                Some(KnobValue::Float(value)) => *value,
+                other => panic!("mix should be a Float knob, got {other:?}"),
+            };
+
+        // The artist is mid-gesture: two edits (0.6, then the newest 0.9) are
+        // on their way to the worker and the mirror already shows 0.9.
+        app.apply_optimistic_mirror_update(&set_mix(0.6));
+        app.apply_optimistic_mirror_update(&set_mix(0.9));
+        app.in_flight_knob_edits = 2;
+
+        // The echo of the first, older step (0.6) must be ignored.
+        app.fold_event(KernelEvent::Applied(set_mix(0.6)));
+        assert!(
+            (mirrored_mix(&app) - 0.9).abs() < 1e-9,
+            "a stale echo must not roll the mirror back, got {}",
+            mirrored_mix(&app)
+        );
+        assert_eq!(app.in_flight_knob_edits, 1);
+
+        // The newest echo retires the last slot without disturbing the value.
+        app.fold_event(KernelEvent::Applied(set_mix(0.9)));
+        assert_eq!(app.in_flight_knob_edits, 0);
+        assert!((mirrored_mix(&app) - 0.9).abs() < 1e-9);
+
+        // With nothing outstanding, a real external change still applies.
+        app.fold_event(KernelEvent::Applied(set_mix(0.7)));
+        assert!(
+            (mirrored_mix(&app) - 0.7).abs() < 1e-9,
+            "echoes must apply once the gesture is over, got {}",
+            mirrored_mix(&app)
+        );
 
         app.kernel.shutdown();
     }

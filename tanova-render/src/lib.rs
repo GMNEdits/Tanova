@@ -17,7 +17,7 @@ pub use coords::{
     BBox, EdgeMode, Format, RegionOfInterest, TILE_PIXELS, TILE_SIZE, TileCoord, TileRange,
     world_to_tile,
 };
-pub use matrix::Mat3x3;
+pub use matrix::{Mat3x3, TransformChain};
 pub use ops::{
     GradeOp, MergeOp, MergeRequest, blur_padded_rgba, blur_padded_tile, grade_raster,
     is_rgba_channel, mask_value, merge_pixel, merge_raster, rgba_at, transform_gathered_rgba,
@@ -27,4 +27,7 @@ pub use shader::{
     BlurParams, DISPATCH_SIZE, EvalContextGpu, GpuComputeEngine, GradeParams, MergeParams,
     TransformParams, WORKGROUP_SIZE,
 };
-pub use tile::{Channel, ChannelPlane, Raster2D, TILE_BYTES, TileBuffer, extract_padded_tile};
+pub use tile::{
+    Channel, ChannelPlane, DisplayTransform, Raster2D, TILE_BYTES, TileBuffer, ViewerChannel,
+    extract_padded_tile,
+};

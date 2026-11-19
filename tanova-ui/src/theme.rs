@@ -31,10 +31,11 @@ pub enum NodeCategory {
 pub fn node_category(kind: &str) -> NodeCategory {
     match kind {
         "Read" | "Write" => NodeCategory::Io,
-        "Constant" | "Grade" => NodeCategory::Color,
-        "Merge2" => NodeCategory::Merge,
-        "Blur" => NodeCategory::Filter,
-        "Transform" => NodeCategory::Transform,
+        "Constant" | "Grade" | "ColorCorrect" | "Invert" | "Premult" | "Unpremult" | "Clamp"
+        | "Saturation" | "CheckerBoard2" => NodeCategory::Color,
+        "Merge2" | "Switch" | "Shuffle" => NodeCategory::Merge,
+        "Blur" | "TimeOffset" | "FrameHold" => NodeCategory::Filter,
+        "Transform" | "Crop" | "Reformat" => NodeCategory::Transform,
         "Viewer" => NodeCategory::Viewer,
         _ => NodeCategory::Other,
     }
@@ -52,6 +53,10 @@ pub struct ThemePalette {
     pub card_shadow: Color32,
     pub selected_rim: Color32,
     pub card_corner_radius: u8,
+    /// Fill for interactive widgets that sit on the panel background
+    /// (slider rails, checkbox bodies, slider handles). Must contrast clearly
+    /// with [`ThemePalette::panel_bg`], or the rails vanish into the panel.
+    pub widget_bg: Color32,
     pub wire_default: Color32,
     pub pin_b: Color32,
     pub pin_a: Color32,
@@ -101,6 +106,7 @@ pub fn palette(theme: StudioTheme) -> ThemePalette {
             card_shadow: Color32::from_black_alpha(130),
             selected_rim: Color32::from_rgb(247, 147, 30),
             card_corner_radius: 2,
+            widget_bg: Color32::from_rgb(74, 76, 82),
             wire_default: Color32::from_rgb(200, 200, 200),
             pin_b: Color32::from_rgb(230, 230, 230),
             pin_a: Color32::from_rgb(92, 214, 141),
@@ -126,6 +132,7 @@ pub fn palette(theme: StudioTheme) -> ThemePalette {
             card_shadow: Color32::from_black_alpha(120),
             selected_rim: Color32::from_rgb(230, 126, 34),
             card_corner_radius: 3,
+            widget_bg: Color32::from_rgb(55, 60, 70),
             wire_default: Color32::from_rgb(208, 211, 216),
             pin_b: Color32::from_rgb(240, 240, 240),
             pin_a: Color32::from_rgb(72, 201, 176),
@@ -151,6 +158,7 @@ pub fn palette(theme: StudioTheme) -> ThemePalette {
             card_shadow: Color32::from_black_alpha(100),
             selected_rim: Color32::from_rgb(58, 130, 246),
             card_corner_radius: 7,
+            widget_bg: Color32::from_rgb(50, 54, 68),
             wire_default: Color32::from_rgb(148, 163, 184),
             pin_b: Color32::from_rgb(250, 204, 21),
             pin_a: Color32::from_rgb(74, 222, 128),
@@ -193,7 +201,19 @@ pub fn apply_theme_visuals(ctx: &egui::Context, theme: StudioTheme) {
         let mut visuals = ctx.style_of(egui_theme).visuals.clone();
         visuals.panel_fill = pal.panel_bg;
         visuals.window_fill = pal.panel_bg;
-        visuals.widgets.inactive.bg_fill = pal.panel_bg;
+        // Interactive fills must read as recessed tracks against the panel.
+        // Setting this to `panel_bg` (the old behavior) erased every slider
+        // rail, leaving only a floating thumb on `mix`, `gain`, and `gamma`.
+        visuals.widgets.inactive.bg_fill = pal.widget_bg;
+        visuals.widgets.inactive.weak_bg_fill = pal.widget_bg;
+        // Hover/press step brighter so the thumb and buttons still respond.
+        visuals.widgets.hovered.bg_fill = pal.widget_bg.gamma_multiply(1.25);
+        visuals.widgets.hovered.weak_bg_fill = pal.widget_bg.gamma_multiply(1.25);
+        visuals.widgets.active.bg_fill = pal.widget_bg.gamma_multiply(1.5);
+        visuals.widgets.active.weak_bg_fill = pal.widget_bg.gamma_multiply(1.5);
+        // Light the filled portion of a slider rail behind the thumb.
+        visuals.selection.bg_fill = pal.selected_rim;
+        visuals.slider_trailing_fill = true;
         ctx.set_visuals(visuals);
     }
 }
@@ -208,6 +228,10 @@ mod tests {
         assert_eq!(node_category("Write"), NodeCategory::Io);
         assert_eq!(node_category("Constant"), NodeCategory::Color);
         assert_eq!(node_category("Grade"), NodeCategory::Color);
+        assert_eq!(node_category("ColorCorrect"), NodeCategory::Color);
+        assert_eq!(node_category("Invert"), NodeCategory::Color);
+        assert_eq!(node_category("Premult"), NodeCategory::Color);
+        assert_eq!(node_category("Unpremult"), NodeCategory::Color);
         assert_eq!(node_category("Merge2"), NodeCategory::Merge);
         assert_eq!(node_category("Blur"), NodeCategory::Filter);
         assert_eq!(node_category("Transform"), NodeCategory::Transform);
@@ -303,5 +327,42 @@ mod tests {
         assert_ne!(classic_accent, slate_accent);
         assert_ne!(slate_accent, midnight_accent);
         assert_ne!(classic_accent, midnight_accent);
+    }
+
+    #[test]
+    fn every_theme_paints_a_visible_slider_rail_and_trailing_fill() {
+        fn luminance(color: Color32) -> f32 {
+            0.299 * color.r() as f32 + 0.587 * color.g() as f32 + 0.114 * color.b() as f32
+        }
+
+        for theme in [
+            StudioTheme::Classic,
+            StudioTheme::Slate,
+            StudioTheme::Midnight,
+        ] {
+            let ctx = egui::Context::default();
+            apply_theme_visuals(&ctx, theme);
+            let visuals = ctx.style_of(ctx.theme()).visuals.clone();
+            let pal = palette(theme);
+
+            // The rail uses `inactive.bg_fill`; panels used to overwrite it
+            // with `panel_bg`, which made every slider track invisible.
+            assert_eq!(
+                visuals.widgets.inactive.bg_fill, pal.widget_bg,
+                "{theme:?}: inactive bg_fill must be the widget track color"
+            );
+            assert_ne!(
+                visuals.widgets.inactive.bg_fill, pal.panel_bg,
+                "{theme:?}: slider rail must not match the panel background"
+            );
+            assert!(
+                (luminance(pal.widget_bg) - luminance(pal.panel_bg)).abs() >= 12.0,
+                "{theme:?}: slider rail needs visible luminance contrast"
+            );
+            assert!(
+                visuals.slider_trailing_fill,
+                "{theme:?}: the filled part of the slider rail must be painted"
+            );
+        }
     }
 }

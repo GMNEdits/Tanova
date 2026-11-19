@@ -4,9 +4,10 @@
 //! recursively pulls its inputs, hashes the whole upstream chain, and consults
 //! the cache before any cartridge runs.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use indexmap::IndexMap;
 
@@ -15,7 +16,7 @@ use crate::command::{EdgeSnapshot, NodeSnapshot};
 use crate::governor::{MemoryGovernor, RenderEpoch, evaluate_with_airbag};
 use crate::knobs::{KnobTable, KnobValue, canonical_f64};
 use crate::registry::find_cartridge;
-use crate::types::{EvalContext, NodeError, NodeTrait, Packet, ProjectFormat};
+use crate::types::{AnimationCurve, EvalContext, NodeError, NodeTrait, Packet, ProjectFormat};
 
 /// Static cartridge default width for source nodes (`Constant`).
 ///
@@ -77,6 +78,11 @@ pub struct DagNode {
     pub kind: String,
     /// User-facing parameters.
     pub knobs: KnobTable,
+    /// Per-knob animation curves, one curve per channel.
+    ///
+    /// `BTreeMap` keeps iteration deterministic so `export_to_tcl` and the
+    /// operation hash are stable across runs and platforms.
+    pub curves: BTreeMap<String, Vec<AnimationCurve>>,
     /// The cartridge itself; `None` until a registry resolves `kind`.
     pub implementation: Option<Arc<dyn NodeTrait>>,
     /// Last panic message, if evaluation crashed this node.
@@ -97,6 +103,7 @@ impl DagNode {
             id,
             kind: kind.into(),
             knobs: KnobTable::new(),
+            curves: BTreeMap::new(),
             implementation: None,
             crashed: None,
             x: 0.0,
@@ -110,6 +117,46 @@ impl DagNode {
         self.implementation = Some(implementation);
         self
     }
+
+    /// Returns the knob table with every animated knob evaluated at `frame`.
+    ///
+    /// Static knobs are copied verbatim. Float knobs read channel 0, Int knobs
+    /// round channel 0, and Color knobs evaluate each channel from its own
+    /// curve (falling back to channel 0, then to the static base value).
+    /// Knobs with no non-empty curve stay exactly as stored.
+    pub fn evaluated_knobs_at(&self, frame: f64) -> KnobTable {
+        let mut knobs = self.knobs.clone();
+        for (name, channel_curves) in &self.curves {
+            if channel_curves.is_empty() || channel_curves.iter().all(|curve| curve.is_empty()) {
+                continue;
+            }
+            let Some(base) = self.knobs.get(name) else {
+                continue;
+            };
+            let evaluated = match base {
+                KnobValue::Float(_) => KnobValue::Float(channel_curves[0].evaluate(frame)),
+                KnobValue::Int(_) => {
+                    KnobValue::Int(channel_curves[0].evaluate(frame).round() as i64)
+                }
+                KnobValue::Color(base) => {
+                    let mut channels = *base;
+                    for (index, channel) in channels.iter_mut().enumerate() {
+                        let curve = channel_curves
+                            .get(index)
+                            .filter(|curve| !curve.is_empty())
+                            .or_else(|| channel_curves.first().filter(|curve| !curve.is_empty()));
+                        if let Some(curve) = curve {
+                            *channel = curve.evaluate(frame) as f32;
+                        }
+                    }
+                    KnobValue::Color(channels)
+                }
+                _ => continue,
+            };
+            knobs.insert(name.clone(), evaluated);
+        }
+        knobs
+    }
 }
 
 impl fmt::Debug for DagNode {
@@ -118,6 +165,7 @@ impl fmt::Debug for DagNode {
             .field("id", &self.id)
             .field("kind", &self.kind)
             .field("knobs", &self.knobs)
+            .field("curves", &self.curves)
             .field("has_implementation", &self.implementation.is_some())
             .field("crashed", &self.crashed)
             .field("x", &self.x)
@@ -265,32 +313,73 @@ impl Default for RamCache {
     }
 }
 
+/// One cache entry for the bounded GreedyDual-Size packet cache.
+///
+/// `priority` orders entries for eviction: the lowest-priority entry is the
+/// victim when the cache is full. A cache hit refreshes `priority` to
+/// `global_clock + cost_us`, so actively scrubbed nodes stay hot, while
+/// expensive entries (high `cost_us`) are inherently harder to evict than
+/// cheap ones.
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    /// Node that produced the packet.
+    ///
+    /// A node evaluated at several frames (a `TimeOffset` branch) owns one
+    /// entry per frame, so invalidation must be able to find them all by node
+    /// even though `node_hashes` only remembers the most recent hash.
+    pub node_id: NodeId,
+    /// The cached packet.
+    pub packet: Arc<Packet>,
+    /// Measured evaluation cost in microseconds (floored at 1).
+    pub cost_us: u64,
+    /// `global_clock + cost_us` at insert or last hit time.
+    pub priority: f64,
+}
+
 /// The kernel's graph: nodes, edges, and the packet cache.
 #[derive(Debug)]
 pub struct Dag {
     nodes: IndexMap<NodeId, DagNode>,
     edges: Vec<Edge>,
-    cache: RamCache,
+    cache: HashMap<OpHash, CacheEntry>,
     /// Most recent op hash per node, used for targeted cache invalidation.
     node_hashes: HashMap<NodeId, OpHash>,
     /// Active project format, stamped onto source cartridges when they spawn.
     project_format: Option<ProjectFormat>,
+    /// Maximum number of cached packets (0 disables caching entirely).
+    pub max_cache_entries: usize,
+    /// Monotonic recency clock, advanced to evicted priorities on eviction.
+    pub global_clock: f64,
+    /// Frame requested by the most recent pull (defaults to frame 1.0).
+    ///
+    /// Used to keep a knob's static fallback synced with its animation when a
+    /// curve is edited, without threading an extra parameter through
+    /// [`Dag::apply_command`].
+    current_frame: f64,
 }
 
 impl Dag {
+    /// Default number of cached packets kept by [`Dag::new`].
+    pub const DEFAULT_MAX_CACHE_ENTRIES: usize = 64;
+
     /// Creates an empty graph with the default cache capacity.
     pub fn new() -> Self {
-        Self::with_cache_capacity(RamCache::DEFAULT_CAPACITY)
+        Self::with_cache_capacity(Self::DEFAULT_MAX_CACHE_ENTRIES)
     }
 
     /// Creates an empty graph with a specific cache capacity.
+    ///
+    /// A capacity of zero disables caching entirely.
     pub fn with_cache_capacity(capacity: usize) -> Self {
         Self {
             nodes: IndexMap::new(),
             edges: Vec::new(),
-            cache: RamCache::new(capacity),
+            cache: HashMap::new(),
             node_hashes: HashMap::new(),
             project_format: None,
+            max_cache_entries: capacity,
+            global_clock: 0.0,
+            current_frame: 1.0,
         }
     }
 
@@ -350,13 +439,38 @@ impl Dag {
     }
 
     /// Borrows the packet cache.
-    pub fn cache(&self) -> &RamCache {
+    pub fn cache(&self) -> &HashMap<OpHash, CacheEntry> {
         &self.cache
     }
 
     /// Mutably borrows the packet cache.
-    pub fn cache_mut(&mut self) -> &mut RamCache {
+    pub fn cache_mut(&mut self) -> &mut HashMap<OpHash, CacheEntry> {
         &mut self.cache
+    }
+
+    /// Maximum number of cached packets (0 disables caching entirely).
+    pub fn max_cache_entries(&self) -> usize {
+        self.max_cache_entries
+    }
+
+    /// Sets the maximum number of cached packets.
+    ///
+    /// A capacity of zero disables caching entirely. Lowering the capacity
+    /// below the current entry count does not evict immediately; the next
+    /// insertion triggers GreedyDual-Size eviction.
+    pub fn set_max_cache_entries(&mut self, max: usize) {
+        self.max_cache_entries = max;
+    }
+
+    /// Number of packets currently in the cache.
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Clears the cache and resets the recency clock.
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+        self.global_clock = 0.0;
     }
 
     /// Removes cached packets for `node_id` and every node downstream of it
@@ -364,7 +478,7 @@ impl Dag {
     /// a `Transform`) keep their cache entries intact, so a knob drag on a
     /// downstream node doesn't force upstream re-allocation.
     pub fn invalidate_downstream(&mut self, node_id: NodeId) {
-        let mut downstream: Vec<NodeId> = Vec::new();
+        let mut downstream: HashSet<NodeId> = HashSet::new();
         let mut visited: HashSet<NodeId> = HashSet::new();
         let mut queue = vec![node_id];
         while let Some(current) = queue.pop() {
@@ -376,16 +490,22 @@ impl Dag {
                     && edge.to_node != current
                     && !visited.contains(&edge.to_node)
                 {
-                    downstream.push(edge.to_node);
+                    downstream.insert(edge.to_node);
                     queue.push(edge.to_node);
                 }
             }
         }
-        for node in downstream {
-            if let Some(hash) = self.node_hashes.get(&node) {
+        for node in &downstream {
+            if let Some(hash) = self.node_hashes.get(node) {
                 self.cache.remove(hash);
             }
         }
+        // A node evaluated at several frames has one cache entry per frame but
+        // only one slot in `node_hashes`, so also drop every entry by node id.
+        // This keeps a `TimeOffset` branch from serving a stale frame after an
+        // upstream knob edit.
+        self.cache
+            .retain(|_, entry| !downstream.contains(&entry.node_id));
     }
 
     /// Serializes the whole graph back into Nuke `.nk` stack syntax.
@@ -455,6 +575,10 @@ impl Dag {
                 // user parameters), and never let a stray `disable` knob
                 // shadow the real bypass flag.
                 if name == "xpos" || name == "ypos" || name == "disable" {
+                    continue;
+                }
+                if let Some(serialized) = serialize_animated_knob(node.curves.get(name), value) {
+                    let _ = writeln!(out, " {name} {serialized}");
                     continue;
                 }
                 let _ = writeln!(out, " {name} {}", format_knob_value(value));
@@ -649,6 +773,7 @@ impl Dag {
             y: node.y,
             disabled: node.disabled,
             knobs: node.knobs.clone(),
+            curves: node.curves.clone(),
             edges,
         })
     }
@@ -922,6 +1047,39 @@ impl Dag {
                 self.set_disabled(node, disabled)?;
                 Ok(UndoableCommand::SetDisabled { node, disabled })
             }
+            UndoableCommand::SetKnobCurve {
+                node,
+                name,
+                curves,
+                previous,
+            } => {
+                let frame = self.current_frame;
+                let target = self
+                    .nodes
+                    .get_mut(&node)
+                    .ok_or(NodeError::UnknownNode(node.0))?;
+                if curves.is_empty() {
+                    target.curves.remove(&name);
+                } else {
+                    target.curves.insert(name.clone(), curves.clone());
+                    // Keep the static fallback in sync with the frame being
+                    // evaluated. Downstream export and knob widgets that read
+                    // the base table then agree with the live curve.
+                    if target.knobs.contains_key(&name) {
+                        let resolved = target.evaluated_knobs_at(frame);
+                        if let Some(value) = resolved.get(&name).cloned() {
+                            target.knobs.insert(name.clone(), value);
+                        }
+                    }
+                }
+                self.invalidate_downstream(node);
+                Ok(UndoableCommand::SetKnobCurve {
+                    node,
+                    name,
+                    curves,
+                    previous,
+                })
+            }
             UndoableCommand::MoveNode {
                 id,
                 from_x: _,
@@ -1001,6 +1159,11 @@ impl Dag {
         if !self.nodes.contains_key(&id) {
             return Err(NodeError::UnknownNode(id.0));
         }
+        // Remember the frame being evaluated so curve edits can keep the
+        // static fallback knob synced without an extra parameter.
+        if let Some(time) = ctx.time() {
+            self.current_frame = time;
+        }
         if !visiting.insert(id) {
             return Err(NodeError::CycleDetected {
                 from: id.0,
@@ -1010,9 +1173,11 @@ impl Dag {
 
         let hash = self.compute_op_hash(id, ctx)?;
         self.node_hashes.insert(id, hash);
-        if let Some(cached) = self.cache.get(&hash) {
+        // Cache hit: refresh priority so actively scrubbed nodes stay hot.
+        if let Some(entry) = self.cache.get_mut(&hash) {
+            entry.priority = self.global_clock + (entry.cost_us as f64);
             visiting.remove(&id);
-            return Ok(cached);
+            return Ok(entry.packet.clone());
         }
 
         // A bypassed node is a pure wire: it never runs its cartridge, so it
@@ -1042,27 +1207,69 @@ impl Dag {
             .collect();
         edges.sort_by_key(|edge| (edge.to_port, edge.from_node, edge.from_port));
 
+        // The node's own context: live knobs plus the governor. Cartridges use
+        // it to decide which ports to pull and with what render state, e.g.
+        // `Switch` pulls only the active branch and `TimeOffset` rewrites the
+        // frame time for the port it requests.
+        let mut node_ctx = ctx.clone();
+        if let Some(node) = self.nodes.get(&id) {
+            node_ctx.insert(node.evaluated_knobs_at(ctx.time().unwrap_or(1.0)));
+        }
+        node_ctx.insert(governor.clone());
+
+        let connected_ports: Vec<PortId> = edges.iter().map(|edge| edge.to_port).collect();
+        // A bypassed node is a pure wire: it only ever forwards `B`
+        // (`PortId(0)`), so pulling any other connected branch would waste
+        // work and could even run a panicking cartridge for nothing.
+        let requested: Vec<(PortId, EvalContext)> = if disabled {
+            connected_ports
+                .iter()
+                .filter(|port| port.0 == 0)
+                .map(|&port| (port, node_ctx.clone()))
+                .collect()
+        } else {
+            match implementation.as_ref() {
+                Some(implementation) => implementation.upstream_inputs(&node_ctx, &connected_ports),
+                None => connected_ports
+                    .iter()
+                    .map(|&port| (port, node_ctx.clone()))
+                    .collect(),
+            }
+        };
+
         // Inputs are indexed by port, not by edge order: Nuke's B/A/mask ports
-        // must keep their slots even when an intermediate port is unconnected.
-        let max_port = edges.iter().map(|edge| edge.to_port.0).max();
+        // must keep their slots even when a requested port arrives out of order
+        // or an intermediate port is skipped. Unpulled slots stay empty.
+        let max_port = edges
+            .iter()
+            .map(|edge| edge.to_port.0)
+            .chain(requested.iter().map(|(port, _)| port.0))
+            .max();
         let mut inputs = vec![Packet::new(); max_port.map_or(0, |port| port as usize + 1)];
-        for edge in &edges {
-            let packet = self.pull(edge.from_node, ctx, governor, epoch, target_epoch, visiting)?;
-            inputs[edge.to_port.0 as usize] = (*packet).clone();
+        for (port_id, port_ctx) in &requested {
+            let Some(edge) = edges.iter().find(|edge| edge.to_port == *port_id) else {
+                continue;
+            };
+            let packet = self.pull(
+                edge.from_node,
+                port_ctx,
+                governor,
+                epoch,
+                target_epoch,
+                visiting,
+            )?;
+            if let Some(slot) = inputs.get_mut(port_id.0 as usize) {
+                *slot = (*packet).clone();
+            }
         }
 
+        // Time the cartridge evaluation so the cache can keep expensive
+        // entries alive longer than cheap ones (GreedyDual-Size: evict the
+        // least valuable entry, where value ~ cost * recency).
+        let start = Instant::now();
         let evaluated = if disabled {
             Ok(inputs.first().cloned().unwrap_or_default())
         } else {
-            // Knobs live on the DagNode; inject them into a per-node context so
-            // cartridges can read live values without changing `evaluate`'s
-            // signature. The governor rides along so tile allocations reserve
-            // from the same cap the kernel enforces.
-            let mut node_ctx = ctx.clone();
-            if let Some(node) = self.nodes.get(&id) {
-                node_ctx.insert(node.knobs.clone());
-            }
-            node_ctx.insert(governor.clone());
             match implementation {
                 Some(implementation) => {
                     evaluate_with_airbag(implementation.as_ref(), &node_ctx, &inputs)
@@ -1070,6 +1277,7 @@ impl Dag {
                 None => Err(NodeError::NoImplementation(id.0)),
             }
         };
+        let cost_us = start.elapsed().as_micros().max(1) as u64;
 
         if !epoch.is_current(target_epoch) {
             visiting.remove(&id);
@@ -1094,7 +1302,34 @@ impl Dag {
             }
         };
 
-        self.cache.insert(hash, Arc::clone(&packet));
+        // GreedyDual-Size admission: when the cache is full, evict the entry
+        // with the lowest priority and advance the recency clock to the
+        // victim's priority before inserting. Entries are never evicted on a
+        // hit; hits only refresh priority. A capacity of zero disables
+        // caching entirely.
+        if self.max_cache_entries > 0 {
+            if self.cache.len() >= self.max_cache_entries && !self.cache.contains_key(&hash) {
+                let victim = self
+                    .cache
+                    .iter()
+                    .min_by(|(_, a), (_, b)| a.priority.total_cmp(&b.priority))
+                    .map(|(hash, entry)| (*hash, entry.priority));
+                if let Some((victim_hash, victim_priority)) = victim {
+                    self.global_clock = victim_priority;
+                    self.cache.remove(&victim_hash);
+                }
+            }
+            self.cache.insert(
+                hash,
+                CacheEntry {
+                    node_id: id,
+                    packet: Arc::clone(&packet),
+                    cost_us,
+                    priority: self.global_clock + (cost_us as f64),
+                },
+            );
+        }
+
         visiting.remove(&id);
         Ok(packet)
     }
@@ -1103,10 +1338,18 @@ impl Dag {
         &self,
         id: NodeId,
         ctx: &EvalContext,
-        memo: &mut HashMap<NodeId, OpHash>,
+        memo: &mut HashMap<HashKey, OpHash>,
         visiting: &mut HashSet<NodeId>,
     ) -> Result<OpHash, NodeError> {
-        if let Some(hash) = memo.get(&id) {
+        // A node can be reached more than once under different render states
+        // once a cartridge rewrites time per port (e.g. two `TimeOffset`
+        // branches feeding one merge), so memoize on the state as well as id.
+        let memo_key = (
+            id,
+            ctx.time().map(|time| canonical_f64(time).to_bits()),
+            ctx.view().map(str::to_string),
+        );
+        if let Some(hash) = memo.get(&memo_key) {
             return Ok(*hash);
         }
 
@@ -1126,36 +1369,119 @@ impl Dag {
         // input through instead of evaluating, so it must never share a cache
         // entry with the enabled node it replaced.
         hasher.update(&[u8::from(node.disabled)]);
-        node.knobs.feed_hash(&mut hasher);
-        feed_eval_context(&mut hasher, ctx);
 
-        let mut inputs: Vec<Edge> = self
+        // Cartridges choose their inputs from the node's own context (live
+        // knobs plus the requested frame), so build it exactly like `pull`.
+        // Animated knobs are resolved at the requested frame, which makes the
+        // frame-accurate value part of the operation hash.
+        let resolved_knobs = node.evaluated_knobs_at(ctx.time().unwrap_or(1.0));
+        let mut node_ctx = ctx.clone();
+        node_ctx.insert(resolved_knobs.clone());
+        if let Some(time) = node_ctx.time() {
+            // Frame time is part of the operation: the same node at a
+            // different frame must never reuse a packet.
+            hasher.update(b"time");
+            hasher.update(&canonical_f64(time).to_bits().to_le_bytes());
+        }
+        resolved_knobs.feed_hash(&mut hasher);
+        feed_eval_context(&mut hasher, &node_ctx);
+
+        let mut edges: Vec<Edge> = self
             .edges
             .iter()
             .filter(|edge| edge.to_node == id)
             .copied()
             .collect();
-        inputs.sort_by_key(|edge| (edge.to_port, edge.from_node, edge.from_port));
+        edges.sort_by_key(|edge| (edge.to_port, edge.from_node, edge.from_port));
+        let connected_ports: Vec<PortId> = edges.iter().map(|edge| edge.to_port).collect();
 
-        hasher.update(&(inputs.len() as u64).to_le_bytes());
-        for edge in inputs {
-            hasher.update(&edge.to_port.0.to_le_bytes());
+        let requested: Vec<(PortId, EvalContext)> = if node.disabled {
+            connected_ports
+                .iter()
+                .filter(|port| port.0 == 0)
+                .map(|&port| (port, node_ctx.clone()))
+                .collect()
+        } else {
+            match node.implementation.as_ref() {
+                Some(implementation) => implementation.upstream_inputs(&node_ctx, &connected_ports),
+                None => connected_ports
+                    .iter()
+                    .map(|&port| (port, node_ctx.clone()))
+                    .collect(),
+            }
+        };
+
+        // Hash only the ports the cartridge actually pulls: an unselected
+        // `Switch` branch is never evaluated, so changing it must not
+        // invalidate the active branch's cache entry.
+        let mut pulled: Vec<(PortId, Edge, EvalContext)> = requested
+            .into_iter()
+            .filter_map(|(port, port_ctx)| {
+                edges
+                    .iter()
+                    .find(|edge| edge.to_port == port)
+                    .map(|edge| (port, *edge, port_ctx))
+            })
+            .collect();
+        pulled.sort_by_key(|(port, edge, _)| (*port, edge.from_node, edge.from_port));
+        pulled.dedup_by_key(|(port, _, _)| *port);
+
+        hasher.update(&(pulled.len() as u64).to_le_bytes());
+        for (port, edge, port_ctx) in pulled {
+            hasher.update(&port.0.to_le_bytes());
             hasher.update(&edge.from_port.0.to_le_bytes());
-            let upstream = self.hash_node(edge.from_node, ctx, memo, visiting)?;
+            let upstream = self.hash_node(edge.from_node, &port_ctx, memo, visiting)?;
             hasher.update(upstream.as_bytes());
         }
 
         visiting.remove(&id);
         let hash = OpHash::from(hasher.finalize());
-        memo.insert(id, hash);
+        memo.insert(memo_key, hash);
         Ok(hash)
     }
 }
+
+/// Memoization key for [`Dag::hash_node`]: a node plus the render state that
+/// affects its upstream selection.
+type HashKey = (NodeId, Option<u64>, Option<String>);
 
 impl Default for Dag {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Serializes a knob as Nuke `{curve ...}` syntax when it is animated.
+///
+/// Returns `None` for static knobs so the caller keeps the exact scalar text
+/// it has always emitted. A single-channel animation serializes as one curve;
+/// a multi-channel (Color) animation serializes as the nested
+/// `{{curve ...} {curve ...} <static> <static>}` tuple the parser reads back.
+fn serialize_animated_knob(
+    curves: Option<&Vec<AnimationCurve>>,
+    value: &KnobValue,
+) -> Option<String> {
+    let curves = curves?;
+    if curves.is_empty() || curves.iter().all(|curve| curve.is_empty()) {
+        return None;
+    }
+    if curves.len() == 1 {
+        return Some(curves[0].to_nuke_tcl());
+    }
+
+    let mut channels = Vec::with_capacity(curves.len());
+    for (index, curve) in curves.iter().enumerate() {
+        if curve.is_empty() {
+            let static_value = match value {
+                KnobValue::Color(rgba) => rgba.get(index).copied().unwrap_or(0.0) as f64,
+                _ => 0.0,
+            };
+            channels.push(static_value.to_string());
+        } else {
+            channels.push(curve.to_nuke_tcl());
+        }
+    }
+    Some(format!("{{ {} }}", channels.join(" ")))
 }
 
 /// Formats one knob value for `.nk` serialization.
@@ -1199,19 +1525,13 @@ fn escape_tcl_text(text: &str) -> String {
     escaped
 }
 
-/// Feeds only the render state the hash contract covers.
+/// Feeds the viewer part of the render state the hash contract covers.
+///
+/// Frame time is hashed separately by [`Dag::hash_node`], because a cartridge
+/// may rewrite it per port (e.g. `TimeOffset`) and the active time must reach
+/// that node's cache key.
 fn feed_eval_context(hasher: &mut blake3::Hasher, ctx: &EvalContext) {
     hasher.update(b"ctx");
-
-    match ctx.time() {
-        Some(time) => {
-            hasher.update(&[1]);
-            hasher.update(&canonical_f64(time).to_le_bytes());
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
 
     match ctx.view() {
         Some(view) => {
@@ -2242,5 +2562,192 @@ mod tests {
             other => panic!("expected SetKnob, got {other:?}"),
         }
         assert!(stack.can_undo(), "second undo step should remain");
+    }
+
+    #[test]
+    fn greedy_dual_size_cache_evicts_cheap_entries_before_expensive_ones() {
+        /// Cartridge that sleeps so its measured evaluation cost is high.
+        struct ExpensiveNode;
+
+        impl NodeTrait for ExpensiveNode {
+            fn evaluate(
+                &self,
+                _ctx: &EvalContext,
+                _inputs: &[Packet],
+            ) -> Result<Packet, NodeError> {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                let mut packet = Packet::new();
+                packet.insert(42u32);
+                Ok(packet)
+            }
+
+            fn serialize_to_tcl(&self) -> String {
+                "ExpensiveNode {}".to_string()
+            }
+        }
+
+        /// Instant cartridge that echoes its tag into the packet.
+        struct CheapNode(u32);
+
+        impl NodeTrait for CheapNode {
+            fn evaluate(
+                &self,
+                _ctx: &EvalContext,
+                _inputs: &[Packet],
+            ) -> Result<Packet, NodeError> {
+                let mut packet = Packet::new();
+                packet.insert(self.0);
+                Ok(packet)
+            }
+
+            fn serialize_to_tcl(&self) -> String {
+                "CheapNode {}".to_string()
+            }
+        }
+
+        let mut dag = Dag::new();
+        dag.set_max_cache_entries(2);
+        dag.add_node_with_implementation(NodeId(1), "Expensive", Arc::new(ExpensiveNode))
+            .unwrap();
+        dag.add_node_with_implementation(NodeId(2), "CheapA", Arc::new(CheapNode(1)))
+            .unwrap();
+        dag.add_node_with_implementation(NodeId(3), "CheapB", Arc::new(CheapNode(2)))
+            .unwrap();
+
+        let ctx = EvalContext::new();
+        let governor = MemoryGovernor::new(usize::MAX);
+        let epoch = RenderEpoch::new();
+        let target_epoch = epoch.bump();
+
+        // Populate the cache: one expensive entry (~5 ms) plus two cheap ones.
+        dag.evaluate_pull(NodeId(1), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+        dag.evaluate_pull(NodeId(2), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+        dag.evaluate_pull(NodeId(3), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+
+        assert_eq!(
+            dag.cache_len(),
+            2,
+            "the bounded cache holds at most 2 entries"
+        );
+
+        // The cheap entry inserted second must have been evicted first:
+        // GreedyDual-Size always picks the lowest-priority (cheapest) entry.
+        let cheap_a_hash = dag.compute_op_hash(NodeId(2), &ctx).unwrap();
+        assert!(
+            !dag.cache().contains_key(&cheap_a_hash),
+            "cheap entry should be evicted before the expensive one"
+        );
+
+        // The expensive entry survives and is served from cache on re-pull.
+        let expensive_hash = dag.compute_op_hash(NodeId(1), &ctx).unwrap();
+        assert!(
+            dag.cache().contains_key(&expensive_hash),
+            "expensive entry must remain cached"
+        );
+        let packet = dag
+            .evaluate_pull(NodeId(1), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+        assert_eq!(packet.get::<u32>(), Some(&42));
+    }
+
+    #[test]
+    fn upstream_inputs_skips_unselected_branch_and_shifts_time_in_dag() {
+        use std::sync::Mutex;
+
+        struct TimeRecordingNode {
+            seen: Arc<Mutex<Vec<f64>>>,
+        }
+
+        impl NodeTrait for TimeRecordingNode {
+            fn evaluate(&self, ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
+                let time = ctx
+                    .time()
+                    .ok_or_else(|| NodeError::Other("missing time".to_string()))?;
+                self.seen.lock().unwrap().push(time);
+                let mut packet = Packet::new();
+                packet.insert(time);
+                Ok(packet)
+            }
+
+            fn serialize_to_tcl(&self) -> String {
+                "TimeRecordingNode {}".to_string()
+            }
+        }
+
+        /// Pulls only `PortId(1)` and rewrites its time to 15.0, like a
+        /// `TimeOffset` feeding a `Switch`'s selected input.
+        struct SelectPort1Node;
+
+        impl NodeTrait for SelectPort1Node {
+            fn evaluate(&self, _ctx: &EvalContext, inputs: &[Packet]) -> Result<Packet, NodeError> {
+                inputs.get(1).cloned().ok_or(NodeError::MissingInput("A"))
+            }
+
+            fn upstream_inputs(
+                &self,
+                ctx: &EvalContext,
+                connected_ports: &[PortId],
+            ) -> Vec<(PortId, EvalContext)> {
+                if !connected_ports.contains(&PortId(1)) {
+                    return Vec::new();
+                }
+                let mut shifted = ctx.clone();
+                shifted.insert(Time(15.0));
+                vec![(PortId(1), shifted)]
+            }
+
+            fn serialize_to_tcl(&self) -> String {
+                "SelectPort1Node {}".to_string()
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut dag = Dag::new();
+        dag.add_node_with_implementation(NodeId(1), "Panicking", Arc::new(PanickingNode))
+            .unwrap();
+        dag.add_node_with_implementation(
+            NodeId(2),
+            "TimeRecorder",
+            Arc::new(TimeRecordingNode {
+                seen: Arc::clone(&seen),
+            }),
+        )
+        .unwrap();
+        dag.add_node_with_implementation(NodeId(3), "Switch", Arc::new(SelectPort1Node))
+            .unwrap();
+
+        dag.connect_edge(Edge::new(NodeId(1), PortId(0), NodeId(3), PortId(0)))
+            .unwrap();
+        dag.connect_edge(Edge::new(NodeId(2), PortId(0), NodeId(3), PortId(1)))
+            .unwrap();
+
+        let mut ctx = EvalContext::new();
+        ctx.insert(Time(20.0));
+        let governor = MemoryGovernor::new(usize::MAX);
+        let epoch = RenderEpoch::new();
+        let target_epoch = epoch.bump();
+
+        let packet = dag
+            .evaluate_pull(NodeId(3), &ctx, &governor, &epoch, target_epoch)
+            .expect("only the requested PortId(1) branch may be pulled");
+
+        assert_eq!(
+            packet.get::<f64>(),
+            Some(&15.0),
+            "the selected input's packet must come from the shifted context"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![15.0],
+            "PortId(1) must see the shifted frame, and the panicking PortId(0) must never run"
+        );
+        assert_eq!(
+            dag.node(NodeId(1)).and_then(|node| node.crashed.as_deref()),
+            None,
+            "the unselected branch must not be evaluated"
+        );
     }
 }

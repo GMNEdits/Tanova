@@ -5,6 +5,109 @@ All notable changes to Tanova are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.5.0] - 2026-11-19
+
+**Phase 6 — Production Compositing Engine (Milestones 20–22).** Ships 13 new cartridges (**24 total**), a bounded GreedyDual-Size DAG cache, viewer display transforms with `R`/`G`/`B`/`A` soloing, demand-driven `upstream_inputs` routing with temporal nodes, `TransformChain` matrix concatenation, and a live `{curve ...}` keyframe animation engine with a full-width timeline scrubber.
+
+### Added
+
+- **Milestone 20 — Viewer Display Transforms & Channel Soloing (`tanova-render`, `tanova-ui`):**
+  - New `DisplayTransform` (`Linear`, `sRGB`, `Rec.709`, `ACES`) and `ViewerChannel` (`Rgba`, `R`, `G`, `B`, `A`) enums, re-exported from `tanova-render`.
+  - `Raster2D::to_top_left_rgba8_with_view` applies gain/gamma to RGB, the selected display transform (sRGB OETF, BT.709 OETF, or ACES filmic + sRGB), then channel soloing.
+  - `ViewerPanel` stores `pub display_transform` (default `Linear`) and `pub channel` (default `Rgba`); both are tracked in the texture dirty flag so changes upload immediately even while playback is paused.
+  - Viewer toolbar: channel solo buttons `[RGBA] [R] [G] [B] [A]` (highlighting the active channel) and a `Display transform` combo box (`Linear`, `sRGB`, `Rec.709`, `ACES`).
+  - Pointer-scoped `R`/`G`/`B`/`A` hotkeys toggle channel soloing only when the pointer is inside the viewer viewport and no widget owns the keyboard — never conflicting with canvas node spawning. `NodeCanvas::over_canvas` now requires the pointer over the canvas rect, so hovering the viewer never spawns a `Read`/`Grade`/`Blur` node.
+
+- **Milestone 20 — Core Color/Alpha Cartridges & UI Integration (`tanova-nodes`, `tanova-ui`):**
+  - New `"Premult"` cartridge: premultiplies RGB by a selected alpha plane (`rgba.alpha` / `depth.Z` / `none`) with a `mix` knob; `PropertiesPanel` renders a `ComboBox` for its `alpha` knob.
+  - New `"Unpremult"` cartridge: divides RGB by a selected alpha plane (`rgba.alpha` / `depth.Z` / `none`) with a `mix` knob; `PropertiesPanel` renders a `ComboBox` for its `alpha` knob.
+  - New `"Invert"` cartridge: inverts selected channels (`rgb` / `rgba` / `alpha` / `none`) with a `mix` knob; `PropertiesPanel` renders a `ComboBox` for its `channels` knob.
+  - New `"ColorCorrect"` cartridge: `saturation`, `contrast`, `gamma`, `gain`, `offset`, `unpremult`, and `mix` knobs.
+  - All four cartridges map to `NodeCategory::Color`, so they render the category header band color across `Classic`, `Slate`, and `Midnight` themes; they appear in the `+ Add Node` dropdown, right-click context menu, and `Tab` quick-search.
+
+- **Milestone 21 — Demand-Driven `upstream_inputs` Routing, Temporal Hooks & Pipe Splicing (`tanova-kernel`, `tanova-ui`):**
+  - New `NodeTrait::upstream_inputs` default method: a cartridge declares exactly which connected ports to pull and the `EvalContext` for each. The default still pulls every connected port with the caller's context, so existing cartridges are unchanged.
+  - `Dag::pull` now honors `upstream_inputs` (and bypassed nodes pull only `PortId(0)`), assembling per-port inputs from just the requested branches, so an unselected `Switch` branch is never evaluated and never invalidates the active branch.
+  - `CacheEntry` records its `node_id`, so multi-frame `TimeOffset` entries can be invalidated by owner.
+  - `Switch` pin geometry: input `0` on the top edge, input `1` on the left `A` edge, with `0` / `1` labels; the cartridge accepts two inputs.
+  - Canvas `Shift+X` swaps `PortId(0)` and `PortId(1)` on every selected multi-input node as one `Batch`, so a single `Ctrl+Z` swaps the pipes back.
+  - Dragging a single unconnected node onto a Bezier wire splices it into that pipe: the release emits one `Batch` of `MoveNode` + detach + two connects, so one `Ctrl+Z` unsplices and returns the node.
+
+- **Milestone 21 — `Switch`, `TimeOffset` & `FrameHold` Cartridges (`tanova-nodes`, `tanova-ui`):**
+  - New `"Switch"` cartridge: two inputs (`0` / `1`) and a `which` knob; `upstream_inputs` requests only the selected port, so the unselected branch is never pulled, evaluated, or hashed. `evaluate` is a pure pass-through of the selected packet.
+  - New `"TimeOffset"` cartridge: `time_offset` rewrites the upstream `EvalContext` time to `t - offset`, so a positive offset delays the clip with zero pixel work in `evaluate`.
+  - New `"FrameHold"` cartridge: `first_frame` always requests that single upstream frame, freezing the clip for downstream nodes.
+  - `Switch` maps to `NodeCategory::Merge`; `TimeOffset` / `FrameHold` map to `NodeCategory::Filter`; all three appear in the `+ Add Node` menu, right-click context menu, and `Tab` quick-search. `Saturation` and `Clamp` now report their optional mask input.
+
+- **Milestone 21 — `Crop`, `Clamp` & `Saturation` Cartridges (`tanova-nodes`, `tanova-ui`):** merged from `codex-nodes`.
+  - New `"Clamp"` cartridge: per-channel `minimum` / `maximum` with independent enables and a masked `mix`.
+  - New `"Saturation"` cartridge: `saturation`, luminance `mode` (`Rec709` / `Average` / `Maximum`), `unpremult`, and a masked `mix`.
+  - New `"Crop"` cartridge: `box_min` / `box_max`, `reformat`, and `intersect`, sharing interior AOV tiles with the input.
+  - `Clamp` and `Saturation` map to `NodeCategory::Color` and render their mask port; `Crop` maps to `NodeCategory::Transform`. The properties bin edits `box_min` / `box_max` as clean `X` / `Y` coordinates (never RGBA swatches) and offers a `mode` combo box for `Saturation`.
+
+- **Milestone 22 — Nuke `{curve ...}` Keyframe Parser (`tanova-parse`):** merged from `kilo-parse`.
+  - New `AnimationCurve` / `Keyframe` / `InterpMode` types with Nuke-compatible smooth (Hermite), linear, and constant (hold) segments, plus frame-sorted evaluation and TCL serialization.
+  - `NkNode` collects `curves: HashMap<String, Vec<AnimationCurve>>`; an animated knob accepts both a single `{curve ...}` channel and a nested `{{curve ...} {curve ...} 1 1}` multi-channel tuple, coercing the frame-1.0 value into the schema knob type.
+
+- **Milestone 22 — Live Keyframe Animation Engine (`tanova-kernel`, `tanova-parse`, `tanova-ui`, `tanova-app`):**
+  - `DagNode` stores `curves: BTreeMap<String, Vec<AnimationCurve>>` (one curve per channel, deterministic order). `DagNode::evaluated_knobs_at(frame)` resolves Float/Int from channel 0, Color per channel with a channel-0/base fallback, and leaves statically stored knobs untouched.
+  - `Dag::pull` now injects the frame-resolved knobs into the node's `EvalContext`, and `hash_node` hashes those resolved values, so scrubbing a `{curve}` produces a distinct cache entry per frame.
+  - `export_to_tcl` writes `{curve ...}` for animated knobs (nested tuples for multi-channel colors) and the plain static scalar otherwise; `load_nk_into_dag` copies parsed curves onto the `DagNode`, so animation survives a save/load round trip.
+  - New `UndoableCommand::SetKnobCurve { node, name, curves, previous }` with an exact inverse; applying it updates the node curves and invalidates downstream cache entries.
+  - Properties bin `[Key]` controls: blue `[K]` when a key sits on the current frame, teal `[+K]` when the knob is animated but interpolated, and a neutral `[+K]` when it is static. Clicking toggles a key at the current frame; editing an animated knob auto-keys the new value.
+  - Timeline draws gold keyframe ticks on the frame slider and adds `[< Key]` / `[Key >]` buttons that jump the playhead to the previous/next keyframe (selected node's keys, or every node's keys when nothing is selected).
+  - `GraphMirror` mirrors curve state from `KernelEvent`s and exposes `keyframe_times(selected)`; the app syncs `PropertiesPanel::current_frame` from the timeline each frame.
+
+- **Milestone 22 — Full-Width Timeline Scrubber, Live Animated Properties & Merged Cartridges (`tanova-kernel`, `tanova-parse`, `tanova-nodes`, `tanova-ui`, `tanova-app`):**
+  - New full-width custom scrubber track: recessed rail, 5/20-frame ruler ticks with frame numbers, gold keyframe ticks, and an orange playhead. The playhead and keyframe ticks share one `frame_to_x` mapping, so a key on the current frame lines up exactly.
+  - Added a compact frame `DragValue` and kept `[< Key]` / `[Key >]` navigation; clicking or dragging anywhere on the rail scrubs the playhead and emits `SetTime`. The `TIMELINE_HEIGHT` reservation is unchanged, so the viewer panel keeps avoiding the egui 0.37 panel-growth feedback loop.
+  - `PropertiesPanel` displays the frame-resolved value of every Float/Int/Color knob via `effective_knob_value`; `mix` renders as a `0.0..=1.0` slider.
+  - Editing an animated knob auto-keys the new value and emits one `Batch([SetKnob, SetKnobCurve])`, which the kernel coalesces inside its 400 ms window so a drag stays a single undo step. Consecutive `SetKnobCurve` and knob `Batch` edits also coalesce.
+  - `Dag` tracks the last evaluated frame; applying `SetKnobCurve` syncs the knob's static fallback to that frame, and the kernel invalidates downstream caches and re-renders for `SetKnobCurve` and batches containing it.
+  - The properties banner stays pinned above a `ScrollArea::vertical().auto_shrink([false, false])` around the knob grid, so the node identity and bypass control never scroll away.
+  - Wired the merged `Reformat`, `CheckerBoard2`, and `Shuffle` cartridges into the canvas, category colors, spawn menus, and properties bin (`resize` and per-channel selector combo boxes); `CheckerBoard2` is a zero-input generator.
+  - The canvas bottom-left shortcut hint now sits on a framed dark pill so it no longer collides with node labels.
+
+- **Thirteen new cartridges — 24 total (`tanova-nodes`):** `Premult`, `Unpremult`, `Invert`, `ColorCorrect`, `Switch`, `TimeOffset`, `FrameHold`, `Clamp`, `Saturation`, `Crop`, `Reformat`, `CheckerBoard2`, and `Shuffle` join the existing 11 cartridges for **24 self-registering nodes** in total.
+
+- **Two-pass separable GPU/CPU Gaussian `Blur` (`tanova-nodes`, `tanova-render`):** `blur.wgsl` and the CPU fallback run a horizontal 1D pass into an intermediate buffer followed by a vertical 1D pass, so the cost is `2 * (2 * radius + 1)` samples per pixel instead of the full 2D kernel. Both paths stay bit-compatible with the previous 2D Gaussian (`separable_blur_matches_2d_gaussian_and_gpu_parity`), and the storage-buffer path still handles aprons larger than 3 MB.
+
+- **Test isolation and regression coverage:**
+  - `GPU_TEST_LOCK` serializes every GPU-backed app test through `test_gpu()`, so parallel `cargo test` runs no longer race on the shared `wgpu` device/adapter.
+  - `animated_slider_scrubbing_timeline_emits_zero_phantom_keys` (`tanova-ui`): scrubs frames `1..=30` across an animated `mix` knob with no pointer input and asserts zero `Execute` messages.
+  - `mix_slider_drag_emits_continuous_monotonic_updates_before_release` (`tanova-ui`): presses the `mix` rail inside a narrow, scrollable properties column, then walks the pointer right over five frames without releasing the button (drifting above/below the rail) and asserts every intermediate frame emits a strictly newer value that tracks the pointer.
+  - `optimistic_batch_updates_both_knob_and_curve_without_snapback` and `stale_knob_echo_cannot_roll_the_mirror_back_while_edits_are_in_flight` (`tanova-app`): cover optimistic `Batch([SetKnob, SetKnobCurve])` mirroring and stale-echo rejection.
+  - `batch_drain_coalesces_consecutive_auto_key_batches` (`tanova-kernel`): three auto-key batches collapse to one message carrying the newest value and curves.
+  - `set_time_is_only_sent_when_the_whole_frame_changes` and `every_theme_paints_a_visible_slider_rail_and_trailing_fill` (`tanova-ui`): cover `SetTime` deduplication and per-theme rail/trailing-fill contrast.
+
+### Changed
+
+- **Bounded GreedyDual-Size cache replaces the unbounded DAG RAM map (`tanova-kernel`):**
+  - The cache is now bounded and cost- and recency-aware, keyed by `OpHash` (`max_cache_entries` defaults to 64, `global_clock` drives recency).
+  - Cache entries track `cost_us` (evaluation time measured with `std::time::Instant` around `evaluate_with_airbag`, floored at 1 us) and `priority` (`global_clock + cost_us` on insert and on every hit).
+  - `Dag::pull` refreshes a hit entry's priority so actively scrubbed nodes stay hot; on insert, when the cache is full, the lowest-priority entry is evicted and `global_clock` advances to the victim's priority.
+  - New `Dag::set_max_cache_entries`, `Dag::cache_len`, and `Dag::clear_cache` (which also resets `global_clock`); `invalidate_downstream` behavior is unchanged.
+- **`OpHash` hashes only the pulled inputs (`tanova-kernel`):** the op hash covers only the ports selected by `upstream_inputs` plus the node's frame time, so an unselected `Switch` branch cannot invalidate the active branch.
+- **Downstream invalidation is per-node (`tanova-kernel`):** `invalidate_downstream` now drops every cache entry owned by a downstream node (not just the last hash), keeping multi-frame `TimeOffset` entries from serving stale frames.
+- **`TransformNode` concatenates through `TransformChain` (`tanova-nodes`):** contiguous transforms fold into one `Mat3x3` chain and resample once from the original source, returning it untouched when the combined matrix is identity, which preserves sharpness across scale-down/scale-up pairs.
+- **`tanova-nodes` module surface (`tanova-nodes`):** `tanova-nodes/src/lib.rs` is now a pure module/re-export surface; the shared `map_color_tiles` helper moved into `tanova-nodes/src/util.rs`.
+- **Curve types moved into the kernel (`tanova-kernel`, `tanova-parse`):** `AnimationCurve`, `Keyframe`, and `InterpMode` now live in `tanova-kernel::types` and are re-exported from the kernel; `tanova-parse::curve` aliases the kernel types and keeps only the Nuke parser.
+- **Display conversion delegates (`tanova-render`):** `to_top_left_rgba8` and `to_top_left_rgba8_with_display` delegate to `to_top_left_rgba8_with_view` with `Linear` / `Rgba` and remain byte-identical.
+- **Timeline widget (`tanova-ui`):** the 100 px `egui::Slider` that collapsed the 100-frame timeline into a tiny stub is replaced by the full-width custom scrubber, with `TIMELINE_HEIGHT` unchanged.
+- **Animated knob values (`tanova-ui`):** the properties bin now shows the frame-resolved value of animated knobs instead of the static base value, and `mix` uses a `f64` slider end-to-end.
+
+### Fixed
+
+- **Phantom auto-keyframes while scrubbing or playing (`tanova-ui`):** an animated `mix` slider no longer authors a key per frame. The slider now uses `f64` end-to-end (the old `f32` round-trip plus `fixed_decimals(2)` re-rounded the bound value every frame, so `response.changed()` fired on every interpolated value), and knob edits are only emitted when the widget saw real pointer/keyboard input **and** the value actually differs from the frame-resolved value. `[Key]`/`+K` toggles and non-animated knobs are unchanged, and typing into a knob still commits normally.
+
+- **Invisible slider rails and mid-drag snap-back (`tanova-ui`, `tanova-app`):** every theme palette now carries a `widget_bg` track color with clear luminance contrast against `panel_bg` (previously `widgets.inactive.bg_fill` was set to the panel color, so the rail vanished and only a floating thumb showed), hover/press steps brighten from the same track color, and `visuals.slider_trailing_fill` lights the filled part of the rail. The properties grid reserves `140px` of slider travel, requests a repaint while a knob is dragged, and the app drops stale kernel `Applied` echoes for knob commands while a drag is in flight so the thumb never snaps back under the cursor.
+
+- **Laggy timeline scrubbing and playback (`tanova-ui`, `tanova-app`, `tanova-kernel`):** `SetTime` is only sent when the whole frame changed (deduplicated in `ViewerPanel` and again in `TanovaApp::dispatch`), consecutive `SetTime` messages are coalesced by the kernel's batch drain so only the newest requested frame renders, and the UI requests repaints while the timeline is playing or being scrubbed instead of waiting on pointer motion.
+
+- **Mix slider froze mid-drag and jumped to the release position (`tanova-ui`, `tanova-app`, `tanova-kernel`):** the properties bin disables drag-to-scroll on its `ScrollArea` (a horizontal drag could be interpreted as a scroll gesture), pins the `mix` widget to a stable id, and fixes the readout width with `custom_formatter("{value:.2}")` instead of `fixed_decimals` (which mutated the bound value). The kernel now keeps draining and applying messages **until its queue is empty** and then renders once, instead of paying one GPU render per drag frame, and it retires a burst of auto-key `Batch([SetKnob, SetKnobCurve])` messages in the same drain. `TanovaApp::dispatch` bumps the shared `render_epoch` for knob and time updates so a render already running for an older value is abandoned, and `render_viewer` keeps the last good image when a render is preempted instead of blanking the viewer. The app additionally tracks `in_flight_knob_edits` and refuses to fold a knob `Applied` echo back into the mirror while edits are outstanding or a drag is live, so an intermediate drag step can never roll the thumb backward.
+
+- **Viewer `Display transform` combo box showed a blank closed button (`tanova-ui`):** the combo box now sets `.selected_text(...)` from a `DisplayTransform` label helper, so the active transform (`Linear`, `sRGB`, `Rec.709`, or `ACES`) is always visible without opening the dropdown.
+
 ## [v0.4.5] - 2026-11-16
 
 ### Added

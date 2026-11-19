@@ -175,7 +175,8 @@ struct EngineInner {
     queue: Arc<wgpu::Queue>,
     grade: ComputePass,
     merge: ComputePass,
-    blur: ComputePass,
+    blur_h: ComputePass,
+    blur_v: ComputePass,
     transform: ComputePass,
 }
 
@@ -227,10 +228,24 @@ impl GpuComputeEngine {
                 storage_read_write(),
             ],
         );
-        let blur = build_pass(
+        let blur_h = build_pass(
             &device,
-            "tanova-blur",
-            BLUR_WGSL,
+            "tanova-blur-h",
+            BLUR_H_WGSL,
+            &[
+                storage_read(),
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                storage_read_write(),
+            ],
+        );
+        let blur_v = build_pass(
+            &device,
+            "tanova-blur-v",
+            BLUR_V_WGSL,
             &[
                 storage_read(),
                 wgpu::BindingType::Buffer {
@@ -262,7 +277,8 @@ impl GpuComputeEngine {
                 queue,
                 grade,
                 merge,
-                blur,
+                blur_h,
+                blur_v,
                 transform,
             }),
         }
@@ -315,7 +331,8 @@ impl GpuComputeEngine {
             ],
         });
 
-        self.run(&self.inner.grade, &bind_group, &output, TILE_RGBA_BYTES)
+        self.dispatch(&self.inner.grade, &bind_group, DISPATCH_SIZE, DISPATCH_SIZE)?;
+        self.readback(&output, TILE_RGBA_BYTES)
     }
 
     /// Runs `Merge2` over one dense background tile, foreground tile, and mask.
@@ -360,19 +377,23 @@ impl GpuComputeEngine {
             ],
         });
 
-        self.run(&self.inner.merge, &bind_group, &output, TILE_RGBA_BYTES)
+        self.dispatch(&self.inner.merge, &bind_group, DISPATCH_SIZE, DISPATCH_SIZE)?;
+        self.readback(&output, TILE_RGBA_BYTES)
     }
 
-    /// Runs the Gaussian `Blur` over one padded RGBA tile.
+    /// Runs the separable Gaussian `Blur` over one padded RGBA tile.
     ///
-    /// `padded` is `padded_width^2` interleaved pixels (the 256x256 tile plus
-    /// an `apron` halo). The output is one dense 256x256 interleaved RGBA tile.
+    /// A horizontal 1D pass writes an intermediate buffer, then a vertical 1D
+    /// pass writes the dense output. `padded` is `padded_width^2` interleaved
+    /// pixels (the 256x256 tile plus an `apron` halo). The output is one dense
+    /// 256x256 interleaved RGBA tile.
     pub fn blur_tile(
         &self,
         padded: &[[f32; 4]],
         params: &BlurParams,
     ) -> Result<Vec<f32>, NodeError> {
-        let expected = params.padded_width as usize * params.padded_width as usize;
+        let padded_width = params.padded_width as usize;
+        let expected = padded_width * padded_width;
         if padded.len() != expected {
             return Err(NodeError::Other(format!(
                 "blur input needs {expected} pixels, got {}",
@@ -381,21 +402,57 @@ impl GpuComputeEngine {
         }
 
         let device = &self.inner.device;
+        let padded_height = padded_width; // input is square
+        let intermediate_pixels = padded_height * TILE_SIZE as usize;
+        let intermediate_bytes =
+            (intermediate_pixels * 4) as u64 * std::mem::size_of::<f32>() as u64;
+
         let input = create_buffer(device, "tanova-blur-input", padded, true);
         let uniform = create_uniform_buffer(device, "tanova-blur-params", &[*params]);
+        let intermediate = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tanova-blur-intermediate"),
+            size: intermediate_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
         let output = create_output_buffer(device, TILE_RGBA_BYTES);
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("tanova-blur-bind-group"),
-            layout: &self.inner.blur.layout,
+        // Pass 1: horizontal 1D convolution -> intermediate (padded_height x TILE_SIZE).
+        let h_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tanova-blur-h-bind-group"),
+            layout: &self.inner.blur_h.layout,
             entries: &[
                 binding(0, &input),
+                binding(1, &uniform),
+                binding(2, &intermediate),
+            ],
+        });
+        let h_dispatch_y = (padded_height as u32).div_ceil(WORKGROUP_SIZE);
+        self.dispatch(
+            &self.inner.blur_h,
+            &h_bind_group,
+            DISPATCH_SIZE,
+            h_dispatch_y,
+        )?;
+
+        // Pass 2: vertical 1D convolution -> dense output (TILE_SIZE x TILE_SIZE).
+        let v_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tanova-blur-v-bind-group"),
+            layout: &self.inner.blur_v.layout,
+            entries: &[
+                binding(0, &intermediate),
                 binding(1, &uniform),
                 binding(2, &output),
             ],
         });
+        self.dispatch(
+            &self.inner.blur_v,
+            &v_bind_group,
+            DISPATCH_SIZE,
+            DISPATCH_SIZE,
+        )?;
 
-        self.run(&self.inner.blur, &bind_group, &output, TILE_RGBA_BYTES)
+        self.readback(&output, TILE_RGBA_BYTES)
     }
 
     /// Runs inverse-sampled bilinear `Transform` over one gathered input tile.
@@ -434,24 +491,25 @@ impl GpuComputeEngine {
             ],
         });
 
-        self.run(&self.inner.transform, &bind_group, &output, TILE_RGBA_BYTES)
+        self.dispatch(
+            &self.inner.transform,
+            &bind_group,
+            DISPATCH_SIZE,
+            DISPATCH_SIZE,
+        )?;
+        self.readback(&output, TILE_RGBA_BYTES)
     }
 
-    /// Records one dispatch, waits for it, and reads the output back.
-    fn run(
+    /// Records one compute dispatch with the given workgroup dimensions and
+    /// waits for the GPU to finish before returning.
+    fn dispatch(
         &self,
         pass: &ComputePass,
         bind_group: &wgpu::BindGroup,
-        output: &wgpu::Buffer,
-        output_bytes: u64,
-    ) -> Result<Vec<f32>, NodeError> {
+        dispatch_x: u32,
+        dispatch_y: u32,
+    ) -> Result<(), NodeError> {
         let device = &self.inner.device;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tanova-readback"),
-            size: output_bytes,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("tanova-compute-encoder"),
@@ -463,8 +521,29 @@ impl GpuComputeEngine {
             });
             compute.set_pipeline(&pass.pipeline);
             compute.set_bind_group(0, bind_group, &[]);
-            compute.dispatch_workgroups(DISPATCH_SIZE, DISPATCH_SIZE, 1);
+            compute.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         }
+        self.inner.queue.submit(Some(encoder.finish()));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map(|_| ())
+            .map_err(|error| NodeError::Other(format!("wgpu poll failed: {error}")))
+    }
+
+    /// Copies `output` to a mappable readback buffer, waits for the GPU, and
+    /// returns the pixel data as `f32` values.
+    fn readback(&self, output: &wgpu::Buffer, output_bytes: u64) -> Result<Vec<f32>, NodeError> {
+        let device = &self.inner.device;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tanova-readback"),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tanova-readback-encoder"),
+        });
         encoder.copy_buffer_to_buffer(output, 0, &readback, 0, output_bytes);
         self.inner.queue.submit(Some(encoder.finish()));
 
@@ -476,6 +555,7 @@ impl GpuComputeEngine {
             });
         device
             .poll(wgpu::PollType::wait_indefinitely())
+            .map(|_| ())
             .map_err(|error| NodeError::Other(format!("wgpu poll failed: {error}")))?;
         receiver
             .recv()
@@ -731,7 +811,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-const BLUR_WGSL: &str = r#"
+const BLUR_H_WGSL: &str = r#"
 struct BlurParams {
     radius: u32,
     sigma: f32,
@@ -739,8 +819,54 @@ struct BlurParams {
     padded_width: u32,
 };
 
-// Padded apron tiles can exceed the 64 KiB uniform limit, so pixel data must
-// live in storage buffers rather than `var<uniform>`.
+// Horizontal 1D pass: convolves each padded row across `dx`, writing one
+// intermediate pixel per (padded row, inner output column). Padded apron tiles
+// can exceed the 64 KiB uniform limit, so pixel data lives in storage buffers.
+@group(0) @binding(0) var<storage, read> input_pixels: array<vec4<f32>>;
+@group(0) @binding(1) var<uniform> params: BlurParams;
+@group(0) @binding(2) var<storage, read_write> output_pixels: array<vec4<f32>>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let padded_width = i32(params.padded_width);
+    if (id.y >= u32(padded_width) || id.x >= 256u) {
+        return;
+    }
+
+    let radius = i32(params.radius);
+    let stride = padded_width;
+    let center_x = i32(id.x) + i32(params.apron);
+    let center_y = i32(id.y);
+
+    let sigma = max(params.sigma, 1e-5);
+    let denom = max(2.0 * sigma * sigma, 1e-10);
+
+    var sum = vec3<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var dx = -radius; dx <= radius; dx = dx + 1) {
+        let weight = exp(-f32(dx * dx) / denom);
+        let sample = input_pixels[center_y * stride + (center_x + dx)];
+        sum = sum + sample.rgb * weight;
+        weight_sum = weight_sum + weight;
+    }
+
+    // Alpha is intentionally untouched: premultiplied pipeline, center coverage
+    // survives the RGB convolution.
+    let center = input_pixels[center_y * stride + center_x];
+    output_pixels[id.y * 256u + id.x] = vec4<f32>(sum / weight_sum, center.a);
+}
+"#;
+
+const BLUR_V_WGSL: &str = r#"
+struct BlurParams {
+    radius: u32,
+    sigma: f32,
+    apron: u32,
+    padded_width: u32,
+};
+
+// Vertical 1D pass: convolves the horizontal intermediate down the `dy` axis,
+// writing the final dense 256x256 tile. Intermediate rows are `TILE_SIZE` wide.
 @group(0) @binding(0) var<storage, read> input_pixels: array<vec4<f32>>;
 @group(0) @binding(1) var<uniform> params: BlurParams;
 @group(0) @binding(2) var<storage, read_write> output_pixels: array<vec4<f32>>;
@@ -752,10 +878,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let radius = i32(params.radius);
-    let stride = i32(params.padded_width);
-    let center_x = i32(id.x) + i32(params.apron);
+    let stride = 256;
+    let center_x = i32(id.x);
     let center_y = i32(id.y) + i32(params.apron);
-    let center = input_pixels[center_y * stride + center_x];
 
     let sigma = max(params.sigma, 1e-5);
     let denom = max(2.0 * sigma * sigma, 1e-10);
@@ -763,16 +888,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var sum = vec3<f32>(0.0);
     var weight_sum = 0.0;
     for (var dy = -radius; dy <= radius; dy = dy + 1) {
-        for (var dx = -radius; dx <= radius; dx = dx + 1) {
-            let weight = exp(-f32(dx * dx + dy * dy) / denom);
-            let sample = input_pixels[(center_y + dy) * stride + (center_x + dx)];
-            sum = sum + sample.rgb * weight;
-            weight_sum = weight_sum + weight;
-        }
+        let weight = exp(-f32(dy * dy) / denom);
+        let sample = input_pixels[(center_y + dy) * stride + center_x];
+        sum = sum + sample.rgb * weight;
+        weight_sum = weight_sum + weight;
     }
 
-    // Alpha is intentionally untouched: the pipeline is premultiplied, so the
-    // center coverage must survive the RGB convolution.
+    let center = input_pixels[center_y * stride + center_x];
     output_pixels[id.y * 256u + id.x] = vec4<f32>(sum / weight_sum, center.a);
 }
 "#;

@@ -10,6 +10,7 @@
 
 use std::any::Any;
 
+use crate::PortId;
 use crate::governor::MemoryGovernor;
 use crate::knobs::KnobTable;
 
@@ -43,6 +44,199 @@ impl ProjectFormat {
     pub fn new(width: u32, height: u32) -> Self {
         Self { width, height }
     }
+}
+
+/// Interpolation mode for a keyframe segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InterpMode {
+    /// Nuke's default smooth/cubic segment (`'s'`, `'S'`, `'c'`, `'C'`).
+    #[default]
+    Smooth,
+    /// Straight linear interpolation (`'l'`, `'L'`).
+    Linear,
+    /// Step/hold the value until the next keyframe (`'k'`, `'K'`).
+    Constant,
+}
+
+/// A single keyframe sample on an [`AnimationCurve`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Keyframe {
+    /// Frame at which this key sits.
+    pub frame: f64,
+    /// Value at this frame.
+    pub value: f64,
+    /// Interpolation used from this key to the next one.
+    pub interp: InterpMode,
+}
+
+/// A frame-sorted 1D animation curve for a knob channel.
+///
+/// The kernel stores one curve per animated knob channel and evaluates them at
+/// pull time, so a cartridge always receives concrete knob values in its
+/// [`EvalContext`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AnimationCurve {
+    /// Keyframes, always sorted ascending by `frame`.
+    pub keys: Vec<Keyframe>,
+}
+
+const KEYFRAME_EPSILON: f64 = 1e-6;
+const SPAN_EPSILON: f64 = 1e-9;
+
+impl AnimationCurve {
+    /// Creates an empty curve.
+    pub fn new() -> Self {
+        Self { keys: Vec::new() }
+    }
+
+    /// Creates a 1-key constant curve at frame `1.0`, used when a multi-channel
+    /// knob mixes animated `{curve ...}` channels with static numeric channels.
+    pub fn from_constant(value: f64) -> Self {
+        let mut curve = Self::new();
+        curve.keys.push(Keyframe {
+            frame: 1.0,
+            value,
+            interp: InterpMode::Constant,
+        });
+        curve
+    }
+
+    /// Returns `true` if the curve holds no keyframes.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Returns the number of keyframes.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Inserts or overwrites a keyframe, keeping `keys` sorted ascending by
+    /// frame. Non-finite frames or values are ignored.
+    pub fn set_key(&mut self, frame: f64, value: f64, interp: InterpMode) {
+        if !frame.is_finite() || !value.is_finite() {
+            return;
+        }
+        if let Some(existing) = self
+            .keys
+            .iter_mut()
+            .find(|key| (key.frame - frame).abs() <= KEYFRAME_EPSILON)
+        {
+            existing.value = value;
+            existing.interp = interp;
+            return;
+        }
+        self.keys.push(Keyframe {
+            frame,
+            value,
+            interp,
+        });
+        self.keys.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+    }
+
+    /// Removes the keyframe nearest to `frame`, if one sits within epsilon.
+    /// Returns `true` when a keyframe was removed.
+    pub fn remove_key(&mut self, frame: f64) -> bool {
+        let before = self.keys.len();
+        self.keys
+            .retain(|key| (key.frame - frame).abs() > KEYFRAME_EPSILON);
+        self.keys.len() != before
+    }
+
+    /// Returns `true` if a keyframe sits within epsilon of `frame`.
+    pub fn has_key_at(&self, frame: f64) -> bool {
+        self.keys
+            .iter()
+            .any(|key| (key.frame - frame).abs() <= KEYFRAME_EPSILON)
+    }
+
+    /// Returns deduplicated, rounded keyframe times in ascending order, used
+    /// for timeline keyframe tick rendering.
+    pub fn keyframe_times(&self) -> Vec<i64> {
+        let mut times: Vec<i64> = self
+            .keys
+            .iter()
+            .map(|key| key.frame.round() as i64)
+            .collect();
+        times.sort_unstable();
+        times.dedup();
+        times
+    }
+
+    /// Evaluates the curve at `frame`, clamping to the end keyframes outside
+    /// the curve's time range.
+    pub fn evaluate(&self, frame: f64) -> f64 {
+        if self.keys.is_empty() {
+            return 0.0;
+        }
+        if self.keys.len() == 1 || frame <= self.keys[0].frame {
+            return self.keys[0].value;
+        }
+        let last = self.keys.last().expect("non-empty curve");
+        if frame >= last.frame {
+            return last.value;
+        }
+        let Some((k0, k1)) = self.keys.windows(2).find_map(|window| {
+            let (k0, k1) = (&window[0], &window[1]);
+            if k0.frame <= frame && frame <= k1.frame {
+                Some((k0, k1))
+            } else {
+                None
+            }
+        }) else {
+            return 0.0;
+        };
+        let span = k1.frame - k0.frame;
+        if span.abs() <= SPAN_EPSILON {
+            return k0.value;
+        }
+        let t = ((frame - k0.frame) / span).clamp(0.0, 1.0);
+        match k0.interp {
+            InterpMode::Constant => k0.value,
+            InterpMode::Linear => k0.value + (k1.value - k0.value) * t,
+            InterpMode::Smooth => {
+                let s = t * t * (3.0 - 2.0 * t);
+                k0.value + (k1.value - k0.value) * s
+            }
+        }
+    }
+
+    /// Serializes the curve into Nuke TCL syntax, e.g. `"{curve x1 0 x10 100}"`.
+    /// Emits `l`/`k` mode tokens for non-smooth interpolation and formats
+    /// integer-valued floats without trailing decimal noise.
+    pub fn to_nuke_tcl(&self) -> String {
+        if self.keys.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("{curve");
+        for key in &self.keys {
+            match key.interp {
+                InterpMode::Linear => out.push_str(" l"),
+                InterpMode::Constant => out.push_str(" k"),
+                InterpMode::Smooth => {}
+            }
+            out.push_str(&format!(
+                " x{} {}",
+                format_curve_scalar(key.frame),
+                format_curve_scalar(key.value)
+            ));
+        }
+        out.push('}');
+        out
+    }
+}
+
+/// Formats a scalar curve value cleanly: integer-valued floats lose their
+/// trailing `.0`, other values keep a bounded fractional part.
+fn format_curve_scalar(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if value.fract() == 0.0 && value.abs() < 1e12 {
+        return format!("{:.0}", value);
+    }
+    let text = format!("{:.6}", value);
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// Generic data travelling bottom-up from a node to its consumers.
@@ -263,6 +457,24 @@ pub trait NodeTrait: Send + Sync {
     /// Pulls data from `inputs`, using `ctx` for render state, and returns the
     /// resulting packet. Must not mutate the node.
     fn evaluate(&self, ctx: &EvalContext, inputs: &[Packet]) -> Result<Packet, NodeError>;
+
+    /// Declares which connected input ports to pull and the `EvalContext` for
+    /// each port.
+    ///
+    /// Defaults to pulling all connected ports with `ctx` unchanged. Cartridges
+    /// that only read some inputs (a `Switch`) override this to skip the
+    /// inactive branch, and time-warping cartridges (a `TimeOffset`) rewrite the
+    /// context for the port they request.
+    fn upstream_inputs(
+        &self,
+        ctx: &EvalContext,
+        connected_ports: &[PortId],
+    ) -> Vec<(PortId, EvalContext)> {
+        connected_ports
+            .iter()
+            .map(|&port| (port, ctx.clone()))
+            .collect()
+    }
 
     /// Writes the node's state back into `.nk` / TCL syntax.
     fn serialize_to_tcl(&self) -> String;

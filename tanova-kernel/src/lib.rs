@@ -21,7 +21,10 @@ pub use dag::{Dag, DagNode, Edge, OpHash, RamCache};
 pub use governor::{MemoryGovernor, MemoryPermit, RenderEpoch, evaluate_with_airbag};
 pub use knobs::{KnobTable, KnobValue};
 pub use registry::{NodeCartridgeDescriptor, find_cartridge, registered_cartridge_kinds};
-pub use types::{EvalContext, NodeError, NodeTrait, Packet, ProjectFormat, Time, TypeMap, View};
+pub use types::{
+    AnimationCurve, EvalContext, InterpMode, Keyframe, NodeError, NodeTrait, Packet, ProjectFormat,
+    Time, TypeMap, View,
+};
 
 #[cfg(test)]
 mod tests {
