@@ -41,6 +41,7 @@ const VIEWER_OFFSET: f32 = 120.0;
 const CONTEXT_MENU_KINDS: &[&str] = &[
     "Read",
     "Constant",
+    "CheckerBoard2",
     "Grade",
     "ColorCorrect",
     "Clamp",
@@ -48,7 +49,9 @@ const CONTEXT_MENU_KINDS: &[&str] = &[
     "Invert",
     "Premult",
     "Unpremult",
+    "Shuffle",
     "Transform",
+    "Reformat",
     "Crop",
     "Blur",
     "Merge2",
@@ -1887,13 +1890,25 @@ impl NodeCanvas {
             messages.push(message);
         }
 
-        painter.text(
-            rect.left_bottom() + Vec2::new(12.0, -10.0),
-            Align2::LEFT_BOTTOM,
-            "R/W/C/G/B/T/M/./Z: add node | Shift+B: backdrop | Tab: search | 1/2: view | D: bypass | F: frame",
-            FontId::proportional(11.0),
-            Color32::from_gray(110),
+        // Bottom-left shortcut hint. A framed pill keeps it readable over node
+        // cards instead of colliding with their labels.
+        let hint = "Keys: R W C G B T M . Z | Tab: search | 1/2: view | D: bypass | F: frame | Shift+X: swap";
+        let hint_color = Color32::from_gray(165);
+        let galley =
+            painter.layout_no_wrap(hint.to_string(), FontId::proportional(11.0), hint_color);
+        let hint_anchor = rect.left_bottom() + Vec2::new(12.0, -10.0);
+        let text_rect = Rect::from_min_size(
+            Pos2::new(hint_anchor.x, hint_anchor.y - galley.size().y),
+            galley.size(),
         );
+        painter.rect(
+            text_rect.expand2(Vec2::new(8.0, 4.0)),
+            9.0,
+            Color32::from_rgba_unmultiplied(16, 18, 22, 215),
+            Stroke::new(1.0, Color32::from_rgb(55, 60, 70)),
+            StrokeKind::Inside,
+        );
+        painter.galley(text_rect.min, galley, hint_color);
 
         messages
     }
@@ -2737,7 +2752,7 @@ pub fn input_port_side(kind: &str, input_count: usize, port_index: usize) -> Por
 /// Number of input ports a cartridge exposes to the canvas.
 fn input_port_count(kind: &str) -> usize {
     match kind {
-        "Constant" | "Read" | "BackdropNode" => 0,
+        "Constant" | "Read" | "BackdropNode" | "CheckerBoard2" => 0,
         "Merge2" => 3,
         "Grade" | "Switch" | "Clamp" | "Saturation" => 2,
         _ => 1,

@@ -549,6 +549,53 @@ fn batches_share_gesture(
     })
 }
 
+/// `true` when two batches describe the same knob-edit session.
+///
+/// Every pair must be a `SetKnob` on the same `(node, knob)` or a
+/// `SetKnobCurve` on the same `(node, name)`, and at least one pair must
+/// actually match. This is the shape the properties panel emits when it
+/// auto-keys an already-animated knob.
+fn batches_share_knob_session(last: &[UndoableCommand], incoming: &[UndoableCommand]) -> bool {
+    if last.is_empty() || last.len() != incoming.len() {
+        return false;
+    }
+    let mut matched = false;
+    for (a, b) in last.iter().zip(incoming.iter()) {
+        let same = match (a, b) {
+            (
+                UndoableCommand::SetKnob {
+                    node: node_a,
+                    knob: knob_a,
+                    ..
+                },
+                UndoableCommand::SetKnob {
+                    node: node_b,
+                    knob: knob_b,
+                    ..
+                },
+            ) => node_a == node_b && knob_a == knob_b,
+            (
+                UndoableCommand::SetKnobCurve {
+                    node: node_a,
+                    name: name_a,
+                    ..
+                },
+                UndoableCommand::SetKnobCurve {
+                    node: node_b,
+                    name: name_b,
+                    ..
+                },
+            ) => node_a == node_b && name_a == name_b,
+            _ => false,
+        };
+        if !same {
+            return false;
+        }
+        matched = true;
+    }
+    matched
+}
+
 impl UndoStack {
     /// Creates an empty history.
     pub fn new() -> Self {
@@ -662,6 +709,24 @@ impl UndoStack {
                 self.next_op_id = self.next_op_id.saturating_add(1);
                 Some(())
             }
+            // Coalesce consecutive SetKnobCurve on the same (node, name).
+            (
+                UndoableCommand::SetKnobCurve {
+                    node: last_node,
+                    name: last_name,
+                    curves: last_curves,
+                    ..
+                },
+                UndoableCommand::SetKnobCurve {
+                    node, name, curves, ..
+                },
+            ) if *last_node == *node && *last_name == *name && within_window => {
+                *last_curves = curves.clone();
+                // Keep the earliest `previous` for correct undo semantics.
+                last.0 = self.next_op_id;
+                self.next_op_id = self.next_op_id.saturating_add(1);
+                Some(())
+            }
             // Coalesce consecutive MoveNode on the same id and drag origin.
             (
                 UndoableCommand::MoveNode {
@@ -688,6 +753,34 @@ impl UndoStack {
                 *last_to_y = *to_y;
                 // Keep the earliest from_x/from_y.
                 // A coalesced update still advances the monotonic op id.
+                last.0 = self.next_op_id;
+                self.next_op_id = self.next_op_id.saturating_add(1);
+                Some(())
+            }
+            // Coalesce consecutive Batch([SetKnob, SetKnobCurve]) edits of the
+            // same knob inside the coalescing window.
+            (UndoableCommand::Batch(last_cmds), UndoableCommand::Batch(cmds))
+                if within_window && batches_share_knob_session(last_cmds, cmds) =>
+            {
+                for (last_cmd, cmd) in last_cmds.iter_mut().zip(cmds.iter()) {
+                    match (last_cmd, cmd) {
+                        (
+                            UndoableCommand::SetKnob {
+                                value: last_value, ..
+                            },
+                            UndoableCommand::SetKnob { value, .. },
+                        ) => *last_value = value.clone(),
+                        (
+                            UndoableCommand::SetKnobCurve {
+                                curves: last_curves,
+                                ..
+                            },
+                            UndoableCommand::SetKnobCurve { curves, .. },
+                        ) => *last_curves = curves.clone(),
+                        _ => {}
+                    }
+                }
+                // Keep the earliest `previous` values for exact undo.
                 last.0 = self.next_op_id;
                 self.next_op_id = self.next_op_id.saturating_add(1);
                 Some(())
@@ -756,6 +849,8 @@ pub struct KernelHandle {
     messages: Sender<KernelMessage>,
     events: Receiver<KernelEvent>,
     frames: Receiver<FrameNotification>,
+    /// The worker's render epoch, shared so the UI can preempt a stale render.
+    epoch: RenderEpoch,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -773,16 +868,27 @@ impl KernelHandle {
 
         let epoch = RenderEpoch::new();
 
+        let worker_epoch = epoch.clone();
         let thread = thread::Builder::new()
             .name("tanova-kernel".into())
-            .spawn(move || kernel_loop(message_rx, event_tx, frame_tx, governor, epoch))?;
+            .spawn(move || kernel_loop(message_rx, event_tx, frame_tx, governor, worker_epoch))?;
 
         Ok(Self {
             messages: message_tx,
             events: event_rx,
             frames: frame_rx,
+            epoch,
             thread: Some(thread),
         })
+    }
+
+    /// The shared render epoch.
+    ///
+    /// Bumping it from the UI thread abandons a render the worker already
+    /// started for a now-stale state, so the next frame reflects the newest
+    /// knob/time value instead of an outdated one.
+    pub fn render_epoch(&self) -> &RenderEpoch {
+        &self.epoch
     }
 
     /// Sends a message to the kernel thread.
@@ -838,6 +944,13 @@ fn coalesce_batch(batch: Vec<KernelMessage>) -> Vec<KernelMessage> {
     let mut coalesced: Vec<KernelMessage> = Vec::with_capacity(batch.len());
     for message in batch {
         let merged = match (&message, coalesced.last_mut()) {
+            // Rapid scrubbing queues many frames while one render is in
+            // flight. Only the newest requested frame matters, so collapse
+            // consecutive `SetTime`s (non-`SetTime` messages keep their order).
+            (KernelMessage::SetTime(frame), Some(KernelMessage::SetTime(last_frame))) => {
+                *last_frame = *frame;
+                true
+            }
             (
                 KernelMessage::Execute(UndoableCommand::SetKnob {
                     node,
@@ -876,6 +989,34 @@ fn coalesce_batch(batch: Vec<KernelMessage>) -> Vec<KernelMessage> {
             ) if last_id == id && same_origin((*last_from_x, *last_from_y), (*from_x, *from_y)) => {
                 *last_to_x = *to_x;
                 *last_to_y = *to_y;
+                true
+            }
+            (
+                KernelMessage::Execute(UndoableCommand::Batch(cmds)),
+                Some(KernelMessage::Execute(UndoableCommand::Batch(last_cmds))),
+            ) if batches_share_knob_session(last_cmds, cmds) => {
+                // Auto-key drags emit `Batch([SetKnob, SetKnobCurve])` once per
+                // UI frame. Collapse the whole burst the same way plain
+                // `SetKnob` drags collapse: keep the earliest `previous` and
+                // the newest value/curves.
+                for (last_cmd, cmd) in last_cmds.iter_mut().zip(cmds.iter()) {
+                    match (last_cmd, cmd) {
+                        (
+                            UndoableCommand::SetKnob {
+                                value: last_value, ..
+                            },
+                            UndoableCommand::SetKnob { value, .. },
+                        ) => *last_value = value.clone(),
+                        (
+                            UndoableCommand::SetKnobCurve {
+                                curves: last_curves,
+                                ..
+                            },
+                            UndoableCommand::SetKnobCurve { curves, .. },
+                        ) => *last_curves = curves.clone(),
+                        _ => {}
+                    }
+                }
                 true
             }
             (
@@ -924,220 +1065,251 @@ fn kernel_loop(
     let mut render_dirty = false;
 
     while let Ok(first) = messages.recv() {
-        // Drain-then-render: apply every queued mutation before paying for a
-        // render, so a burst of seed commands produces exactly one frame.
-        let mut batch = vec![first];
-        while let Ok(message) = messages.try_recv() {
-            batch.push(message);
-        }
-
         let mut shutdown = false;
-        // Coalesce consecutive same-target mutations within the batch so a
-        // burst of drag events evaluates only the latest value, keeping the
-        // render backlog low and the undo stack clean.
-        for message in coalesce_batch(batch) {
-            match message {
-                KernelMessage::Execute(command) => {
-                    // Invalidate downstream cache entries for knob changes and
-                    // bypass toggles so stale rendered pixels don't linger.
-                    // Upstream caches (e.g. Constant) are preserved by op-hash
-                    // keying, so toggling a Grade re-renders immediately
-                    // without re-evaluating its sources.
-                    match &command {
-                        UndoableCommand::SetKnob { node, .. }
-                        | UndoableCommand::SetDisabled { node, .. } => {
-                            dag.invalidate_downstream(*node);
-                        }
-                        _ => {}
-                    }
-                    if apply_and_record(&mut dag, &mut undo, &events, command) {
-                        render_dirty = true;
-                    }
-                }
-                KernelMessage::Undo => {
-                    if let Some(command) = undo.undo() {
-                        match dag.undo_command(&command) {
-                            Ok(()) => {
-                                // Topology may have changed: drop cached packets
-                                // so the next pull reflects the restored wiring.
-                                dag.cache_mut().clear();
-                                render_dirty = true;
-                                let _ = events.send(KernelEvent::Undone(command));
-                                let _ = events.send(KernelEvent::DirtyStateChanged {
-                                    is_dirty: undo.is_dirty(),
-                                });
+        // Draining only once per render is not enough: while this thread is
+        // applying a batch the UI keeps streaming drag frames, and each of
+        // those would otherwise pay for its own GPU render. Keep absorbing
+        // messages until the queue is actually empty, then render exactly once
+        // for the newest combined state.
+        let mut pending = vec![first];
+        while !pending.is_empty() {
+            // Coalesce consecutive same-target mutations within the batch so a
+            // burst of drag events evaluates only the latest value, keeping the
+            // render backlog low and the undo stack clean.
+            for message in coalesce_batch(std::mem::take(&mut pending)) {
+                match message {
+                    KernelMessage::Execute(command) => {
+                        // Invalidate downstream cache entries for knob changes and
+                        // bypass toggles so stale rendered pixels don't linger.
+                        // Upstream caches (e.g. Constant) are preserved by op-hash
+                        // keying, so toggling a Grade re-renders immediately
+                        // without re-evaluating its sources.
+                        match &command {
+                            UndoableCommand::SetKnob { node, .. }
+                            | UndoableCommand::SetDisabled { node, .. }
+                            | UndoableCommand::SetKnobCurve { node, .. } => {
+                                dag.invalidate_downstream(*node);
                             }
-                            Err(error) => {
-                                let _ = events.send(KernelEvent::CommandFailed {
-                                    command,
-                                    message: error.to_string(),
-                                });
+                            UndoableCommand::Batch(cmds) => {
+                                for cmd in cmds {
+                                    if let UndoableCommand::SetKnob { node, .. }
+                                    | UndoableCommand::SetDisabled { node, .. }
+                                    | UndoableCommand::SetKnobCurve { node, .. } = cmd
+                                    {
+                                        dag.invalidate_downstream(*node);
+                                    }
+                                }
                             }
+                            _ => {}
+                        }
+                        if apply_and_record(&mut dag, &mut undo, &events, command) {
+                            render_dirty = true;
                         }
                     }
-                }
-                KernelMessage::Redo => {
-                    if let Some(command) = undo.redo() {
-                        match dag.apply_command(command.clone()) {
-                            Ok(_) => {
-                                dag.cache_mut().clear();
-                                render_dirty = true;
-                                let _ = events.send(KernelEvent::Redone(command));
-                                let _ = events.send(KernelEvent::DirtyStateChanged {
-                                    is_dirty: undo.is_dirty(),
-                                });
-                            }
-                            Err(error) => {
-                                let _ = events.send(KernelEvent::CommandFailed {
-                                    command,
-                                    message: error.to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-                KernelMessage::BumpEpoch => {
-                    let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
-                }
-                KernelMessage::SetBaseContext(context) => {
-                    dag.set_project_format(context.project_format());
-                    base_ctx = context;
-                    render_dirty = true;
-                }
-                KernelMessage::SetViewerNode(node) => {
-                    viewer_node = node;
-                    let _ = events.send(KernelEvent::ViewerChanged(node));
-                    render_dirty = true;
-                }
-                KernelMessage::RouteNukeViewer {
-                    target_node,
-                    fallback_pos,
-                } => {
-                    if let Some(viewer) =
-                        route_nuke_viewer(&mut dag, &mut undo, &events, target_node, fallback_pos)
-                    {
-                        viewer_node = Some(viewer);
-                        let _ = events.send(KernelEvent::ViewerChanged(Some(viewer)));
-                        let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
-                        let _ = events.send(KernelEvent::DirtyStateChanged {
-                            is_dirty: undo.is_dirty(),
-                        });
-                        render_dirty = true;
-                    }
-                }
-                KernelMessage::RequestRender => {
-                    render_dirty = true;
-                }
-                KernelMessage::TriggerRender => {
-                    // External data (for example a disk frame) changed outside
-                    // the graph. The op hash cannot see that, so drop cached
-                    // packets before re-evaluating.
-                    dag.cache_mut().clear();
-                    render_dirty = true;
-                }
-                KernelMessage::SetTime(frame) => {
-                    base_ctx.insert(Time(frame));
-                    let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
-                    render_dirty = true;
-                }
-                KernelMessage::MarkClean => {
-                    undo.clear_and_mark_clean();
-                    let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
-                }
-                KernelMessage::NewScript => {
-                    dag = Dag::new();
-                    undo.clear_and_mark_clean();
-                    viewer_node = None;
-                    let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
-                    let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
-                    let _ = frames.send(FrameNotification::cleared(None, epoch.current()));
-                    render_dirty = true;
-                }
-                KernelMessage::ReplaceDag {
-                    dag: new_dag,
-                    viewer_target,
-                } => {
-                    dag = *new_dag;
-                    undo.clear_and_mark_clean();
-                    viewer_node = viewer_target;
-                    let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
-                    let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
-                    render_dirty = true;
-                }
-                KernelMessage::SaveScript { path } => {
-                    let tcl = dag.export_to_tcl();
-                    match std::fs::write(&path, &tcl) {
-                        Ok(()) => {
-                            undo.mark_saved();
-                            let _ = events.send(KernelEvent::ScriptSaved { path: path.clone() });
-                            let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
-                        }
-                        Err(e) => {
-                            let _ = events.send(KernelEvent::ScriptError {
-                                message: e.to_string(),
-                            });
-                        }
-                    }
-                }
-                KernelMessage::Shutdown => shutdown = true,
-                KernelMessage::ExecuteWriteNode { node } => {
-                    // Rendering to disk must not mark the project dirty:
-                    // do not touch `undo` or emit `DirtyStateChanged`.
-                    let Some(dag_node) = dag.node(node) else {
-                        let _ = events.send(KernelEvent::ScriptError {
-                            message: format!("Write node #{} not found in graph", node.0),
-                        });
-                        continue;
-                    };
-                    let knobs = dag_node.knobs.clone();
-
-                    let Some(exporter) = base_ctx.get::<FrameExporter>().cloned() else {
-                        let _ = events.send(KernelEvent::ScriptError {
-                            message: "no FrameExporter registered in EvalContext".to_string(),
-                        });
-                        continue;
-                    };
-
-                    let first = knobs
-                        .get("first")
-                        .and_then(|v| match v {
-                            KnobValue::Int(i) => Some(*i as i32),
-                            _ => None,
-                        })
-                        .unwrap_or(1);
-                    let mut last = knobs
-                        .get("last")
-                        .and_then(|v| match v {
-                            KnobValue::Int(i) => Some(*i as i32),
-                            _ => None,
-                        })
-                        .unwrap_or(1);
-                    if last < first {
-                        last = first;
-                    }
-
-                    let saved_time = base_ctx.time();
-                    let mut frames_written = 0usize;
-                    let mut last_path: Option<std::path::PathBuf> = None;
-                    let mut aborted = false;
-
-                    for f in first..=last {
-                        dag.cache_mut().clear();
-                        base_ctx.insert(Time(f as f64));
-                        let current_epoch = epoch.bump();
-                        match dag.evaluate_pull(node, &base_ctx, &governor, &epoch, current_epoch) {
-                            Ok(packet) => match (exporter.0)(&packet, &knobs, f as f64) {
-                                Ok(path) => {
-                                    frames_written += 1;
-                                    last_path = Some(path.clone());
-                                    let _ = events.send(KernelEvent::WriteFrameRendered {
-                                        node,
-                                        frame: f,
-                                        first,
-                                        last,
-                                        path,
+                    KernelMessage::Undo => {
+                        if let Some(command) = undo.undo() {
+                            match dag.undo_command(&command) {
+                                Ok(()) => {
+                                    // Topology may have changed: drop cached packets
+                                    // so the next pull reflects the restored wiring.
+                                    dag.cache_mut().clear();
+                                    render_dirty = true;
+                                    let _ = events.send(KernelEvent::Undone(command));
+                                    let _ = events.send(KernelEvent::DirtyStateChanged {
+                                        is_dirty: undo.is_dirty(),
                                     });
                                 }
+                                Err(error) => {
+                                    let _ = events.send(KernelEvent::CommandFailed {
+                                        command,
+                                        message: error.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    KernelMessage::Redo => {
+                        if let Some(command) = undo.redo() {
+                            match dag.apply_command(command.clone()) {
+                                Ok(_) => {
+                                    dag.cache_mut().clear();
+                                    render_dirty = true;
+                                    let _ = events.send(KernelEvent::Redone(command));
+                                    let _ = events.send(KernelEvent::DirtyStateChanged {
+                                        is_dirty: undo.is_dirty(),
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = events.send(KernelEvent::CommandFailed {
+                                        command,
+                                        message: error.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    KernelMessage::BumpEpoch => {
+                        let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+                    }
+                    KernelMessage::SetBaseContext(context) => {
+                        dag.set_project_format(context.project_format());
+                        base_ctx = context;
+                        render_dirty = true;
+                    }
+                    KernelMessage::SetViewerNode(node) => {
+                        viewer_node = node;
+                        let _ = events.send(KernelEvent::ViewerChanged(node));
+                        render_dirty = true;
+                    }
+                    KernelMessage::RouteNukeViewer {
+                        target_node,
+                        fallback_pos,
+                    } => {
+                        if let Some(viewer) = route_nuke_viewer(
+                            &mut dag,
+                            &mut undo,
+                            &events,
+                            target_node,
+                            fallback_pos,
+                        ) {
+                            viewer_node = Some(viewer);
+                            let _ = events.send(KernelEvent::ViewerChanged(Some(viewer)));
+                            let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+                            let _ = events.send(KernelEvent::DirtyStateChanged {
+                                is_dirty: undo.is_dirty(),
+                            });
+                            render_dirty = true;
+                        }
+                    }
+                    KernelMessage::RequestRender => {
+                        render_dirty = true;
+                    }
+                    KernelMessage::TriggerRender => {
+                        // External data (for example a disk frame) changed outside
+                        // the graph. The op hash cannot see that, so drop cached
+                        // packets before re-evaluating.
+                        dag.cache_mut().clear();
+                        render_dirty = true;
+                    }
+                    KernelMessage::SetTime(frame) => {
+                        base_ctx.insert(Time(frame));
+                        let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+                        render_dirty = true;
+                    }
+                    KernelMessage::MarkClean => {
+                        undo.clear_and_mark_clean();
+                        let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
+                    }
+                    KernelMessage::NewScript => {
+                        dag = Dag::new();
+                        undo.clear_and_mark_clean();
+                        viewer_node = None;
+                        let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+                        let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
+                        let _ = frames.send(FrameNotification::cleared(None, epoch.current()));
+                        render_dirty = true;
+                    }
+                    KernelMessage::ReplaceDag {
+                        dag: new_dag,
+                        viewer_target,
+                    } => {
+                        dag = *new_dag;
+                        undo.clear_and_mark_clean();
+                        viewer_node = viewer_target;
+                        let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+                        let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
+                        render_dirty = true;
+                    }
+                    KernelMessage::SaveScript { path } => {
+                        let tcl = dag.export_to_tcl();
+                        match std::fs::write(&path, &tcl) {
+                            Ok(()) => {
+                                undo.mark_saved();
+                                let _ =
+                                    events.send(KernelEvent::ScriptSaved { path: path.clone() });
+                                let _ =
+                                    events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
+                            }
+                            Err(e) => {
+                                let _ = events.send(KernelEvent::ScriptError {
+                                    message: e.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    KernelMessage::Shutdown => shutdown = true,
+                    KernelMessage::ExecuteWriteNode { node } => {
+                        // Rendering to disk must not mark the project dirty:
+                        // do not touch `undo` or emit `DirtyStateChanged`.
+                        let Some(dag_node) = dag.node(node) else {
+                            let _ = events.send(KernelEvent::ScriptError {
+                                message: format!("Write node #{} not found in graph", node.0),
+                            });
+                            continue;
+                        };
+                        let knobs = dag_node.knobs.clone();
+
+                        let Some(exporter) = base_ctx.get::<FrameExporter>().cloned() else {
+                            let _ = events.send(KernelEvent::ScriptError {
+                                message: "no FrameExporter registered in EvalContext".to_string(),
+                            });
+                            continue;
+                        };
+
+                        let first = knobs
+                            .get("first")
+                            .and_then(|v| match v {
+                                KnobValue::Int(i) => Some(*i as i32),
+                                _ => None,
+                            })
+                            .unwrap_or(1);
+                        let mut last = knobs
+                            .get("last")
+                            .and_then(|v| match v {
+                                KnobValue::Int(i) => Some(*i as i32),
+                                _ => None,
+                            })
+                            .unwrap_or(1);
+                        if last < first {
+                            last = first;
+                        }
+
+                        let saved_time = base_ctx.time();
+                        let mut frames_written = 0usize;
+                        let mut last_path: Option<std::path::PathBuf> = None;
+                        let mut aborted = false;
+
+                        for f in first..=last {
+                            dag.cache_mut().clear();
+                            base_ctx.insert(Time(f as f64));
+                            let current_epoch = epoch.bump();
+                            match dag.evaluate_pull(
+                                node,
+                                &base_ctx,
+                                &governor,
+                                &epoch,
+                                current_epoch,
+                            ) {
+                                Ok(packet) => match (exporter.0)(&packet, &knobs, f as f64) {
+                                    Ok(path) => {
+                                        frames_written += 1;
+                                        last_path = Some(path.clone());
+                                        let _ = events.send(KernelEvent::WriteFrameRendered {
+                                            node,
+                                            frame: f,
+                                            first,
+                                            last,
+                                            path,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        aborted = true;
+                                        let _ = events.send(KernelEvent::ScriptError {
+                                            message: format!("Write failed at frame {f}: {e}"),
+                                        });
+                                        break;
+                                    }
+                                },
                                 Err(e) => {
                                     aborted = true;
                                     let _ = events.send(KernelEvent::ScriptError {
@@ -1145,33 +1317,32 @@ fn kernel_loop(
                                     });
                                     break;
                                 }
-                            },
-                            Err(e) => {
-                                aborted = true;
-                                let _ = events.send(KernelEvent::ScriptError {
-                                    message: format!("Write failed at frame {f}: {e}"),
-                                });
-                                break;
                             }
                         }
-                    }
 
-                    // Restore the original time and clear the cache so the next
-                    // viewer render is unaffected by the sequence evaluation.
-                    if let Some(t) = saved_time {
-                        base_ctx.insert(Time(t));
-                    }
-                    dag.cache_mut().clear();
+                        // Restore the original time and clear the cache so the next
+                        // viewer render is unaffected by the sequence evaluation.
+                        if let Some(t) = saved_time {
+                            base_ctx.insert(Time(t));
+                        }
+                        dag.cache_mut().clear();
 
-                    let _ = events.send(KernelEvent::WriteCompleted {
-                        node,
-                        frames_written,
-                        last_path,
-                    });
-                    if aborted {
-                        continue;
+                        let _ = events.send(KernelEvent::WriteCompleted {
+                            node,
+                            frames_written,
+                            last_path,
+                        });
+                        if aborted {
+                            continue;
+                        }
                     }
                 }
+            }
+
+            // Messages that arrived while this slice was applying join the
+            // next slice instead of triggering their own render.
+            while let Ok(message) = messages.try_recv() {
+                pending.push(message);
             }
         }
 
@@ -1187,7 +1358,7 @@ fn kernel_loop(
         // A node can disappear through Execute, Undo, or Redo; `render_viewer`
         // unbinds a dead target and clears the image instead of freezing it.
         let render_start = Instant::now();
-        if let Some(notification) = render_viewer(
+        match render_viewer(
             &mut dag,
             &mut viewer_node,
             &mut displayed_target,
@@ -1196,7 +1367,18 @@ fn kernel_loop(
             &epoch,
             &events,
         ) {
-            let _ = frames.send(notification);
+            RenderOutcome::Frame(notification) => {
+                let _ = frames.send(notification);
+            }
+            RenderOutcome::Unchanged => {}
+            RenderOutcome::Preempted => {
+                // The UI moved the epoch on while this render was running, so
+                // its pixels describe a state the artist already left. Drop
+                // them (the last good frame stays on screen) and wait for the
+                // next message, which carries the newer state.
+                render_dirty = true;
+                continue;
+            }
         }
         let render_time = render_start.elapsed();
 
@@ -1209,6 +1391,33 @@ fn kernel_loop(
             .saturating_sub(render_time)
             .max(Duration::from_millis(2));
         thread::sleep(sleep_dur);
+    }
+}
+
+/// What one [`render_viewer`] attempt produced.
+enum RenderOutcome {
+    /// A frame (possibly a deliberate clear) for the UI.
+    Frame(FrameNotification),
+    /// Nothing to send; the displayed image is already correct.
+    Unchanged,
+    /// A newer render epoch arrived mid-render; retry with the newest state.
+    Preempted,
+}
+
+#[cfg(test)]
+impl RenderOutcome {
+    /// Consumes the outcome, panicking unless a frame was produced.
+    fn expect_frame(self, message: &str) -> FrameNotification {
+        match self {
+            Self::Frame(notification) => notification,
+            Self::Unchanged => panic!("{message}: no frame (nothing changed)"),
+            Self::Preempted => panic!("{message}: the render was preempted"),
+        }
+    }
+
+    /// `true` when this attempt produced no frame for the UI.
+    fn is_none(&self) -> bool {
+        !matches!(self, Self::Frame(_))
     }
 }
 
@@ -1227,48 +1436,53 @@ fn render_viewer(
     governor: &MemoryGovernor,
     epoch: &RenderEpoch,
     events: &Sender<KernelEvent>,
-) -> Option<FrameNotification> {
+) -> RenderOutcome {
     let Some(target) = *viewer_node else {
         // Nothing is bound: clear only if the UI is still showing something.
         return displayed_target
             .take()
-            .map(|_| FrameNotification::cleared(None, epoch.bump()));
+            .map(|_| RenderOutcome::Frame(FrameNotification::cleared(None, epoch.bump())))
+            .unwrap_or(RenderOutcome::Unchanged);
     };
 
     if !dag.contains_node(target) {
         *viewer_node = None;
         *displayed_target = None;
         let _ = events.send(KernelEvent::ViewerChanged(None));
-        return Some(FrameNotification::cleared(None, epoch.bump()));
+        return RenderOutcome::Frame(FrameNotification::cleared(None, epoch.bump()));
     }
 
     let current_epoch = epoch.bump();
     match dag.evaluate_pull(target, context, governor, epoch, current_epoch) {
         Ok(packet) if !packet.is_empty() => {
             *displayed_target = Some(target);
-            Some(FrameNotification::frame(target, current_epoch, packet))
+            RenderOutcome::Frame(FrameNotification::frame(target, current_epoch, packet))
         }
         Ok(_) => {
             // The chain exists but produced nothing displayable: an
             // unconnected `Viewer`, a detached upstream wire, or a
             // metadata-only packet.
             *displayed_target = None;
-            Some(FrameNotification::cleared(Some(target), current_epoch))
+            RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
+        // Preemption is not a failure: the artist moved the timeline or a knob
+        // while this render ran. Keep the last good image on screen and let
+        // the caller retry with the newest state -- clearing here would blank
+        // the viewer on every mid-drag preemption.
+        Err(NodeError::Preempted) => RenderOutcome::Preempted,
         Err(NodeError::Panic(message)) => {
             *displayed_target = None;
             let _ = events.send(KernelEvent::NodeCrashed {
                 node: target,
                 message,
             });
-            Some(FrameNotification::cleared(Some(target), current_epoch))
+            RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
         Err(_) => {
-            // Missing inputs, memory pressure, and preemption are normal
-            // during interactive editing. Clear the image; the next change
-            // retries.
+            // Missing inputs and memory pressure are normal during interactive
+            // editing. Clear the image; the next change retries.
             *displayed_target = None;
-            Some(FrameNotification::cleared(Some(target), current_epoch))
+            RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
     }
 }
@@ -1423,6 +1637,7 @@ mod tests {
     use crate::dag::Edge;
     use crate::knobs::{KnobTable, KnobValue};
     use crate::registry::NodeCartridgeDescriptor;
+    use crate::types::{AnimationCurve, InterpMode, Keyframe};
 
     struct ConstantProbe;
 
@@ -1823,7 +2038,7 @@ mod tests {
             &epoch,
             &events_tx,
         )
-        .expect("a wired Viewer renders");
+        .expect_frame("a wired Viewer renders");
         assert_eq!(frame.node, Some(NodeId(2)));
         assert!(!frame.is_cleared(), "the Constant must reach the viewer");
         assert_eq!(frame.packet.get::<u32>(), Some(&7));
@@ -1848,7 +2063,7 @@ mod tests {
             &epoch,
             &events_tx,
         )
-        .expect("an unconnected Viewer clears");
+        .expect_frame("an unconnected Viewer clears");
         assert!(cleared.is_cleared(), "the viewer must go blank");
         assert_eq!(cleared.node, Some(NodeId(2)));
         assert_eq!(displayed, None);
@@ -1890,7 +2105,7 @@ mod tests {
             &epoch,
             &events_tx,
         )
-        .expect("the stale image is cleared");
+        .expect_frame("the stale image is cleared");
         assert!(cleared.is_cleared());
         assert_eq!(cleared.node, None);
         assert_eq!(displayed, None);
@@ -2126,6 +2341,63 @@ mod tests {
         }
     }
 
+    /// Auto-key drags send `Batch([SetKnob, SetKnobCurve])` twice per UI frame.
+    /// The batch drain must collapse those bursts the same way it collapses
+    /// plain `SetKnob` drags, keeping the newest value and curves.
+    #[test]
+    fn batch_drain_coalesces_consecutive_auto_key_batches() {
+        let knob_batch = |value: f64, key: f64| {
+            KernelMessage::Execute(UndoableCommand::Batch(vec![
+                UndoableCommand::SetKnob {
+                    node: NodeId(2),
+                    knob: "mix".to_string(),
+                    value: KnobValue::Float(value),
+                    previous: KnobValue::Float(0.0),
+                },
+                UndoableCommand::SetKnobCurve {
+                    node: NodeId(2),
+                    name: "mix".to_string(),
+                    curves: vec![AnimationCurve {
+                        keys: vec![Keyframe {
+                            frame: 1.0,
+                            value: key,
+                            interp: InterpMode::Smooth,
+                        }],
+                    }],
+                    previous: Vec::new(),
+                },
+            ]))
+        };
+
+        let coalesced = coalesce_batch(vec![
+            knob_batch(0.1, 0.1),
+            knob_batch(0.2, 0.2),
+            knob_batch(0.3, 0.3),
+        ]);
+
+        assert_eq!(coalesced.len(), 1, "the whole burst must collapse to one");
+        match &coalesced[0] {
+            KernelMessage::Execute(UndoableCommand::Batch(cmds)) => match (&cmds[0], &cmds[1]) {
+                (
+                    UndoableCommand::SetKnob { value, .. },
+                    UndoableCommand::SetKnobCurve { curves, .. },
+                ) => {
+                    assert!(
+                        matches!(value, KnobValue::Float(v) if (v - 0.3).abs() < 1e-9),
+                        "the newest knob value must survive, got {value:?}"
+                    );
+                    assert!(
+                        (curves[0].keys[0].value - 0.3).abs() < 1e-9,
+                        "the newest curve must survive, got {:?}",
+                        curves[0].keys[0].value
+                    );
+                }
+                other => panic!("unexpected batch shape: {other:?}"),
+            },
+            other => panic!("expected one coalesced batch, got {other:?}"),
+        }
+    }
+
     #[test]
     fn batch_drain_coalesces_consecutive_set_knobs() {
         let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
@@ -2166,8 +2438,9 @@ mod tests {
                 .expect("send SetKnob");
         }
 
-        // Drain all events: only one SetKnob application should be recorded
-        // because consecutive SetKnobs for the same knob coalesce.
+        // Drain all events: the burst must collapse instead of applying 20
+        // separate knob edits. The worker may wake for the first message
+        // before the rest arrive, so allow two slices -- never one per edit.
         let mut applied_knobs = 0u32;
         let mut final_value: Option<u32> = None;
         for _ in 0..50 {
@@ -2189,9 +2462,9 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            applied_knobs, 1,
-            "20 rapid SetKnobs must coalesce into one applied event, got {applied_knobs}"
+        assert!(
+            applied_knobs <= 2,
+            "20 rapid SetKnobs must coalesce instead of applying 20 times, got {applied_knobs}"
         );
         assert_eq!(
             final_value,

@@ -350,6 +350,12 @@ pub struct Dag {
     pub max_cache_entries: usize,
     /// Monotonic recency clock, advanced to evicted priorities on eviction.
     pub global_clock: f64,
+    /// Frame requested by the most recent pull (defaults to frame 1.0).
+    ///
+    /// Used to keep a knob's static fallback synced with its animation when a
+    /// curve is edited, without threading an extra parameter through
+    /// [`Dag::apply_command`].
+    current_frame: f64,
 }
 
 impl Dag {
@@ -373,6 +379,7 @@ impl Dag {
             project_format: None,
             max_cache_entries: capacity,
             global_clock: 0.0,
+            current_frame: 1.0,
         }
     }
 
@@ -1046,6 +1053,7 @@ impl Dag {
                 curves,
                 previous,
             } => {
+                let frame = self.current_frame;
                 let target = self
                     .nodes
                     .get_mut(&node)
@@ -1054,6 +1062,15 @@ impl Dag {
                     target.curves.remove(&name);
                 } else {
                     target.curves.insert(name.clone(), curves.clone());
+                    // Keep the static fallback in sync with the frame being
+                    // evaluated. Downstream export and knob widgets that read
+                    // the base table then agree with the live curve.
+                    if target.knobs.contains_key(&name) {
+                        let resolved = target.evaluated_knobs_at(frame);
+                        if let Some(value) = resolved.get(&name).cloned() {
+                            target.knobs.insert(name.clone(), value);
+                        }
+                    }
                 }
                 self.invalidate_downstream(node);
                 Ok(UndoableCommand::SetKnobCurve {
@@ -1141,6 +1158,11 @@ impl Dag {
         }
         if !self.nodes.contains_key(&id) {
             return Err(NodeError::UnknownNode(id.0));
+        }
+        // Remember the frame being evaluated so curve edits can keep the
+        // static fallback knob synced without an extra parameter.
+        if let Some(time) = ctx.time() {
+            self.current_frame = time;
         }
         if !visiting.insert(id) {
             return Err(NodeError::CycleDetected {

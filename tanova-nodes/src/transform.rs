@@ -14,7 +14,7 @@ use tanova_kernel::{
 use tanova_render::coords::BBox;
 use tanova_render::{
     Channel, ChannelPlane, EvalContextGpu, Mat3x3, Raster2D, TILE_SIZE, TileBuffer, TileCoord,
-    transform_gathered_tile,
+    TransformChain, transform_gathered_tile,
 };
 
 use crate::util::{color_knob, float_knob, format_color, format_float, raster_input};
@@ -92,10 +92,32 @@ impl NodeTrait for TransformNode {
             None => input.format.to_bbox(),
         };
 
-        // A scale near zero would make the affine matrix singular. Instead of
-        // rejecting it, emit a fully transparent raster so downstream Merge2
-        // compositing never breaks.
-        if scale.abs() < 1e-4 {
+        let matrix = transform_matrix(translate, center, rotate, scale);
+
+        // Fold this node into an upstream contiguous transform chain when one
+        // is present. The whole chain then resamples ONCE from the original
+        // source raster, so a downscale followed by an upscale never
+        // double-filters (and never softens) the pixels.
+        let upstream_chain = inputs
+            .first()
+            .and_then(|packet| packet.get::<TransformChain>());
+        let chained = upstream_chain.map(|chain| chain.chain(&matrix));
+        let source: &Raster2D = match &chained {
+            Some(chain) => chain.source_raster.as_ref(),
+            None => input,
+        };
+        let forward = match &chained {
+            Some(chain) => chain.combined_matrix,
+            None => matrix,
+        };
+
+        let governor = ctx.governor();
+        let gpu = ctx.gpu();
+
+        // A singular matrix (including a zero scale) would make inverse
+        // mapping meaningless. Instead of rejecting it, emit a fully
+        // transparent raster so downstream compositing never breaks.
+        let Some(inverse) = forward.inverse() else {
             let mut output = Raster2D::new(input.format.clone(), output_bbox, input.edge_mode);
             let mut red = ChannelPlane::new();
             let mut green = ChannelPlane::new();
@@ -112,81 +134,87 @@ impl NodeTrait for TransformNode {
             output.insert_channel(Channel::RgbaBlue, blue);
             output.insert_channel(Channel::RgbaAlpha, alpha);
             let mut packet = Packet::new();
-            packet.insert(output);
+            packet.insert(output.clone());
+            // Downstream Transform nodes can keep chaining from the blank.
+            packet.insert(TransformChain::new(Arc::new(output), Mat3x3::identity()));
             return Ok(packet);
-        }
+        };
 
-        let matrix = transform_matrix(translate, center, rotate, scale);
-        let inverse = matrix.inverse().ok_or_else(|| NodeError::InvalidKnob {
-            knob: "scale".to_string(),
-            reason: "the affine matrix is singular".to_string(),
-        })?;
-
-        let governor = ctx.governor();
-        let gpu = ctx.gpu();
-
-        let mut output = Raster2D::new(input.format.clone(), output_bbox, input.edge_mode);
-        // Only RGBA participates in resampling; AOV planes keep their upstream
-        // tiles by reference.
-        for (channel, plane) in input.channels.iter() {
-            if !is_rgba(channel) {
-                output.insert_channel(channel.clone(), plane.clone());
-            }
-        }
-
-        let mut red = ChannelPlane::new();
-        let mut green = ChannelPlane::new();
-        let mut blue = ChannelPlane::new();
-        let mut alpha = ChannelPlane::new();
-
-        for tile in output_bbox.tile_coords() {
-            let (origin_x, origin_y) = tile.origin_world();
-            let Some((gx0, gy0, gx1, gy1)) = gather_bounds(input, &inverse, origin_x, origin_y)
-            else {
-                insert_uniform(&mut red, tile, 0.0);
-                insert_uniform(&mut green, tile, 0.0);
-                insert_uniform(&mut blue, tile, 0.0);
-                insert_uniform(&mut alpha, tile, 0.0);
-                continue;
-            };
-
-            let gathered_width = (gx1 - gx0) as u32;
-            let gathered_height = (gy1 - gy0) as u32;
-            let mut gathered = Vec::with_capacity((gathered_width * gathered_height * 4) as usize);
-            for y in gy0..gy1 {
-                for x in gx0..gx1 {
-                    gathered.extend_from_slice(&input.sample_rgba(x, y));
+        // A chained identity transform is a mathematical no-op: hand the
+        // source straight through instead of paying for a bilinear pass. The
+        // bbox guard keeps a project-format resize from being skipped.
+        let output =
+            if chained.is_some() && output_bbox == source.bbox && is_identity(&forward, 1e-5) {
+                source.clone()
+            } else {
+                let mut output = Raster2D::new(input.format.clone(), output_bbox, input.edge_mode);
+                // Only RGBA participates in resampling; AOV planes keep their
+                // upstream tiles by reference.
+                for (channel, plane) in source.channels.iter() {
+                    if !is_rgba(channel) {
+                        output.insert_channel(channel.clone(), plane.clone());
+                    }
                 }
-            }
 
-            // Fold the tile origin and gathered origin into the inverse so the
-            // kernel works in local 0..255 output coordinates.
-            let tile_inverse = Mat3x3::translate(-(gx0 as f32), -(gy0 as f32))
-                .mul(&inverse)
-                .mul(&Mat3x3::translate(origin_x as f32, origin_y as f32));
+                let mut red = ChannelPlane::new();
+                let mut green = ChannelPlane::new();
+                let mut blue = ChannelPlane::new();
+                let mut alpha = ChannelPlane::new();
 
-            let pixels = transform_gathered_tile(
-                &gathered,
-                gathered_width,
-                gathered_height,
-                &tile_inverse,
-                gpu,
-            )?;
-            insert_dense(
-                [&mut red, &mut green, &mut blue, &mut alpha],
-                tile,
-                &pixels,
-                governor,
-            )?;
-        }
+                for tile in output_bbox.tile_coords() {
+                    let (origin_x, origin_y) = tile.origin_world();
+                    let Some((gx0, gy0, gx1, gy1)) =
+                        gather_bounds(source, &inverse, origin_x, origin_y)
+                    else {
+                        insert_uniform(&mut red, tile, 0.0);
+                        insert_uniform(&mut green, tile, 0.0);
+                        insert_uniform(&mut blue, tile, 0.0);
+                        insert_uniform(&mut alpha, tile, 0.0);
+                        continue;
+                    };
 
-        output.insert_channel(Channel::RgbaRed, red);
-        output.insert_channel(Channel::RgbaGreen, green);
-        output.insert_channel(Channel::RgbaBlue, blue);
-        output.insert_channel(Channel::RgbaAlpha, alpha);
+                    let gathered_width = (gx1 - gx0) as u32;
+                    let gathered_height = (gy1 - gy0) as u32;
+                    let mut gathered =
+                        Vec::with_capacity((gathered_width * gathered_height * 4) as usize);
+                    for y in gy0..gy1 {
+                        for x in gx0..gx1 {
+                            gathered.extend_from_slice(&source.sample_rgba(x, y));
+                        }
+                    }
+
+                    // Fold the tile origin and gathered origin into the inverse so
+                    // the kernel works in local 0..255 output coordinates.
+                    let tile_inverse = Mat3x3::translate(-(gx0 as f32), -(gy0 as f32))
+                        .mul(&inverse)
+                        .mul(&Mat3x3::translate(origin_x as f32, origin_y as f32));
+
+                    let pixels = transform_gathered_tile(
+                        &gathered,
+                        gathered_width,
+                        gathered_height,
+                        &tile_inverse,
+                        gpu,
+                    )?;
+                    insert_dense(
+                        [&mut red, &mut green, &mut blue, &mut alpha],
+                        tile,
+                        &pixels,
+                        governor,
+                    )?;
+                }
+
+                output.insert_channel(Channel::RgbaRed, red);
+                output.insert_channel(Channel::RgbaGreen, green);
+                output.insert_channel(Channel::RgbaBlue, blue);
+                output.insert_channel(Channel::RgbaAlpha, alpha);
+                output
+            };
 
         let mut packet = Packet::new();
         packet.insert(output);
+        let chain = chained.unwrap_or_else(|| TransformChain::new(Arc::new(input.clone()), matrix));
+        packet.insert(chain);
         Ok(packet)
     }
 
@@ -262,6 +290,16 @@ fn is_rgba(channel: &Channel) -> bool {
         channel,
         Channel::RgbaRed | Channel::RgbaGreen | Channel::RgbaBlue | Channel::RgbaAlpha
     )
+}
+
+/// `true` when every coefficient of `matrix` is within `epsilon` of identity.
+fn is_identity(matrix: &Mat3x3, epsilon: f32) -> bool {
+    let identity = Mat3x3::identity();
+    (0..3).all(|row| {
+        let actual = matrix.row(row);
+        let expected = identity.row(row);
+        (0..3).all(|column| (actual[column] - expected[column]).abs() <= epsilon)
+    })
 }
 
 fn insert_uniform(plane: &mut ChannelPlane, tile: TileCoord, value: f32) {
@@ -577,6 +615,58 @@ mod tests {
         assert!(text.starts_with("Transform {"), "got {text}");
         for knob in ["translate", "rotate", "scale", "center"] {
             assert!(text.contains(knob), "missing {knob}: {text}");
+        }
+    }
+
+    #[test]
+    fn chained_transforms_concatenate_matrices_and_preserve_sharp_pixels() {
+        use crate::checkerboard::{CheckerBoardNode, default_knobs as checker_defaults};
+
+        // A crisp 128x128 checkerboard with 16px cells.
+        let mut checker_knobs = checker_defaults();
+        checker_knobs.insert("format_width", KnobValue::Int(128));
+        checker_knobs.insert("format_height", KnobValue::Int(128));
+        checker_knobs.insert("boxsize", KnobValue::Int(16));
+        let checker = CheckerBoardNode::from_knobs(checker_knobs)
+            .evaluate(&EvalContext::new(), &[])
+            .expect("checkerboard evaluates");
+        let original = checker.get::<Raster2D>().expect("raster").clone();
+
+        // Downscale by 0.25, then upscale by 4.0. Chained, the two matrices
+        // multiply to identity and the original sharp pixels come straight
+        // back; unchained, the upscale would resample the blurry downscale.
+        let down = TransformNode::new()
+            .evaluate(
+                &context(DEFAULT_TRANSLATE, 0.0, 0.25, DEFAULT_CENTER),
+                &[checker],
+            )
+            .expect("downscale evaluates");
+        assert!(
+            down.get::<TransformChain>().is_some(),
+            "Transform must publish its chain in the packet"
+        );
+
+        let up = TransformNode::new()
+            .evaluate(
+                &context(DEFAULT_TRANSLATE, 0.0, 4.0, DEFAULT_CENTER),
+                &[down],
+            )
+            .expect("upscale evaluates");
+        let output = up.get::<Raster2D>().expect("raster");
+
+        // The chained identity hands back the original source raster, so
+        // pixels are bit-for-bit the sharp checkerboard.
+        for y in (0..128).step_by(8) {
+            for x in (0..128).step_by(8) {
+                let expected = original.sample_rgba(x, y);
+                let actual = output.sample_rgba(x, y);
+                for channel in 0..4 {
+                    assert!(
+                        (actual[channel] - expected[channel]).abs() < 1e-6,
+                        "({x}, {y}) channel {channel}: expected {expected:?}, got {actual:?}"
+                    );
+                }
+            }
         }
     }
 }

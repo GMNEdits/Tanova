@@ -34,7 +34,15 @@ const JACK_SHAFT_HIT_RADIUS: f32 = 8.0;
 const JACK_X_COLOR: Color32 = Color32::from_rgb(232, 72, 72);
 const JACK_Y_COLOR: Color32 = Color32::from_rgb(84, 210, 96);
 /// Gold tick marks for keyframes on the timeline rail.
-const KEYFRAME_TICK: Color32 = Color32::from_rgb(255, 200, 60);
+const KEYFRAME_TICK: Color32 = Color32::from_rgb(255, 200, 50);
+/// Recessed timeline scrubber track fill.
+const TRACK_BG: Color32 = Color32::from_rgb(22, 24, 29);
+/// Timeline scrubber track border.
+const TRACK_BORDER: Color32 = Color32::from_rgb(55, 60, 70);
+/// Muted ruler ticks and frame numbers under the timeline track.
+const RULER_TICK: Color32 = Color32::from_rgb(75, 82, 95);
+/// High-contrast playhead line and cap.
+const PLAYHEAD_COLOR: Color32 = Color32::from_rgb(245, 135, 35);
 
 /// Restricts a jack drag to one Nuke axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +88,11 @@ pub struct ViewerPanel {
     frame: Option<Arc<Packet>>,
     texture: Option<TextureHandle>,
     dirty: bool,
+    /// Last whole frame handed to the kernel as `SetTime`.
+    ///
+    /// Deduplicates scrub/playback messages so a 60 Hz UI does not queue
+    /// duplicate renders for a frame the kernel already has.
+    last_sent_frame: Option<i64>,
     /// In-flight transform jack drag, if any.
     jack_drag: Option<JackDragState>,
 }
@@ -97,6 +110,7 @@ impl Default for ViewerPanel {
             frame: None,
             texture: None,
             dirty: true,
+            last_sent_frame: None,
             jack_drag: None,
         }
     }
@@ -122,10 +136,34 @@ impl DisplayTransformLabel for DisplayTransform {
     }
 }
 
+/// Queues `SetTime(frame)` unless the kernel already has that whole frame.
+///
+/// Playback and scrubbing can call this many times per second with the same
+/// rounded frame; re-sending would queue redundant renders and make the
+/// timeline feel laggy.
+fn push_set_time(last_sent: &mut Option<i64>, frame: f64, messages: &mut Vec<KernelMessage>) {
+    let rounded = frame.round() as i64;
+    if *last_sent == Some(rounded) {
+        return;
+    }
+    *last_sent = Some(rounded);
+    messages.push(KernelMessage::SetTime(frame));
+}
+
 impl ViewerPanel {
     /// Creates an empty viewer.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records that `frame` already reached the kernel from outside the
+    /// timeline.
+    ///
+    /// Playback advances the frame through `TanovaApp::dispatch`, so the
+    /// timeline's own dedupe state must follow along; otherwise scrubbing back
+    /// to that frame later would be suppressed and the viewer would stall.
+    pub fn note_frame_sent(&mut self, frame: f64) {
+        self.last_sent_frame = Some(frame.round() as i64);
     }
 
     /// Current viewer target.
@@ -329,6 +367,8 @@ impl ViewerPanel {
             (end, start)
         };
 
+        // Keep the height reservation identical: the viewer panel relies on it
+        // to avoid the egui 0.37 panel-growth feedback loop.
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), TIMELINE_HEIGHT),
             Layout::left_to_right(Align::Center),
@@ -342,48 +382,154 @@ impl ViewerPanel {
                 if ui.button("[< Key]").clicked() {
                     if let Some(previous) = keyframes.iter().rev().find(|key| **key < frame) {
                         *current = *previous as f64;
-                        messages.push(KernelMessage::SetTime(*current));
+                        push_set_time(&mut self.last_sent_frame, *current, &mut messages);
                     }
                 }
                 if ui.button("[Key >]").clicked() {
                     if let Some(next) = keyframes.iter().find(|key| **key > frame) {
                         *current = *next as f64;
-                        messages.push(KernelMessage::SetTime(*current));
+                        push_set_time(&mut self.last_sent_frame, *current, &mut messages);
                     }
                 }
 
-                let mut frame = current.round() as i64;
-                let slider = ui.add(
-                    egui::Slider::new(&mut frame, start..=end)
-                        .text("frame")
-                        .integer(),
+                // Compact exact-frame field. Typing a frame is often faster
+                // than hitting a 1-pixel-wide tick.
+                let mut frame_value = *current;
+                let frame_drag = ui.add(
+                    egui::DragValue::new(&mut frame_value)
+                        .speed(0.25)
+                        .range(start as f64..=end as f64)
+                        .max_decimals(0),
                 );
-                if slider.changed() {
-                    *current = frame as f64;
-                    messages.push(KernelMessage::SetTime(*current));
+                if frame_drag.changed() {
+                    *current = frame_value.round().clamp(start as f64, end as f64);
+                    push_set_time(&mut self.last_sent_frame, *current, &mut messages);
                 }
 
-                // Gold ticks mark every keyframe on the slider rail.
-                let span = (end - start) as f32;
-                if span > 0.0 {
-                    for key in keyframes {
-                        if *key < start || *key > end {
-                            continue;
-                        }
-                        let t = (*key - start) as f32 / span;
-                        let x = slider.rect.left() + t * slider.rect.width();
-                        ui.painter().line_segment(
-                            [
-                                Pos2::new(x, slider.rect.center().y - 6.0),
-                                Pos2::new(x, slider.rect.center().y + 6.0),
-                            ],
-                            Stroke::new(2.0, KEYFRAME_TICK),
+                // Full-width scrubber track. The `- 70.0` leaves room for the
+                // range readout on the right; the `.max(120.0)` keeps a usable
+                // rail on very narrow panels.
+                let track_width = (ui.available_width() - 70.0).max(120.0);
+                let (track_rect, track_resp) = ui.allocate_exact_size(
+                    egui::vec2(track_width, 22.0),
+                    egui::Sense::click_and_drag(),
+                );
+                let painter = ui.painter();
+
+                let rail_left = track_rect.left() + 8.0;
+                let rail_right = track_rect.right() - 8.0;
+                let rail_w = (rail_right - rail_left).max(1.0);
+                let span = (end - start) as f64;
+                let frame_to_x = |f: f64| -> f32 {
+                    if span <= 0.0 {
+                        rail_left
+                    } else {
+                        let t = ((f - start as f64) / span).clamp(0.0, 1.0) as f32;
+                        rail_left + t * rail_w
+                    }
+                };
+
+                // 1. Recessed track.
+                painter.rect(
+                    track_rect,
+                    3.0,
+                    TRACK_BG,
+                    Stroke::new(1.0, TRACK_BORDER),
+                    StrokeKind::Inside,
+                );
+
+                // 2. Ruler ticks every 5 frames, labels every 20. Minor ticks
+                // hug the bottom half so the gold keys and playhead read first.
+                let first_tick = start.div_euclid(5).saturating_add(1) * 5;
+                let mut tick = first_tick;
+                while tick <= end {
+                    let x = frame_to_x(tick as f64);
+                    let major = tick % 20 == 0;
+                    let height = if major { 6.0 } else { 3.0 };
+                    painter.line_segment(
+                        [
+                            Pos2::new(x, track_rect.bottom() - 1.0 - height),
+                            Pos2::new(x, track_rect.bottom() - 1.0),
+                        ],
+                        Stroke::new(1.0, RULER_TICK),
+                    );
+                    if major {
+                        // Labels sit inside the 22px track, just above the
+                        // tick marks, so the timeline reservation never has to
+                        // grow to fit them.
+                        painter.text(
+                            Pos2::new(x, track_rect.bottom() - 7.0),
+                            Align2::CENTER_BOTTOM,
+                            tick.to_string(),
+                            FontId::proportional(8.0),
+                            RULER_TICK,
                         );
                     }
+                    tick += 5;
+                }
+                // Always label the range start, so frame 1 is never ambiguous.
+                painter.text(
+                    Pos2::new(frame_to_x(start as f64) + 2.0, track_rect.bottom() - 7.0),
+                    Align2::LEFT_BOTTOM,
+                    start.to_string(),
+                    FontId::proportional(8.0),
+                    RULER_TICK,
+                );
+
+                // 3. Exact keyframe ticks. Both these and the playhead go
+                // through `frame_to_x`, so a key on the current frame lines up
+                // perfectly under the playhead.
+                for key in keyframes {
+                    if *key < start || *key > end {
+                        continue;
+                    }
+                    let x = frame_to_x(*key as f64);
+                    painter.line_segment(
+                        [
+                            Pos2::new(x, track_rect.top() + 2.0),
+                            Pos2::new(x, track_rect.bottom() - 2.0),
+                        ],
+                        Stroke::new(2.5, KEYFRAME_TICK),
+                    );
                 }
 
-                ui.separator();
-                ui.label(format!("{:.0} / {}", current.round(), end));
+                // 4. Playhead line plus a small top cap.
+                let playhead_x = frame_to_x(current.round());
+                painter.line_segment(
+                    [
+                        Pos2::new(playhead_x, track_rect.top()),
+                        Pos2::new(playhead_x, track_rect.bottom()),
+                    ],
+                    Stroke::new(2.0, PLAYHEAD_COLOR),
+                );
+                painter.add(Shape::convex_polygon(
+                    vec![
+                        Pos2::new(playhead_x - 5.0, track_rect.top()),
+                        Pos2::new(playhead_x + 5.0, track_rect.top()),
+                        Pos2::new(playhead_x, track_rect.top() + 6.0),
+                    ],
+                    PLAYHEAD_COLOR,
+                    Stroke::NONE,
+                ));
+
+                // Scrubbing: click or drag anywhere on the track maps the
+                // pointer back through the same rail geometry.
+                if (track_resp.clicked() || track_resp.dragged())
+                    && let Some(mouse_pos) = track_resp.interact_pointer_pos()
+                {
+                    let t = ((mouse_pos.x - rail_left) / rail_w).clamp(0.0, 1.0) as f64;
+                    let frame = (start as f64 + t * span).round();
+                    *current = frame;
+                    push_set_time(&mut self.last_sent_frame, frame, &mut messages);
+                }
+
+                // Scrubbing and playback must redraw even when the pointer is
+                // still, so the playhead and properties readouts stay live.
+                if *playing || track_resp.dragged() {
+                    ui.ctx().request_repaint();
+                }
+
+                ui.label(format!("{start}..{end}"));
             },
         );
 
@@ -960,6 +1106,37 @@ fn draw_dashed_rect(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
 mod tests {
     use super::*;
     use tanova_render::{EdgeMode, Format};
+
+    #[test]
+    fn set_time_is_only_sent_when_the_whole_frame_changes() {
+        let mut last = None;
+        let mut messages = Vec::new();
+
+        push_set_time(&mut last, 5.0, &mut messages);
+        push_set_time(&mut last, 5.0, &mut messages);
+        // A fractional scrub that rounds to the same frame is a duplicate.
+        push_set_time(&mut last, 5.4, &mut messages);
+        push_set_time(&mut last, 6.0, &mut messages);
+
+        assert_eq!(
+            messages.len(),
+            2,
+            "only frames 5 and 6 should reach the kernel"
+        );
+        assert!(matches!(messages[0], KernelMessage::SetTime(t) if (t - 5.0).abs() < 1e-9));
+        assert!(matches!(messages[1], KernelMessage::SetTime(t) if (t - 6.0).abs() < 1e-9));
+
+        // Playback advances the frame outside `show_timeline`; the panel must
+        // learn about it, or scrubbing back to that frame would be suppressed.
+        let mut viewer = ViewerPanel::new();
+        viewer.note_frame_sent(9.0);
+        assert_eq!(viewer.last_sent_frame, Some(9));
+        let mut messages = Vec::new();
+        push_set_time(&mut viewer.last_sent_frame, 9.0, &mut messages);
+        assert!(messages.is_empty(), "frame 9 already reached the kernel");
+        push_set_time(&mut viewer.last_sent_frame, 10.0, &mut messages);
+        assert_eq!(messages.len(), 1, "a new frame must still be sent");
+    }
 
     #[test]
     fn fit_uses_the_format_not_the_data_window() {
