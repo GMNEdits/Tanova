@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use tanova_kernel::{MemoryGovernor, NodeError};
 
-use crate::coords::{BBox, EdgeMode, TILE_PIXELS, TILE_SIZE, TileCoord};
+use crate::coords::{BBox, EdgeMode, TILE_PIXELS, TILE_SIZE, TileCoord, world_to_tile};
 use crate::matrix::Mat3x3;
 use crate::shader::{BlurParams, GpuComputeEngine, GradeParams, MergeParams, TransformParams};
-use crate::tile::{Channel, ChannelPlane, Raster2D, TileBuffer};
+use crate::tile::{Channel, ChannelPlane, Raster2D, TileBuffer, extract_padded_tile};
 
 /// `Grade` parameters in Nuke's knob order.
 #[derive(Debug, Clone, PartialEq)]
@@ -210,6 +210,17 @@ impl MergeOp {
             }
         }
     }
+}
+
+/// Optical defocus parameters: disk radius, anamorphic aspect, and blend.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DefocusOp {
+    /// Blur radius in pixels.
+    pub radius: f32,
+    /// Anamorphic aspect (`radius_x / radius_y`).
+    pub aspect: f32,
+    /// Blend between the untouched and defocused result.
+    pub mix: f32,
 }
 
 fn map2(a: [f32; 4], b: [f32; 4], f: impl Fn(f32, f32) -> f32) -> [f32; 4] {
@@ -672,6 +683,133 @@ pub fn merge_raster(
     Ok(output)
 }
 
+/// Samples all four RGBA channels, defaulting missing planes to `0.0`.
+fn sample_rgba_zero(raster: &Raster2D, x: i32, y: i32) -> [f32; 4] {
+    [
+        raster.sample(&Channel::RgbaRed, x, y),
+        raster.sample(&Channel::RgbaGreen, x, y),
+        raster.sample(&Channel::RgbaBlue, x, y),
+        raster.sample(&Channel::RgbaAlpha, x, y),
+    ]
+}
+
+/// Bilinearly samples one RGBA pixel at `x, y` in pixel-index space.
+///
+/// Pixel `(ix, iy)` is centered at integer `(ix, iy)`, so an integer sample
+/// lands exactly on that pixel. Samples outside `raster.bbox` are transparent
+/// black.
+fn bilinear_at(raster: &Raster2D, x: f32, y: f32) -> [f32; 4] {
+    if x < raster.bbox.min_x as f32
+        || x >= raster.bbox.max_x as f32
+        || y < raster.bbox.min_y as f32
+        || y >= raster.bbox.max_y as f32
+    {
+        return [0.0; 4];
+    }
+
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+
+    let c00 = sample_rgba_zero(raster, x0, y0);
+    let c10 = sample_rgba_zero(raster, x1, y0);
+    let c01 = sample_rgba_zero(raster, x0, y1);
+    let c11 = sample_rgba_zero(raster, x1, y1);
+
+    let mut out = [0.0f32; 4];
+    for channel in 0..4 {
+        let top = c00[channel] * (1.0 - fx) + c10[channel] * fx;
+        let bottom = c01[channel] * (1.0 - fx) + c11[channel] * fx;
+        out[channel] = top * (1.0 - fy) + bottom * fy;
+    }
+    out
+}
+
+/// Inverse-sampled perspective warp of `input` over `output_bbox`.
+///
+/// `forward_matrix` maps input pixels into output space, so its inverse maps
+/// each output pixel back to a bilinearly sampled input source. Pixels whose
+/// source misses `input` render transparent black. `input.format` is
+/// preserved on the output and non-RGBA AOV planes are carried over
+/// zero-copy via `Arc`.
+pub fn perspective_warp_raster(
+    input: &Raster2D,
+    forward_matrix: &Mat3x3,
+    output_bbox: BBox,
+    governor: Option<&MemoryGovernor>,
+) -> Result<Raster2D, NodeError> {
+    let Some(inverse) = forward_matrix.inverse_projective() else {
+        let mut output = Raster2D::new(input.format.clone(), output_bbox, input.edge_mode);
+        for (channel, plane) in input.channels.iter() {
+            if !is_rgba_channel(channel) {
+                output.insert_channel(channel.clone(), plane.clone());
+            }
+        }
+        return Ok(output);
+    };
+
+    let mut output = input.clone();
+    output.bbox = output_bbox;
+    output
+        .channels
+        .retain(|channel, _| !is_rgba_channel(channel));
+
+    let mut red = ChannelPlane::new();
+    let mut green = ChannelPlane::new();
+    let mut blue = ChannelPlane::new();
+    let mut alpha = ChannelPlane::new();
+
+    for tile in output_bbox.tile_coords() {
+        let mut pixels = Vec::with_capacity(TILE_PIXELS);
+        let (origin_x, origin_y) = tile.origin_world();
+        for ly in 0..TILE_SIZE {
+            for lx in 0..TILE_SIZE {
+                let world_x = origin_x + lx as i32;
+                let world_y = origin_y + ly as i32;
+                let rgba = match inverse.project_point(world_x as f32 + 0.5, world_y as f32 + 0.5) {
+                    Some(source) => bilinear_at(input, source[0] - 0.5, source[1] - 0.5),
+                    None => [0.0; 4],
+                };
+                pixels.push(rgba);
+            }
+        }
+
+        let mut firsts = [0.0f32; 4];
+        let mut uniform = [true; 4];
+        for channel in 0..4 {
+            firsts[channel] = pixels[0][channel];
+            for pixel in &pixels {
+                if pixel[channel] != firsts[channel] {
+                    uniform[channel] = false;
+                }
+            }
+        }
+
+        for (channel, plane) in [
+            (0, &mut red),
+            (1, &mut green),
+            (2, &mut blue),
+            (3, &mut alpha),
+        ] {
+            if uniform[channel] {
+                insert_uniform(plane, tile, firsts[channel]);
+            } else {
+                let values: Vec<f32> = pixels.iter().map(|pixel| pixel[channel]).collect();
+                plane.insert(tile, Arc::new(TileBuffer::from_vec(values, governor)?));
+            }
+        }
+    }
+
+    output.insert_channel(Channel::RgbaRed, red);
+    output.insert_channel(Channel::RgbaGreen, green);
+    output.insert_channel(Channel::RgbaBlue, blue);
+    output.insert_channel(Channel::RgbaAlpha, alpha);
+    Ok(output)
+}
+
 fn gather_merge_inputs(
     background: &Raster2D,
     foreground: &Raster2D,
@@ -716,6 +854,257 @@ fn insert_dense(
         plane.insert(tile, Arc::new(TileBuffer::from_vec(values, governor)?));
     }
     Ok(())
+}
+
+/// Returns `Some(v)` when every sample of `region` on `raster` equals `v`
+/// (edge mode respected), else `None`. Absent tiles resolve through `edge_mode`.
+fn region_uniform_value(raster: &Raster2D, channel: &Channel, region: BBox) -> Option<f32> {
+    if region.is_empty() {
+        return Some(0.0);
+    }
+
+    let (min_tile, _, _) = world_to_tile(region.min_x, region.min_y);
+    let (max_tile, _, _) = world_to_tile(region.max_x - 1, region.max_y - 1);
+
+    let mut value: Option<f32> = None;
+    for ty in min_tile.ty..=max_tile.ty {
+        for tx in min_tile.tx..=max_tile.tx {
+            let tile = TileCoord::new(tx, ty);
+            let overlap = region.intersection(&tile.to_bbox());
+            if overlap.is_empty() {
+                continue;
+            }
+
+            if overlap == tile.to_bbox() {
+                // Whole tile covered: a collapsed tile is uniform by itself,
+                // an absent tile resolves through `edge_mode`, and a dense
+                // tile is not uniform and forces the dense path.
+                let candidate = match raster.channel(channel).and_then(|plane| plane.get(&tile)) {
+                    None => {
+                        Some(raster.sample(channel, tile.origin_world().0, tile.origin_world().1))
+                    }
+                    Some(buffer) => buffer.is_uniform(),
+                };
+                let c = candidate?;
+                match value {
+                    Some(existing) if c == existing => {}
+                    Some(_) => return None,
+                    None => value = Some(c),
+                }
+                continue;
+            }
+
+            // Partial overlap: inspect every sample, resolving through edge mode.
+            for y in overlap.min_y..overlap.max_y {
+                for x in overlap.min_x..overlap.max_x {
+                    let sample = raster.sample(channel, x, y);
+                    match value {
+                        Some(existing) if sample == existing => {}
+                        Some(_) => return None,
+                        None => value = Some(sample),
+                    }
+                }
+            }
+        }
+    }
+
+    Some(value.unwrap_or(0.0))
+}
+
+/// Uniform mask value over `region`, or `None` when the mask must be sampled.
+fn region_mask_uniform(mask: Option<&Raster2D>, region: BBox) -> Option<f32> {
+    let Some(mask) = mask else {
+        return Some(1.0);
+    };
+    let channel = if mask.channels.contains_key(&Channel::RgbaAlpha) {
+        &Channel::RgbaAlpha
+    } else if mask.channels.contains_key(&Channel::RgbaRed) {
+        &Channel::RgbaRed
+    } else {
+        return Some(1.0);
+    };
+    region_uniform_value(mask, channel, region)
+}
+
+/// Optical circular-aperture defocus of `input`.
+///
+/// Convolves every RGBA channel with an anti-aliased elliptical disk kernel
+/// and blends the result back with the source by `mix` times the mask value.
+/// `input.format` is preserved on the output and non-RGBA AOV planes are
+/// carried over zero-copy via `Arc`.
+pub fn defocus_raster(
+    input: &Raster2D,
+    mask: Option<&Raster2D>,
+    op: &DefocusOp,
+    governor: Option<&MemoryGovernor>,
+) -> Result<Raster2D, NodeError> {
+    if op.radius <= 0.01 || op.mix <= 0.0 {
+        return Ok(input.clone());
+    }
+
+    let radius = op.radius.clamp(0.0, 24.0);
+    let aspect = op.aspect.clamp(0.25, 4.0);
+    let r_x = ((radius * aspect).ceil() as i32).min(24);
+    let r_y = (radius.ceil() as i32).min(24);
+
+    // Anti-aliased elliptical disk kernel, normalized to sum to 1.0.
+    let mut taps: Vec<(i32, i32, f32)> = Vec::new();
+    let mut weight_sum = 0.0f32;
+    for dy in -r_y..=r_y {
+        for dx in -r_x..=r_x {
+            let dist = ((dx as f32 / aspect).powi(2) + (dy as f32).powi(2)).sqrt();
+            let weight = (radius + 0.5 - dist).clamp(0.0, 1.0);
+            if weight > 1e-6 {
+                weight_sum += weight;
+                taps.push((dx, dy, weight));
+            }
+        }
+    }
+    for tap in &mut taps {
+        tap.2 /= weight_sum;
+    }
+
+    let output_bbox = BBox::new(
+        input.bbox.min_x.saturating_sub(r_x),
+        input.bbox.min_y.saturating_sub(r_y),
+        input.bbox.max_x.saturating_add(r_x),
+        input.bbox.max_y.saturating_add(r_y),
+    );
+
+    let mut output = input.clone();
+    output.bbox = output_bbox;
+    output
+        .channels
+        .retain(|channel, _| !is_rgba_channel(channel));
+
+    let mut red = ChannelPlane::new();
+    let mut green = ChannelPlane::new();
+    let mut blue = ChannelPlane::new();
+    let mut alpha = ChannelPlane::new();
+
+    let apron = r_x.max(r_y) as usize;
+    let stride = TILE_SIZE as usize + 2 * apron;
+    let empty_plane = ChannelPlane::new();
+
+    for tile in output_bbox.tile_coords() {
+        let tile_bbox = tile.to_bbox();
+        let padded_region = BBox::new(
+            tile_bbox.min_x.saturating_sub(r_x),
+            tile_bbox.min_y.saturating_sub(r_y),
+            tile_bbox.max_x.saturating_add(r_x),
+            tile_bbox.max_y.saturating_add(r_y),
+        );
+
+        // Uniform fast path: when the whole padded region (and the mask)
+        // collapses to one value, the convolved tile is that same value and
+        // costs the governor nothing.
+        let channels = [
+            Channel::RgbaRed,
+            Channel::RgbaGreen,
+            Channel::RgbaBlue,
+            Channel::RgbaAlpha,
+        ];
+        let mut channel_values: [Option<f32>; 4] = [None; 4];
+        let mut all_uniform = true;
+        for (channel, channel_id) in channels.iter().enumerate() {
+            match region_uniform_value(input, channel_id, padded_region) {
+                Some(value) => channel_values[channel] = Some(value),
+                None => {
+                    all_uniform = false;
+                    break;
+                }
+            }
+        }
+
+        if all_uniform {
+            if let Some(mask_value) = region_mask_uniform(mask, padded_region) {
+                let _ = (op.mix * mask_value).clamp(0.0, 1.0);
+                // A uniform region convolves to itself, and blending a value
+                // with itself leaves it unchanged.
+                let mut planes = [&mut red, &mut green, &mut blue, &mut alpha];
+                for (channel, plane) in planes.iter_mut().enumerate() {
+                    insert_uniform(plane, tile, channel_values[channel].unwrap());
+                }
+                continue;
+            }
+        }
+
+        // Dense path: one padded extract per channel, one convolution pass
+        // over all four RGBA channels per pixel.
+        let red_padded = extract_padded_tile(
+            input.channel(&Channel::RgbaRed).unwrap_or(&empty_plane),
+            tile,
+            apron as u32,
+            input.bbox,
+            input.edge_mode,
+        );
+        let green_padded = extract_padded_tile(
+            input.channel(&Channel::RgbaGreen).unwrap_or(&empty_plane),
+            tile,
+            apron as u32,
+            input.bbox,
+            input.edge_mode,
+        );
+        let blue_padded = extract_padded_tile(
+            input.channel(&Channel::RgbaBlue).unwrap_or(&empty_plane),
+            tile,
+            apron as u32,
+            input.bbox,
+            input.edge_mode,
+        );
+        let alpha_padded = extract_padded_tile(
+            input.channel(&Channel::RgbaAlpha).unwrap_or(&empty_plane),
+            tile,
+            apron as u32,
+            input.bbox,
+            input.edge_mode,
+        );
+
+        let mut out = Vec::with_capacity(TILE_PIXELS * 4);
+        let (origin_x, origin_y) = tile.origin_world();
+        for ly in 0..TILE_SIZE {
+            for lx in 0..TILE_SIZE {
+                let ly = ly as usize;
+                let lx = lx as usize;
+                let base = (ly + apron) * stride + lx + apron;
+                let mut acc = [0.0f32; 4];
+                for &(dx, dy, w) in &taps {
+                    let row = (ly as i32 + apron as i32 + dy) as usize;
+                    let col = (lx as i32 + apron as i32 + dx) as usize;
+                    let index = row * stride + col;
+                    acc[0] += red_padded[index] * w;
+                    acc[1] += green_padded[index] * w;
+                    acc[2] += blue_padded[index] * w;
+                    acc[3] += alpha_padded[index] * w;
+                }
+                let orig = [
+                    red_padded[base],
+                    green_padded[base],
+                    blue_padded[base],
+                    alpha_padded[base],
+                ];
+                let world_x = origin_x + lx as i32;
+                let world_y = origin_y + ly as i32;
+                let effective_mix = (op.mix * mask_value(mask, world_x, world_y)).clamp(0.0, 1.0);
+                for channel in 0..4 {
+                    out.push(orig[channel] + (acc[channel] - orig[channel]) * effective_mix);
+                }
+            }
+        }
+
+        insert_dense(
+            [&mut red, &mut green, &mut blue, &mut alpha],
+            tile,
+            &out,
+            governor,
+        )?;
+    }
+
+    output.insert_channel(Channel::RgbaRed, red);
+    output.insert_channel(Channel::RgbaGreen, green);
+    output.insert_channel(Channel::RgbaBlue, blue);
+    output.insert_channel(Channel::RgbaAlpha, alpha);
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -934,5 +1323,175 @@ mod tests {
             Arc::new(device),
             Arc::new(queue),
         ))
+    }
+
+    #[test]
+    fn perspective_warp_and_optical_defocus_preserve_energy_and_aovs() {
+        use crate::Format;
+
+        let format = Format::hd_1080();
+        let bbox = BBox::new(0, 0, 2 * TILE_SIZE as i32, 2 * TILE_SIZE as i32);
+
+        // Two-by-two tiles, each a distinct uniform color.
+        let mut input = Raster2D::new(format.clone(), bbox, EdgeMode::BlackOutside);
+        let mut planes = [
+            ChannelPlane::new(),
+            ChannelPlane::new(),
+            ChannelPlane::new(),
+            ChannelPlane::new(),
+        ];
+        let tile_colors = [
+            [0.1, 0.2, 0.3, 0.4],
+            [0.5, 0.6, 0.7, 0.8],
+            [0.9, 0.1, 0.2, 0.3],
+            [0.4, 0.5, 0.6, 0.7],
+        ];
+        for ty in 0..2 {
+            for tx in 0..2 {
+                let tile = TileCoord::new(tx, ty);
+                let color = tile_colors[(ty * 2 + tx) as usize];
+                for channel in 0..4 {
+                    planes[channel].insert(tile, Arc::new(TileBuffer::new_uniform(color[channel])));
+                }
+            }
+        }
+        let [red, green, blue, alpha] = planes;
+        input.insert_channel(Channel::RgbaRed, red);
+        input.insert_channel(Channel::RgbaGreen, green);
+        input.insert_channel(Channel::RgbaBlue, blue);
+        input.insert_channel(Channel::RgbaAlpha, alpha);
+
+        // An identity quad reproduces every source pixel exactly.
+        let warped = perspective_warp_raster(&input, &Mat3x3::identity(), bbox, None)
+            .expect("identity warp should not fail");
+        assert_eq!(warped.format, input.format);
+        for y in 0..bbox.height() {
+            for x in 0..bbox.width() {
+                let expected = input.sample_rgba(x, y);
+                let actual = warped.sample_rgba(x, y);
+                for channel in 0..4 {
+                    assert!(
+                        (actual[channel] - expected[channel]).abs() < 1e-6,
+                        "identity warp at ({x}, {y}) channel {channel}: {actual:?} vs {expected:?}"
+                    );
+                }
+            }
+        }
+
+        // A single bright impulse pixel defocuses into a symmetric disk that
+        // integrates to exactly 1.0 of energy per channel.
+        let small = BBox::new(0, 0, 64, 64);
+        let mut impulse = Raster2D::new(format.clone(), small, EdgeMode::BlackOutside);
+        impulse
+            .set_pixel(Channel::RgbaRed, 32, 32, 1.0, None)
+            .unwrap();
+        impulse
+            .set_pixel(Channel::RgbaGreen, 32, 32, 1.0, None)
+            .unwrap();
+        impulse
+            .set_pixel(Channel::RgbaBlue, 32, 32, 1.0, None)
+            .unwrap();
+        impulse
+            .set_pixel(Channel::RgbaAlpha, 32, 32, 1.0, None)
+            .unwrap();
+
+        let op = DefocusOp {
+            radius: 4.0,
+            aspect: 1.0,
+            mix: 1.0,
+        };
+        let defocused = defocus_raster(&impulse, None, &op, None).expect("defocus should not fail");
+        assert_eq!(defocused.format, impulse.format);
+        assert_eq!(defocused.bbox, BBox::new(-4, -4, 68, 68));
+
+        // The disk is symmetric around the impulse.
+        let center = (32, 32);
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1), (2, 2), (-2, -2)] {
+            let a = defocused.sample_rgba(center.0 + dx, center.1 + dy);
+            let b = defocused.sample_rgba(center.0 - dx, center.1 - dy);
+            for channel in 0..4 {
+                assert!(
+                    (a[channel] - b[channel]).abs() < 1e-6,
+                    "defocus disk is not symmetric at ({dx}, {dy})"
+                );
+            }
+        }
+
+        // Total integrated energy per channel equals the impulse's 1.0.
+        let mut totals = [0.0f64; 4];
+        for y in -4..68 {
+            for x in -4..68 {
+                let pixel = defocused.sample_rgba(x, y);
+                for channel in 0..4 {
+                    totals[channel] += f64::from(pixel[channel]);
+                }
+            }
+        }
+        for (channel, &total) in totals.iter().enumerate() {
+            assert!(
+                (total - 1.0).abs() < 1e-4,
+                "defocus channel {channel} energy: {}",
+                total
+            );
+        }
+
+        // A uniform raster defocuses to uniform tiles and reserves zero
+        // governor bytes everywhere.
+        let big = BBox::new(0, 0, 4 * TILE_SIZE as i32, 4 * TILE_SIZE as i32);
+        let mut uniform_raster = Raster2D::new(format.clone(), big, EdgeMode::ClampToEdge);
+        let uniform_color = [0.25, 0.5, 0.75, 1.0];
+        let mut planes = [
+            ChannelPlane::new(),
+            ChannelPlane::new(),
+            ChannelPlane::new(),
+            ChannelPlane::new(),
+        ];
+        for ty in 0..4 {
+            for tx in 0..4 {
+                let tile = TileCoord::new(tx, ty);
+                for channel in 0..4 {
+                    planes[channel].insert(
+                        tile,
+                        Arc::new(TileBuffer::new_uniform(uniform_color[channel])),
+                    );
+                }
+            }
+        }
+        let [red, green, blue, alpha] = planes;
+        uniform_raster.insert_channel(Channel::RgbaRed, red);
+        uniform_raster.insert_channel(Channel::RgbaGreen, green);
+        uniform_raster.insert_channel(Channel::RgbaBlue, blue);
+        uniform_raster.insert_channel(Channel::RgbaAlpha, alpha);
+
+        let governor = MemoryGovernor::new(1 << 20);
+        let uniform_output = defocus_raster(&uniform_raster, None, &op, Some(&governor))
+            .expect("uniform defocus should not fail");
+        assert_eq!(uniform_output.format, uniform_raster.format);
+        assert_eq!(
+            governor.allocated_bytes(),
+            0,
+            "a uniform raster must not allocate governor bytes"
+        );
+
+        // Non-RGBA AOV planes travel by zero-copy `Arc` clone.
+        let mut depth_raster = Raster2D::new(format.clone(), bbox, EdgeMode::BlackOutside);
+        let mut depth_plane = ChannelPlane::new();
+        depth_plane.insert(TileCoord::new(0, 0), Arc::new(TileBuffer::new_uniform(3.5)));
+        depth_raster.insert_channel(Channel::DepthZ, depth_plane);
+
+        let depth_before = depth_raster
+            .channel(&Channel::DepthZ)
+            .and_then(|plane| plane.get(&TileCoord::new(0, 0)))
+            .cloned()
+            .expect("depth tile exists");
+
+        let depth_output = defocus_raster(&depth_raster, None, &op, None)
+            .expect("defocus with aov should not fail");
+        assert_eq!(depth_output.format, depth_raster.format);
+        let depth_after = depth_output
+            .channel(&Channel::DepthZ)
+            .and_then(|plane| plane.get(&TileCoord::new(0, 0)))
+            .expect("depth tile preserved");
+        assert!(Arc::ptr_eq(&depth_before, depth_after));
     }
 }

@@ -105,6 +105,136 @@ impl Mat3x3 {
         }
     }
 
+    /// Projects one point through the homogeneous divide.
+    ///
+    /// Computes `(wx, wy, w) = self * [x, y, 1]^T`. Returns `None` when `w`
+    /// is zero or non-finite, else `Some([wx / w, wy / w])`.
+    pub fn project_point(&self, x: f32, y: f32) -> Option<[f32; 2]> {
+        let [[a, b, c], [d, e, f], [g, h, i]] = self.rows;
+        let wx = a * x + b * y + c;
+        let wy = d * x + e * y + f;
+        let w = g * x + h * y + i;
+        if !w.is_finite() || w.abs() <= 1e-6 {
+            return None;
+        }
+        Some([wx / w, wy / w])
+    }
+
+    /// Full projective inverse via the cofactor/adjugate matrix divided by
+    /// `det`, handling arbitrary non-affine bottom rows `[h20, h21, h22]`.
+    ///
+    /// Returns `None` when the determinant is zero or non-finite.
+    pub fn inverse_projective(&self) -> Option<Self> {
+        let [[a, b, c], [d, e, f], [g, h, i]] = self.rows;
+        let determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+        if !determinant.is_finite() || determinant.abs() <= 1e-9 {
+            return None;
+        }
+        let inv_det = 1.0 / determinant;
+        Some(Self {
+            rows: [
+                [
+                    (e * i - f * h) * inv_det,
+                    (c * h - b * i) * inv_det,
+                    (b * f - c * e) * inv_det,
+                ],
+                [
+                    (f * g - d * i) * inv_det,
+                    (a * i - c * g) * inv_det,
+                    (c * d - a * f) * inv_det,
+                ],
+                [
+                    (d * h - e * g) * inv_det,
+                    (b * g - a * h) * inv_det,
+                    (a * e - b * d) * inv_det,
+                ],
+            ],
+        })
+    }
+
+    /// Solves for the projective matrix mapping `from[i]` to `to[i]` for all
+    /// four corners, using the 8-point Direct Linear Transform in `f64`.
+    ///
+    /// `h22` is fixed to `1.0`. Returns `None` for collinear or duplicate
+    /// corners (a singular 8x8 system) or when any entry is non-finite.
+    #[allow(clippy::needless_range_loop)]
+    pub fn from_quad_to_quad(from: [[f32; 2]; 4], to: [[f32; 2]; 4]) -> Option<Self> {
+        let mut system = [[0.0f64; 9]; 8];
+        for i in 0..4 {
+            let x = f64::from(from[i][0]);
+            let y = f64::from(from[i][1]);
+            let u = f64::from(to[i][0]);
+            let v = f64::from(to[i][1]);
+
+            let row = &mut system[i * 2];
+            row[0] = x;
+            row[1] = y;
+            row[2] = 1.0;
+            row[3] = 0.0;
+            row[4] = 0.0;
+            row[5] = 0.0;
+            row[6] = -u * x;
+            row[7] = -u * y;
+            row[8] = u;
+
+            let row = &mut system[i * 2 + 1];
+            row[0] = 0.0;
+            row[1] = 0.0;
+            row[2] = 0.0;
+            row[3] = x;
+            row[4] = y;
+            row[5] = 1.0;
+            row[6] = -v * x;
+            row[7] = -v * y;
+            row[8] = v;
+        }
+
+        // Gaussian elimination with partial pivoting.
+        for column in 0..8 {
+            let mut pivot_row = column;
+            let mut pivot = system[column][column].abs();
+            for row in (column + 1)..8 {
+                let value = system[row][column].abs();
+                if value > pivot {
+                    pivot = value;
+                    pivot_row = row;
+                }
+            }
+            if pivot <= 1e-12 {
+                return None;
+            }
+            system.swap(column, pivot_row);
+            let pivot_value = system[column][column];
+            for row in (column + 1)..8 {
+                let factor = system[row][column] / pivot_value;
+                for c in column..9 {
+                    system[row][c] -= factor * system[column][c];
+                }
+            }
+        }
+
+        let mut h = [0.0f64; 8];
+        for column in (0..8).rev() {
+            let mut value = system[column][8];
+            for c in (column + 1)..8 {
+                value -= system[column][c] * h[c];
+            }
+            value /= system[column][column];
+            if !value.is_finite() {
+                return None;
+            }
+            h[column] = value;
+        }
+
+        Some(Self {
+            rows: [
+                [h[0] as f32, h[1] as f32, h[2] as f32],
+                [h[3] as f32, h[4] as f32, h[5] as f32],
+                [h[6] as f32, h[7] as f32, 1.0],
+            ],
+        })
+    }
+
     /// One row padded to a `vec4` for WGSL uniform upload.
     pub fn row(&self, index: usize) -> [f32; 4] {
         let row = self.rows[index.min(2)];
@@ -215,5 +345,56 @@ mod tests {
             max_diff < 1e-6,
             "combined matrix not identity: {chained:?}, max diff {max_diff}"
         );
+    }
+
+    #[test]
+    fn homography_maps_all_four_corners_and_inverts_cleanly() {
+        let from = [[0.0, 0.0], [256.0, 0.0], [256.0, 256.0], [0.0, 256.0]];
+        let to = [[20.0, 10.0], [230.0, 30.0], [250.0, 240.0], [10.0, 220.0]];
+
+        let matrix = Mat3x3::from_quad_to_quad(from, to).expect("quad must solve");
+        for i in 0..4 {
+            let projected = matrix
+                .project_point(from[i][0], from[i][1])
+                .expect("corner must project");
+            assert!(
+                (projected[0] - to[i][0]).abs() < 1e-4,
+                "corner {i} x: {} vs {}",
+                projected[0],
+                to[i][0]
+            );
+            assert!(
+                (projected[1] - to[i][1]).abs() < 1e-4,
+                "corner {i} y: {} vs {}",
+                projected[1],
+                to[i][1]
+            );
+        }
+
+        let inverse = matrix.inverse_projective().expect("matrix must invert");
+        for i in 0..4 {
+            let back = inverse
+                .project_point(to[i][0], to[i][1])
+                .expect("corner must back-project");
+            assert!(
+                (back[0] - from[i][0]).abs() < 1e-4,
+                "corner {i} x: {} vs {}",
+                back[0],
+                from[i][0]
+            );
+            assert!(
+                (back[1] - from[i][1]).abs() < 1e-4,
+                "corner {i} y: {} vs {}",
+                back[1],
+                from[i][1]
+            );
+        }
+
+        // Collinear or duplicate corners are singular.
+        let collinear = [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]];
+        assert!(Mat3x3::from_quad_to_quad(collinear, to).is_none());
+        assert!(Mat3x3::from_quad_to_quad(from, collinear).is_none());
+        let duplicate = [[0.0, 0.0], [0.0, 0.0], [256.0, 256.0], [0.0, 256.0]];
+        assert!(Mat3x3::from_quad_to_quad(duplicate, to).is_none());
     }
 }
