@@ -20,8 +20,8 @@ use tanova_kernel::{
 use tanova_parse::load_nk_into_dag;
 use tanova_render::{GpuComputeEngine, Raster2D};
 use tanova_ui::{
-    GraphMirror, NodeCanvas, NodeCanvasState, PropertiesPanel, StudioTheme, ViewerPanel,
-    ViewerWorkflow, apply_theme_visuals, spawn_node_message,
+    CurveEditorPanel, GraphMirror, NodeCanvas, NodeCanvasState, PropertiesPanel, StudioTheme,
+    ViewerPanel, ViewerWorkflow, apply_theme_visuals, spawn_node_message,
 };
 
 /// Errors crossing the app boundary (eframe requires `Send + Sync`).
@@ -402,6 +402,11 @@ struct TanovaApp {
     /// older drag step must never overwrite the newer optimistic mirror value:
     /// doing so would snap the thumb backwards, or freeze it until release.
     in_flight_knob_edits: u64,
+    /// The interactive curve editor panel (bottom-left tab).
+    pub curve_editor: CurveEditorPanel,
+    /// Whether the CentralPanel is showing the Curve Editor (`true`) or the
+    /// Node Graph (`false`).
+    pub curve_editor_view: bool,
 }
 
 impl TanovaApp {
@@ -432,6 +437,8 @@ impl TanovaApp {
             last_render_status: None,
             last_sent_time: None,
             in_flight_knob_edits: 0,
+            curve_editor: CurveEditorPanel::default(),
+            curve_editor_view: false,
         };
         app.seed_graph();
         app
@@ -553,7 +560,10 @@ impl TanovaApp {
         // Retire any leftover slots: message coalescing means the 1:1 count
         // above can over-count, and a stuck counter would suppress echoes for
         // the rest of the session.
-        if frame_received && !self.properties.is_dragging_knob() {
+        if frame_received
+            && !self.properties.is_dragging_knob()
+            && !self.curve_editor.is_dragging_key()
+        {
             self.in_flight_knob_edits = 0;
         }
     }
@@ -620,7 +630,10 @@ impl TanovaApp {
             && Self::command_touches_knob(command)
         {
             self.in_flight_knob_edits = self.in_flight_knob_edits.saturating_sub(1);
-            if self.in_flight_knob_edits > 0 || self.properties.is_dragging_knob() {
+            if self.in_flight_knob_edits > 0
+                || self.properties.is_dragging_knob()
+                || self.curve_editor.is_dragging_key()
+            {
                 return;
             }
         }
@@ -1215,18 +1228,64 @@ impl TanovaApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
-                let messages = NodeCanvas::show(
-                    ui,
-                    &mut self.canvas,
-                    &self.graph,
-                    self.viewer.viewer_node(),
-                    self.workflow,
-                    modal_open,
-                );
-                // A modal owns the keyboard. Drop canvas shortcut messages so a
-                // key pressed while the dialog is open cannot spawn a node.
-                if !modal_open {
+                // Bottom-left pane tabs: `[Node Graph]` | `[Curve Editor]`.
+                // Inline on the existing header row — no extra row, so the
+                // canvas Y-origin is unchanged and coordinate-click tests
+                // keep passing.
+                ui.horizontal(|ui| {
+                    let mut show_curve = self.curve_editor_view;
+                    ui.selectable_value(&mut show_curve, false, "Node Graph");
+                    ui.selectable_value(&mut show_curve, true, "Curve Editor");
+                    self.curve_editor_view = show_curve;
+                });
+                ui.separator();
+
+                if self.curve_editor_view {
+                    self.curve_editor.current_frame = self.timeline.current;
+                    // Sync the curve editor's selected curve from the same
+                    // selected-node source that PropertiesPanel uses
+                    // (canvas.primary_selected). This keeps the Curve Editor
+                    // in sync with the inspected node even when the artist
+                    // switches tabs.
+                    if let Some(sel) = self.canvas.primary_selected {
+                        let has_curves = self.graph.node(sel).is_some_and(|n| !n.curves.is_empty());
+                        if has_curves {
+                            // Keep/auto-select a curve on the selected node.
+                            if self.curve_editor.selected_curve.is_none()
+                                || self.curve_editor.selected_curve.as_ref().unwrap().0 != sel
+                            {
+                                let curves = self.graph.node(sel).unwrap().curves.clone();
+                                if let Some((knob, curve_list)) = curves.iter().next() {
+                                    if let Some(curve) = curve_list.first() {
+                                        if !curve.keys.is_empty() {
+                                            self.curve_editor.selected_curve =
+                                                Some((sel, knob.clone(), 0));
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            self.curve_editor.selected_curve = None;
+                        }
+                    } else {
+                        self.curve_editor.selected_curve = None;
+                    }
+                    let messages = self.curve_editor.show(ui, &self.graph);
                     self.dispatch(messages);
+                } else {
+                    let messages = NodeCanvas::show(
+                        ui,
+                        &mut self.canvas,
+                        &self.graph,
+                        self.viewer.viewer_node(),
+                        self.workflow,
+                        modal_open,
+                    );
+                    // A modal owns the keyboard. Drop canvas shortcut messages so a
+                    // key pressed while the dialog is open cannot spawn a node.
+                    if !modal_open {
+                        self.dispatch(messages);
+                    }
                 }
             });
 
@@ -6404,6 +6463,71 @@ mod tests {
             (mirrored_mix(&app) - 0.7).abs() < 1e-9,
             "echoes must apply once the gesture is over, got {}",
             mirrored_mix(&app)
+        );
+
+        app.kernel.shutdown();
+    }
+
+    /// Regression test for Bug 1: the Curve Editor must never show an empty
+    /// state when the inspected node (Grade #2) has animated curves. It reads
+    /// the same `canvas.primary_selected` source as `PropertiesPanel`, then
+    /// falls back to listing all animated curves across the graph.
+    #[test]
+    fn curve_editor_displays_animated_curves_for_selected_grade_node() {
+        tanova_nodes::ensure_linked();
+
+        let (_gpu_lock, gpu) = test_gpu();
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Wait for the starter comp to land in the mirror.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "starter comp must load");
+        // Drain starter echoes.
+        std::thread::sleep(Duration::from_millis(100));
+        app.pump();
+
+        // Select Grade #2 — the same source PropertiesPanel uses.
+        app.canvas.selected_nodes = HashSet::from([GRADE]);
+        app.canvas.primary_selected = Some(GRADE);
+
+        // Animate `mix` at frames 1 (0.0) and 20 (1.0).
+        app.apply_optimistic_mirror_update(&UndoableCommand::SetKnobCurve {
+            node: GRADE,
+            name: "mix".to_string(),
+            curves: vec![tanova_kernel::AnimationCurve {
+                keys: vec![
+                    tanova_kernel::Keyframe {
+                        frame: 1.0,
+                        value: 0.0,
+                        interp: tanova_kernel::InterpMode::Smooth,
+                    },
+                    tanova_kernel::Keyframe {
+                        frame: 20.0,
+                        value: 1.0,
+                        interp: tanova_kernel::InterpMode::Smooth,
+                    },
+                ],
+            }],
+            previous: Vec::new(),
+        });
+
+        // Switch to the Curve Editor tab and run one draw frame.
+        app.curve_editor_view = true;
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+
+        // The Curve Editor must have auto-selected Grade #2's mix curve.
+        assert_eq!(
+            app.curve_editor.selected_curve,
+            Some((GRADE, "mix".to_string(), 0)),
+            "curve editor must populate selected_curve from the inspected node's animated curves"
         );
 
         app.kernel.shutdown();

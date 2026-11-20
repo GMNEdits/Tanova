@@ -5,6 +5,24 @@ All notable changes to Tanova are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Phase 7
+
+### Added
+
+- **Milestone 23 — Interactive Curve Editor tab (`tanova-ui`, `tanova-app`):**
+  - New `CurveEditorPanel`: a bottom-left tab (`[Node Graph]` | `[Curve Editor]`) that edits the `{curve ...}` keyframe curves of the selected node.
+  - Toolbar with `[Fit]` (auto-scales the view to all keys with safe minimum spans), interpolation buttons `[Smooth]` / `[Linear]` / `[Constant]` for the selected key, and `[Del Key]` to remove it.
+  - Left sidebar lists all animated `(knob_name, channel_index)` curves on the selected node, color-coded by channel (Red, Green, Blue, Alpha, Scalar Gold).
+  - Interactive spline plot (`egui::Painter`): recessed dark background, labeled frame/value gridlines, orange playhead line, polyline curve traces, and clickable/draggable keyframe markers.
+  - In-place keyframe dragging mutates the key's `frame`/`value` directly (no ghost keys left behind), re-sorts keys ascending by frame, emits `UndoableCommand::SetKnobCurve`, and requests a repaint each frame.
+  - Middle-mouse drag pans; mouse wheel zooms around the cursor with safe minimum span clamps.
+  - `TanovaApp::fold_event` extends the mirror-protection guard with `|| self.curve_editor.is_dragging_key()` so dragging a keyframe never snaps back from stale kernel echoes.
+
+- **Milestone 23 — Node Graph Minimap (`tanova-ui`, `tanova-app`):**
+  - `CanvasState.show_minimap` (default `false`) plus a pure-ASCII `[Map]` toggle in the Node Graph header bar next to `zoom XX%`.
+  - When enabled, a `170 x 110` semi-transparent dark inset in the bottom-right corner draws category-colored node rectangles (orange outline for selected) and a translucent viewport indicator.
+  - Input priority: pointer interaction inside the minimap is checked before canvas panning, node hit-testing, or box selection, so clicking/dragging inside the minimap pans `state.pan` to center the clicked world point without dragging nodes or starting box selection underneath.
+
 ## [v0.5.0] - 2026-11-19
 
 **Phase 6 — Production Compositing Engine (Milestones 20–22).** Ships 13 new cartridges (**24 total**), a bounded GreedyDual-Size DAG cache, viewer display transforms with `R`/`G`/`B`/`A` soloing, demand-driven `upstream_inputs` routing with temporal nodes, `TransformChain` matrix concatenation, and a live `{curve ...}` keyframe animation engine with a full-width timeline scrubber.
