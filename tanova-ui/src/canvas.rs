@@ -62,6 +62,11 @@ const CONTEXT_MENU_KINDS: &[&str] = &[
     "Viewer",
     "Dot",
     "BackdropNode",
+    "Mirror",
+    "Ramp",
+    "CornerPin2D",
+    "Defocus",
+    "Glow",
 ];
 
 const WIRE_ACTIVE: Color32 = Color32::from_rgb(245, 220, 120);
@@ -332,11 +337,45 @@ impl GraphMirror {
                     // format is active, stamp the real resolution so a fresh
                     // Constant matches the viewer instead of oversizing.
                     if let Some(format) = self.project_format {
-                        if knobs.contains_key("format_width") {
+                        if knobs.get("format_width") == Some(&KnobValue::Int(1920))
+                            && knobs.get("format_height") == Some(&KnobValue::Int(1080))
+                        {
                             knobs.insert("format_width", KnobValue::Int(format.width as i64));
-                        }
-                        if knobs.contains_key("format_height") {
                             knobs.insert("format_height", KnobValue::Int(format.height as i64));
+                        }
+                        // Stamp Ramp's `p1` corner onto the project format so
+                        // the ramp handle sits on the format corner instead of
+                        // the 256px cartridge default.
+                        if kind == "Ramp" {
+                            if let Some(KnobValue::Color(c)) = knobs.get("p1") {
+                                if *c == [256.0, 256.0, 0.0, 0.0]
+                                    && (format.width as f32 != 256.0
+                                        || format.height as f32 != 256.0)
+                                {
+                                    knobs.insert(
+                                        "p1",
+                                        KnobValue::Color([
+                                            format.width as f32,
+                                            format.height as f32,
+                                            0.0,
+                                            0.0,
+                                        ]),
+                                    );
+                                }
+                            }
+                        }
+                        if kind == "CornerPin2D" {
+                            let w = format.width as f32;
+                            let h = format.height as f32;
+                            for (name, default, stamped) in [
+                                ("to2", [256.0, 0.0, 0.0, 0.0], [w, 0.0, 0.0, 0.0]),
+                                ("to3", [256.0, 256.0, 0.0, 0.0], [w, h, 0.0, 0.0]),
+                                ("to4", [0.0, 256.0, 0.0, 0.0], [0.0, h, 0.0, 0.0]),
+                            ] {
+                                if knobs.get(name) == Some(&KnobValue::Color(default)) {
+                                    knobs.insert(name, KnobValue::Color(stamped));
+                                }
+                            }
                         }
                     }
                     self.nodes.push(CanvasNode {
@@ -600,6 +639,12 @@ pub struct NodeCanvasState {
     resize_preview: Option<(NodeId, f32, f32)>,
     /// Active studio theme for card colors, canvas background, pins, and wires.
     pub theme: StudioTheme,
+    /// Whether to draw the Node Graph Minimap inset in the bottom-right corner.
+    pub show_minimap: bool,
+    /// True while the artist is dragging inside the minimap to pan the canvas.
+    dragging_minimap: bool,
+    /// Set when `[Fit]` is clicked; applied after `canvas_rect` is allocated.
+    pub fit_requested: bool,
 }
 
 impl Default for NodeCanvasState {
@@ -630,6 +675,9 @@ impl Default for NodeCanvasState {
             resizing_backdrop: None,
             resize_preview: None,
             theme: StudioTheme::Classic,
+            show_minimap: false,
+            dragging_minimap: false,
+            fit_requested: false,
         }
     }
 }
@@ -811,6 +859,25 @@ impl NodeCanvasState {
         self.positions.get(&id).copied()
     }
 
+    /// Pan the canvas so that `world_pos` lands at the center of `canvas_rect`,
+    /// at the current zoom level. Derived directly from `world_to_screen` so
+    /// that `world_to_screen(world_pos, canvas_rect, self)` equals
+    /// `canvas_rect.center()` within `1e-3` px at any zoom. Guards against
+    /// non-finite values.
+    pub fn pan_to_center_world(&mut self, world_pos: Pos2, canvas_rect: Rect) {
+        if !world_pos.is_finite() || !canvas_rect.is_finite() || self.zoom <= 0.0 {
+            return;
+        }
+        // world_to_screen: screen = canvas_min + pan + world * zoom
+        // We want screen == canvas_rect.center(), so:
+        // pan = canvas_rect.center() - canvas_rect.min - world_pos * zoom
+        self.pan = canvas_rect.center() - canvas_rect.min - world_pos.to_vec2() * self.zoom;
+        // Guard against drift into non-finite territory.
+        if !self.pan.is_finite() {
+            self.pan = Vec2::ZERO;
+        }
+    }
+
     /// Collects every node intersecting a screen-space box, sorted by id.
     ///
     /// The box corners are converted into canvas space *before* the test, so
@@ -877,6 +944,15 @@ impl NodeCanvas {
                 })
                 .show(ui, |ui| {
                     ui.strong("Node Graph");
+                    ui.separator();
+                    let map_response = ui.selectable_label(state.show_minimap, "[Map]");
+                    if map_response.clicked() {
+                        state.show_minimap = !state.show_minimap;
+                    }
+                    ui.separator();
+                    if ui.button("[Fit]").clicked() {
+                        state.fit_requested = true;
+                    }
                 });
             ui.separator();
             if ui.button("View (1)").clicked() {
@@ -905,11 +981,18 @@ impl NodeCanvas {
             return messages;
         }
         state.last_canvas_rect = Some(rect);
+
+        // `[Fit]` was clicked in the header: frame all nodes inside the
+        // newly allocated canvas rect (same logic as pressing `F`).
+        if state.fit_requested {
+            state.frame_nodes(graph, rect);
+            state.fit_requested = false;
+        }
         // Deliberately not `Sense::FOCUSABLE`: the canvas must never hold the
         // keyboard, otherwise `memory.focused()` would stay set and every
         // Delete/`1` press would look like the artist is typing in a field.
         let response = ui.allocate_rect(rect, Sense::CLICK | Sense::DRAG);
-        let painter = ui.painter_at(rect);
+        let mut painter = ui.painter_at(rect);
 
         let pointer_pos = ui.ctx().input(|input| {
             input
@@ -926,7 +1009,62 @@ impl NodeCanvas {
         let shift = ui.input(|input| input.modifiers.shift);
         let escape_pressed = ui.input(|input| input.key_pressed(Key::Escape));
 
-        // egui reports a primary press globally, so a click inside the
+        // Minimap input priority: compute the minimap rect here (same geometry
+        // as the drawing pass) so a click/drag inside it is handled before
+        // canvas panning, node hit-testing, or box selection.
+        let mut minimap_rect: Option<Rect> = None;
+        if state.show_minimap && !graph.nodes().is_empty() {
+            let minimap_size = Vec2::new(170.0, 110.0);
+            let margin = 8.0;
+            minimap_rect = Some(Rect::from_min_size(
+                Pos2::new(
+                    rect.max.x - minimap_size.x - margin,
+                    rect.max.y - minimap_size.y - margin,
+                ),
+                minimap_size,
+            ));
+        }
+        let pointer_over_minimap = minimap_rect
+            .as_ref()
+            .is_some_and(|r| pointer_pos.map(|p| r.contains(p)).unwrap_or(false));
+
+        // Track minimap drag state: latched on press inside the minimap,
+        // released when the primary button is no longer down.
+        if primary_pressed && pointer_over_minimap {
+            state.dragging_minimap = true;
+        }
+        if !primary_down {
+            state.dragging_minimap = false;
+        }
+
+        // While the minimap is being dragged (or hovered/clicked), suppress
+        // ALL canvas interactions: node hit-testing, node dragging, wire
+        // dragging, canvas panning, and marquee box selection.
+        let minimap_active = state.dragging_minimap || pointer_over_minimap;
+
+        // Minimap click/drag: pan the canvas viewport to center the clicked
+        // world point. Clamp the pointer to the minimap rect so dragging past
+        // the border still works cleanly.
+        if (primary_down || primary_pressed) && minimap_active {
+            if let (Some(mr), Some(pointer)) = (minimap_rect, pointer_pos) {
+                // Clamp pointer into the minimap rect.
+                let clamped = pointer.clamp(mr.min, mr.max);
+                // Compute minimap world bounds strictly from nodes.
+                let bounds = minimap_world_bounds(graph, state, mr);
+                if let Some((world_min, _world_max, scale, offset)) = bounds {
+                    // Invert the uniform minimap transform to world space.
+                    // minimap_pos = mr.min + offset + (world - world_min) * scale
+                    // => world = world_min + (minimap_pos - mr.min - offset) / scale
+                    let t = (clamped - mr.min - offset) / scale;
+                    let target_world = world_min + t;
+                    // Exact centering: after this, world_to_screen(target_world)
+                    // == rect.center().
+                    state.pan_to_center_world(target_world, rect);
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+
         // PropertiesPanel, ViewerPanel, or toolbar would otherwise reach the
         // canvas, start a box selection, and clear the selection on release.
         // Only *initiating* a drag needs the origin check: once a drag is
@@ -1063,13 +1201,13 @@ impl NodeCanvas {
         // A click on the canvas means the artist is done with any knob field in
         // the properties panel. Releasing its focus keeps `Ctrl+Z` flowing to
         // the canvas instead of being swallowed by the text edit.
-        if primary_pressed && press_starts_inside && !spawn_ui_open {
+        if primary_pressed && press_starts_inside && !spawn_ui_open && !minimap_active {
             if let Some(focused_id) = ui.ctx().memory(|mem| mem.focused()) {
                 ui.ctx().memory_mut(|mem| mem.surrender_focus(focused_id));
             }
         }
 
-        if primary_pressed && press_starts_inside && !spawn_ui_open {
+        if primary_pressed && press_starts_inside && !spawn_ui_open && !minimap_active {
             if let Some(pointer) = pointer_pos {
                 // A `Dot`'s circular body is a node drag handle. Test it before
                 // the port hit-test so its compact geometry can never turn a
@@ -1352,7 +1490,7 @@ impl NodeCanvas {
             }
         }
 
-        if middle_down {
+        if middle_down && !minimap_active {
             if response.hovered() || state.panning {
                 state.panning = true;
                 state.pan += pointer_delta;
@@ -1884,6 +2022,118 @@ impl NodeCanvas {
                 Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 200, 255, 170)),
                 StrokeKind::Inside,
             );
+        }
+
+        // Node Graph Minimap: semi-transparent dark inset in the bottom-right
+        // corner. Click/drag inside it pans the canvas viewport (checked before
+        // node hit-testing and box selection so it never steals from those).
+        if state.show_minimap && !graph.nodes().is_empty() {
+            let minimap_size = Vec2::new(170.0, 110.0);
+            let margin = 8.0;
+            let minimap_rect = Rect::from_min_size(
+                Pos2::new(
+                    rect.max.x - minimap_size.x - margin,
+                    rect.max.y - minimap_size.y - margin,
+                ),
+                minimap_size,
+            );
+            painter.rect_filled(
+                minimap_rect,
+                4.0,
+                Color32::from_rgba_unmultiplied(16, 18, 24, 220),
+            );
+            painter.rect_stroke(
+                minimap_rect,
+                4.0,
+                Stroke::new(1.0, Color32::from_rgb(60, 65, 75)),
+                StrokeKind::Inside,
+            );
+
+            // World-space bounds and uniform transform for the minimap.
+            if let Some((world_min, _world_max, scale, offset)) =
+                minimap_world_bounds(graph, state, minimap_rect)
+            {
+                // Map a world point into minimap screen space.
+                let world_to_minimap = |world: Pos2| {
+                    minimap_rect.min + offset + (world - world_min) * Vec2::splat(scale)
+                };
+
+                // Viewport indicator box (what the main canvas shows).
+                let view_world_min = state.screen_to_world(rect, rect.min);
+                let view_world_max = state.screen_to_world(rect, rect.max);
+                let vp_min = world_to_minimap(view_world_min);
+                let vp_max = world_to_minimap(view_world_max);
+                let vp_rect = Rect::from_two_pos(vp_min, vp_max);
+                let vp_intersects = vp_rect.intersects(minimap_rect);
+
+                painter.set_clip_rect(minimap_rect);
+                painter.rect_filled(
+                    vp_rect,
+                    2.0,
+                    Color32::from_rgba_unmultiplied(90, 190, 255, 100),
+                );
+                painter.rect_stroke(
+                    vp_rect,
+                    2.0,
+                    Stroke::new(1.5, Color32::from_rgb(120, 200, 255)),
+                    StrokeKind::Inside,
+                );
+
+                // Draw category-colored node rectangles.
+                for node in graph.nodes() {
+                    let Some(pos) = state.node_position(node.id) else {
+                        continue;
+                    };
+                    let size = node_world_size(node);
+                    let n_min = world_to_minimap(pos);
+                    let n_max = world_to_minimap(pos + size);
+                    let is_selected = state.selected_nodes.contains(&node.id);
+                    let node_color = match node_category(&node.kind) {
+                        crate::theme::NodeCategory::Color => Color32::from_rgb(220, 80, 80),
+                        crate::theme::NodeCategory::Merge => Color32::from_rgb(80, 160, 220),
+                        crate::theme::NodeCategory::Filter => Color32::from_rgb(120, 200, 120),
+                        crate::theme::NodeCategory::Transform => Color32::from_rgb(220, 160, 80),
+                        crate::theme::NodeCategory::Io => Color32::from_rgb(160, 120, 220),
+                        crate::theme::NodeCategory::Viewer => Color32::from_rgb(220, 120, 160),
+                        _ => Color32::from_rgb(160, 160, 160),
+                    };
+                    painter.rect_filled(Rect::from_two_pos(n_min, n_max), 2.0, node_color);
+                    if is_selected {
+                        painter.rect_stroke(
+                            Rect::from_two_pos(n_min, n_max),
+                            2.0,
+                            Stroke::new(1.5, Color32::from_rgb(255, 200, 0)),
+                            StrokeKind::Inside,
+                        );
+                    }
+                }
+                painter.set_clip_rect(rect);
+
+                // Off-screen edge marker: if the viewport does not intersect the
+                // minimap (camera panned far away), paint a bright blue/cyan 6px
+                // clamped indicator pill along the nearest edge/corner pointing
+                // toward the off-screen viewport.
+                if !vp_intersects {
+                    let marker_color = Color32::from_rgb(0, 255, 255);
+                    let marker_thickness = 6.0;
+                    let center = minimap_rect.center();
+                    let vp_center = vp_rect.center();
+                    let direction = (vp_center - center).normalized();
+                    // Clamp the indicator to the minimap edge (manual clamp).
+                    let edge_point = Pos2::new(
+                        vp_center.x.clamp(minimap_rect.min.x, minimap_rect.max.x),
+                        vp_center.y.clamp(minimap_rect.min.y, minimap_rect.max.y),
+                    );
+                    // Draw a short line from the edge toward the viewport direction.
+                    let end = edge_point + direction * 24.0;
+                    painter.line_segment(
+                        [edge_point, end],
+                        Stroke::new(marker_thickness, marker_color),
+                    );
+                    // Also draw a dot at the clamped edge point for visibility.
+                    painter.circle_filled(edge_point, 4.0, marker_color);
+                }
+            }
         }
 
         if let Some(message) = draw_tab_search(ui, state, graph, workflow) {
@@ -2752,9 +3002,9 @@ pub fn input_port_side(kind: &str, input_count: usize, port_index: usize) -> Por
 /// Number of input ports a cartridge exposes to the canvas.
 fn input_port_count(kind: &str) -> usize {
     match kind {
-        "Constant" | "Read" | "BackdropNode" | "CheckerBoard2" => 0,
+        "Constant" | "Read" | "BackdropNode" | "CheckerBoard2" | "Ramp" => 0,
         "Merge2" => 3,
-        "Grade" | "Switch" | "Clamp" | "Saturation" => 2,
+        "Grade" | "Switch" | "Clamp" | "Saturation" | "Glow" | "Defocus" => 2,
         _ => 1,
     }
 }
@@ -2799,6 +3049,59 @@ pub fn node_world_size(node: &CanvasNode) -> Vec2 {
         return Vec2::new(width, height);
     }
     NODE_SIZE
+}
+
+/// Computes the uniform minimap transform for mapping world space into
+/// `minimap_rect`.
+///
+/// The bounds are derived **strictly from `mirror.nodes`** (using each node's
+/// actual world rect, including `BackdropNode` and `Dot` sizes), expanded by
+/// fixed padding (25% of span + 180.0 world units per side, minimum span
+/// 600x400). The viewport world rect is never included — this prevents the
+/// feedback loop where panning far away shrinks nodes into specks and dragging
+/// inside the minimap rescales under the cursor.
+///
+/// Returns `(world_min, world_max, scale, offset)` where `scale` is the
+/// uniform aspect-preserving scale and `offset` centers the scaled bounds
+/// inside `minimap_rect`. The minimap mapping is
+/// `minimap_pos = minimap_rect.min + offset + (world_pos - world_min) * scale`.
+fn minimap_world_bounds(
+    graph: &GraphMirror,
+    state: &NodeCanvasState,
+    minimap_rect: Rect,
+) -> Option<(Pos2, Pos2, f32, Vec2)> {
+    let mut world_min = Pos2::new(f32::INFINITY, f32::INFINITY);
+    let mut world_max = Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for node in graph.nodes() {
+        let Some(pos) = state.node_position(node.id) else {
+            continue;
+        };
+        let size = node_world_size(node);
+        let n_min = pos;
+        let n_max = pos + size;
+        world_min = world_min.min(n_min);
+        world_max = world_max.max(n_max);
+    }
+    if !world_min.x.is_finite() {
+        return None;
+    }
+
+    // Padding: 25% of span + 180 world units per side, with minimum span.
+    let span = world_max - world_min;
+    let pad_x = span.x.max(600.0) * 0.25 + 180.0;
+    let pad_y = span.y.max(400.0) * 0.25 + 180.0;
+    world_min -= egui::vec2(pad_x, pad_y);
+    world_max += egui::vec2(pad_x, pad_y);
+
+    let bounds_span = world_max - world_min;
+    let bounds_span = bounds_span.max(Vec2::splat(1.0));
+
+    let inner = minimap_rect.size();
+    let scale = (inner.x / bounds_span.x).min(inner.y / bounds_span.y);
+    let scaled_size = bounds_span * scale;
+    let offset = (inner - scaled_size) / 2.0;
+
+    Some((world_min, world_max, scale, offset))
 }
 
 fn node_accepts_inputs(graph: &GraphMirror, id: NodeId) -> bool {
@@ -3602,10 +3905,11 @@ mod tests {
         graph.apply_event(&KernelEvent::Applied(add_node(2, 40.0, 160.0)));
         graph.apply_event(&KernelEvent::Applied(connect(1, 2)));
 
+        let original_knobs = graph.node(NodeId(2)).unwrap().knobs.clone();
         let command = graph.removal_command(NodeId(2)).expect("snapshot");
         match &command {
             UndoableCommand::RemoveNode { knobs, edges, .. } => {
-                assert_eq!(knobs.len(), 0);
+                assert_eq!(knobs.as_ref(), &original_knobs);
                 assert_eq!(edges.len(), 1);
             }
             other => panic!("expected RemoveNode, got {other:?}"),
@@ -3618,6 +3922,7 @@ mod tests {
         graph.apply_event(&KernelEvent::Undone(command));
         assert_eq!(graph.node_count(), 2);
         assert_eq!(graph.edge_count(), 1);
+        assert_eq!(graph.node(NodeId(2)).unwrap().knobs, original_knobs);
         assert_eq!(
             graph.node(NodeId(2)).map(|node| (node.x, node.y)),
             Some((40.0, 160.0))
@@ -5474,5 +5779,440 @@ mod tests {
             "the dropped Grade must feed the Viewer, got {:?}",
             commands[3]
         );
+    }
+
+    #[test]
+    fn minimap_click_pans_canvas_viewport_to_target_node() {
+        use tanova_kernel::UndoableCommand;
+
+        let mut graph = GraphMirror::default();
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(1),
+            kind: "Constant".to_string(),
+            x: 0.0,
+            y: 0.0,
+        });
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(2),
+            kind: "Grade".to_string(),
+            x: 1000.0,
+            y: 1000.0,
+        });
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let mut state = NodeCanvasState {
+            show_minimap: true,
+            ..Default::default()
+        };
+
+        // First pass to lay out nodes.
+        let _ = run_canvas_pass(&ctx, screen, Vec::new(), &mut state, &graph);
+
+        let pan_before = state.pan;
+
+        // Click inside the minimap on the far node (Node 2 at 1000, 1000).
+        // The minimap rect is in the bottom-right of the canvas rect.
+        let canvas_rect = state.last_canvas_rect.unwrap_or(screen);
+        let minimap_size = Vec2::new(170.0, 110.0);
+        let margin = 8.0;
+        let minimap_rect = Rect::from_min_size(
+            Pos2::new(
+                canvas_rect.max.x - minimap_size.x - margin,
+                canvas_rect.max.y - minimap_size.y - margin,
+            ),
+            minimap_size,
+        );
+        // Click at the center of the minimap where Node 2 would project.
+        let click_pos = minimap_rect.center();
+
+        let events = vec![egui::Event::PointerButton {
+            pos: click_pos,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }];
+        let mut messages = Vec::new();
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        messages = NodeCanvas::show(
+                            ui,
+                            &mut state,
+                            &graph,
+                            None,
+                            ViewerWorkflow::Nuke,
+                            false,
+                        );
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+
+        // Pan should have shifted toward Node 2.
+        assert!(
+            (state.pan - pan_before).length() > 0.0,
+            "minimap click must pan the canvas, pan was {:?} before and {:?} after",
+            pan_before,
+            state.pan
+        );
+        // No node-move commands should be emitted.
+        let has_move = messages
+            .iter()
+            .any(|m| matches!(m, KernelMessage::Execute(UndoableCommand::MoveNode { .. })));
+        assert!(!has_move, "minimap click must not emit node move commands");
+    }
+
+    #[test]
+    fn minimap_click_centers_target_node_even_when_panned_far_away() {
+        use tanova_kernel::UndoableCommand;
+
+        let mut graph = GraphMirror::default();
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(1),
+            kind: "Constant".to_string(),
+            x: 0.0,
+            y: 0.0,
+        });
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(2),
+            kind: "Grade".to_string(),
+            x: 1000.0,
+            y: 1000.0,
+        });
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let mut state = NodeCanvasState {
+            show_minimap: true,
+            pan: Vec2::new(-5000.0, 4000.0),
+            zoom: 0.6,
+            ..Default::default()
+        };
+
+        // First pass to lay out nodes.
+        let _ = run_canvas_pass(&ctx, screen, Vec::new(), &mut state, &graph);
+
+        let canvas_rect = state.last_canvas_rect.unwrap_or(screen);
+        let minimap_size = Vec2::new(170.0, 110.0);
+        let margin = 8.0;
+        let minimap_rect = Rect::from_min_size(
+            Pos2::new(
+                canvas_rect.max.x - minimap_size.x - margin,
+                canvas_rect.max.y - minimap_size.y - margin,
+            ),
+            minimap_size,
+        );
+
+        // Click at Node 2's center minimap screen position using the same
+        // transform as the painting pass.
+        let Some((world_min, _world_max, scale, offset)) =
+            minimap_world_bounds(&graph, &state, minimap_rect)
+        else {
+            panic!("minimap bounds should be computable");
+        };
+        // Node 2's center in world space.
+        let node2_size = node_world_size(graph.node(NodeId(2)).unwrap());
+        let node2_center = Pos2::new(1000.0, 1000.0) + node2_size * 0.5;
+        let click_pos = minimap_rect.min + offset + (node2_center - world_min) * Vec2::splat(scale);
+
+        let events = vec![egui::Event::PointerButton {
+            pos: click_pos,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }];
+        let mut messages = Vec::new();
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        messages = NodeCanvas::show(
+                            ui,
+                            &mut state,
+                            &graph,
+                            None,
+                            ViewerWorkflow::Nuke,
+                            false,
+                        );
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+
+        // Node 2's center should now be within 2.0 px of canvas center.
+        let screen_pos = state.world_to_screen(canvas_rect, node2_center);
+        let canvas_center = canvas_rect.center();
+        assert!(
+            (screen_pos - canvas_center).length() < 2.0,
+            "node 2 center {:?} should be within 2.0px of canvas center {:?}, got distance {:?}",
+            screen_pos,
+            canvas_center,
+            (screen_pos - canvas_center).length()
+        );
+
+        // No node-move commands should be emitted.
+        let has_move = messages
+            .iter()
+            .any(|m| matches!(m, KernelMessage::Execute(UndoableCommand::MoveNode { .. })));
+        assert!(!has_move, "minimap click must not emit node move commands");
+    }
+
+    #[test]
+    fn minimap_drag_stays_stable_even_past_minimap_border() {
+        use tanova_kernel::UndoableCommand;
+
+        let mut graph = GraphMirror::default();
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(1),
+            kind: "Constant".to_string(),
+            x: 0.0,
+            y: 0.0,
+        });
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(2),
+            kind: "Grade".to_string(),
+            x: 1000.0,
+            y: 1000.0,
+        });
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let mut state = NodeCanvasState {
+            show_minimap: true,
+            ..Default::default()
+        };
+
+        // First pass to lay out nodes.
+        let _ = run_canvas_pass(&ctx, screen, Vec::new(), &mut state, &graph);
+
+        let canvas_rect = state.last_canvas_rect.unwrap_or(screen);
+        let minimap_size = Vec2::new(170.0, 110.0);
+        let margin = 8.0;
+        let minimap_rect = Rect::from_min_size(
+            Pos2::new(
+                canvas_rect.max.x - minimap_size.x - margin,
+                canvas_rect.max.y - minimap_size.y - margin,
+            ),
+            minimap_size,
+        );
+
+        // Drag across 3 points inside and past the minimap border.
+        let drag_points = [
+            minimap_rect.center(),
+            Pos2::new(minimap_rect.min.x - 10.0, minimap_rect.center().y), // past left edge
+            Pos2::new(minimap_rect.max.x + 10.0, minimap_rect.center().y), // past right edge
+        ];
+
+        let mut pan_history = Vec::new();
+        for (i, &point) in drag_points.iter().enumerate() {
+            let events = vec![egui::Event::PointerButton {
+                pos: point,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }];
+            let mut messages = Vec::new();
+            ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            messages = NodeCanvas::show(
+                                ui,
+                                &mut state,
+                                &graph,
+                                None,
+                                ViewerWorkflow::Nuke,
+                                false,
+                            );
+                        });
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+
+            pan_history.push(state.pan);
+
+            // No marquee box-selection should start.
+            assert!(
+                state.box_selection.is_none(),
+                "drag point {i} must not start box selection"
+            );
+            // No nodes should move.
+            let has_move = messages
+                .iter()
+                .any(|m| matches!(m, KernelMessage::Execute(UndoableCommand::MoveNode { .. })));
+            assert!(!has_move, "drag point {i} must not emit node move commands");
+        }
+
+        // Pan must stay finite throughout.
+        for (i, &pan) in pan_history.iter().enumerate() {
+            assert!(
+                pan.is_finite(),
+                "pan at drag point {i} must be finite, got {:?}",
+                pan
+            );
+        }
+    }
+
+    #[test]
+    fn phase_seven_cartridges_spawnable_with_expected_ports_and_2d_knobs() {
+        use crate::theme::NodeCategory;
+        use tanova_kernel::UndoableCommand;
+
+        tanova_nodes::ensure_linked();
+        let mut graph = GraphMirror::default();
+
+        // Spawn each Phase 7 cartridge via AddNode through GraphMirror.
+        for (kind, expected_ports, category, xy_rows) in [
+            ("Ramp", 0, NodeCategory::Color, 2),
+            ("Mirror", 1, NodeCategory::Transform, 0),
+            ("CornerPin2D", 1, NodeCategory::Transform, 4),
+            ("Defocus", 2, NodeCategory::Filter, 0),
+            ("Glow", 2, NodeCategory::Filter, 0),
+        ] {
+            assert!(CONTEXT_MENU_KINDS.contains(&kind));
+            assert!(spawnable_kinds(ViewerWorkflow::Nuke).contains(&kind));
+            let id = graph.next_node_id();
+            graph.apply_command(&UndoableCommand::AddNode {
+                id,
+                kind: kind.to_string(),
+                x: 0.0,
+                y: 0.0,
+            });
+            let node = graph.node(id).expect("{kind} must be in mirror");
+            assert_eq!(
+                input_port_count(&node.kind),
+                expected_ports,
+                "{kind} must expose {expected_ports} input port(s)"
+            );
+            assert_eq!(node_category(&node.kind), category, "{kind}");
+            if expected_ports == 2 {
+                assert_eq!(input_port_label(kind, 2, 0), "in");
+                assert_eq!(input_port_label(kind, 2, 1), "M");
+                assert_eq!(input_port_side(kind, 2, 0), PortSide::Top);
+                assert_eq!(input_port_side(kind, 2, 1), PortSide::Right);
+            }
+
+            // Inspect real PropertiesPanel paint output rather than duplicating
+            // its dispatch condition in the test.
+            let ctx = egui::Context::default();
+            let mut panel = crate::properties::PropertiesPanel::default();
+            let output = ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 1600.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            assert!(panel.show(ui, &graph, Some(id), None).is_empty());
+                        });
+                    });
+                },
+            );
+            fn collect_text(shape: &egui::Shape, text: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(s) => text.push(s.galley.text().to_owned()),
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            collect_text(shape, text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut labels = Vec::new();
+            for shape in &output.shapes {
+                collect_text(&shape.shape, &mut labels);
+            }
+            assert_eq!(
+                labels.iter().filter(|text| *text == "X").count(),
+                xy_rows,
+                "{kind}: {labels:?}"
+            );
+            assert_eq!(
+                labels.iter().filter(|text| *text == "Y").count(),
+                xy_rows,
+                "{kind}: {labels:?}"
+            );
+            if kind == "CornerPin2D" {
+                assert!(
+                    !labels
+                        .iter()
+                        .any(|text| ["R", "G", "B", "A"].contains(&text.as_str()))
+                );
+            }
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn phase_seven_format_stamps_match_kernel_and_survive_echoes() {
+        tanova_nodes::ensure_linked();
+        for (width, height) in [(256, 256), (1280, 720), (1920, 1080), (2048, 1556)] {
+            let format = ProjectFormat { width, height };
+            let mut dag = tanova_kernel::Dag::new();
+            dag.set_project_format(Some(format));
+            let mut graph = GraphMirror::default();
+            graph.set_project_format(format);
+            for kind in ["Ramp", "CornerPin2D"] {
+                let id = graph.next_node_id();
+                let add = UndoableCommand::AddNode {
+                    id,
+                    kind: kind.into(),
+                    x: 0.0,
+                    y: 0.0,
+                };
+                dag.apply_command(add.clone()).unwrap();
+                graph.apply_command(&add);
+                assert_eq!(graph.node(id).unwrap().knobs, dag.node(id).unwrap().knobs);
+                let w = width as f32;
+                let h = height as f32;
+                let expected = if kind == "Ramp" {
+                    vec![("p1", [w, h, 0.0, 0.0])]
+                } else {
+                    vec![
+                        ("to2", [w, 0.0, 0.0, 0.0]),
+                        ("to3", [w, h, 0.0, 0.0]),
+                        ("to4", [0.0, h, 0.0, 0.0]),
+                    ]
+                };
+                for (name, value) in &expected {
+                    assert_eq!(
+                        graph.node(id).unwrap().knobs.get(name),
+                        Some(&KnobValue::Color(*value))
+                    );
+                }
+                let edit = UndoableCommand::SetKnob {
+                    node: id,
+                    knob: expected[0].0.into(),
+                    value: KnobValue::Color([17.0, 23.0, 0.0, 0.0]),
+                    previous: KnobValue::Color(expected[0].1),
+                };
+                dag.apply_command(edit.clone()).unwrap();
+                graph.apply_command(&edit);
+                graph.apply_command(&add);
+                assert_eq!(graph.node(id).unwrap().knobs, dag.node(id).unwrap().knobs);
+            }
+        }
     }
 }

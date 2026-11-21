@@ -83,7 +83,23 @@ Nodes that selectively evaluate upstream inputs or shift evaluation time (`Switc
 **Milestone 22: Keyframe Animation Engine (`{curve ...}`), Animated Knob Indicators & Timeline Keyframe Ticks**
 Per-knob keyframe curves (`{curve ...}` syntax), animated knob value indicators in the properties bin, and keyframe ticks on the timeline playhead.
 
+# TANOVA ROADMAP - PHASE 7: STUDIO COMPOSITING, SPATIAL WARPING & CURVE EDITOR
+
+*AI DIRECTIVE: Execute one milestone at a time. Do not skip or combine milestones.*
+
+**Milestone 23: Interactive Curve Editor tab & Node Graph Minimap** — COMPLETE (v0.6.0)
+Interactive curve editor with draggable keyframes and interpolation modes (`tanova-ui`), Node Graph Minimap for navigating large graphs (`tanova-ui`), Projective Homography & Optical Defocus engine (`tanova-render`), and `Mirror` / `Ramp` / `Glow` cartridges (`tanova-nodes`).
+
+**Milestone 24: CornerPin2D & Defocus cartridges + UI integration** — COMPLETE (v0.6.0)
+`CornerPin2D` with interactive 4-corner Viewer overlay handles, `Defocus` cartridge, and full UI integration for all Phase 7 nodes.
+
 ## Release & Tagging Policy
 
 - Every milestone/version tag must first record all Added, Changed, and Fixed items in `CHANGELOG.md`.
 - Every release must use an annotated Git tag (`git tag -a vX.Y.Z-... -m "..."`) and push both the branch and `--tags` to `origin`.
+
+## Release History
+
+- **[v0.6.0] - 2026-11-22:** Phase 7 Studio Compositing, Spatial Warping & Curve Editor (Milestones 23–24). See `CHANGELOG.md`.
+- **[v0.5.0] - 2026-11-19:** Phase 6 Production Compositing Engine (Milestones 20–22).
+

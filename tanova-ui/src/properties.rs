@@ -70,6 +70,8 @@ const SHUFFLE_SELECTORS: &[&str] = &["red", "green", "blue", "alpha", "depth.Z",
 const BACKDROP_COLORS: &[&str] = &[
     "slate", "blue", "teal", "amber", "purple", "crimson", "green",
 ];
+/// Ramp interpolation modes for the `Ramp` node's `ramp_type` knob.
+const RAMP_MODES: &[&str] = &["linear", "smooth", "plinear"];
 /// Nuke's keyframe blue: the knob has a key on the current frame.
 const KEYFRAME_BLUE: Color32 = Color32::from_rgb(80, 175, 255);
 /// Interpolated teal: the knob is animated but has no key on this frame.
@@ -389,6 +391,26 @@ impl PropertiesPanel {
                                             )
                                         })
                                         .inner
+                                    } else if node.kind == "Defocus" && name == "defocus" {
+                                        // Defocus radius is clamped to the
+                                        // optical range the renderer supports
+                                        // (0..=24) so dragging never produces
+                                        // non-finite or out-of-range values.
+                                        ui.add(
+                                            DragValue::new(&mut number)
+                                                .speed(0.01)
+                                                .range(0.0..=24.0),
+                                        )
+                                    } else if node.kind == "Defocus" && name == "aspect" {
+                                        // Defocus aspect is clamped to
+                                        // [0.25, 4.0] to match the renderer's
+                                        // clamp and prevent extreme kernel
+                                        // tap counts.
+                                        ui.add(
+                                            DragValue::new(&mut number)
+                                                .speed(0.01)
+                                                .range(0.25..=4.0),
+                                        )
                                     } else {
                                         ui.add(DragValue::new(&mut number).speed(0.01))
                                     };
@@ -444,6 +466,7 @@ impl PropertiesPanel {
                                         "color" if node.kind == "BackdropNode" => {
                                             Some(BACKDROP_COLORS)
                                         }
+                                        "ramp_type" if node.kind == "Ramp" => Some(RAMP_MODES),
                                         _ => None,
                                     };
                                     if let Some(presets) = presets {
@@ -489,7 +512,14 @@ impl PropertiesPanel {
                                     if (node.kind == "Crop"
                                         && (name == "box_min" || name == "box_max"))
                                         || name == "translate"
-                                        || name == "center" =>
+                                        || name == "center"
+                                        || (node.kind == "Ramp"
+                                            && (name == "p0" || name == "p1"))
+                                        || (node.kind == "CornerPin2D"
+                                            && (name == "to1"
+                                                || name == "to2"
+                                                || name == "to3"
+                                                || name == "to4")) =>
                                 {
                                     // 2D spatial knobs keep `Color([x, y, z, w])`
                                     // storage for cartridge compatibility but edit as
@@ -773,7 +803,7 @@ fn remove_keyframe(mut curves: Vec<AnimationCurve>, frame: f64) -> Vec<Animation
 }
 
 /// Writes concrete channel values at `frame`, used for auto-key after an edit.
-fn set_curve_values(
+pub(crate) fn set_curve_values(
     mut curves: Vec<AnimationCurve>,
     value: &KnobValue,
     frame: f64,
@@ -1312,6 +1342,138 @@ mod tests {
             mirror.keyframe_times(Some(NODE)),
             vec![5, 20],
             "redo must restore the full animation"
+        );
+    }
+
+    /// Pressing and dragging a plain `KnobValue::Float` `DragValue` (e.g.
+    /// `Defocus.defocus`) must emit `SetKnob` on every intermediate frame,
+    /// not just on release.
+    #[test]
+    fn float_drag_value_emits_continuous_updates_before_release() {
+        let ctx = egui::Context::default();
+
+        let mut knobs = KnobTable::new();
+        knobs.insert("defocus", KnobValue::Float(4.0));
+
+        let mut mirror = GraphMirror::default();
+        mirror.apply_event(&KernelEvent::Applied(UndoableCommand::RestoreNode {
+            id: NODE,
+            kind: "Defocus".to_string(),
+            x: 0.0,
+            y: 0.0,
+            disabled: false,
+            knobs: Box::new(knobs.clone()),
+            edges: Vec::new(),
+        }));
+        let mut dag = Dag::new();
+        dag.restore_node(NODE, "Defocus", 0.0, 0.0, false, &knobs, &[])
+            .expect("dag node #2");
+        let mut undo = UndoStack::new();
+
+        let narrow = Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 420.0));
+
+        // Warm-up pass: capture the defocus widget's rect.
+        let _ = run_panel_sized(&ctx, &mirror, vec![], 1.0, narrow);
+        let rect = knob_rect("defocus");
+        let y = rect.center().y;
+
+        // Press on the defocus DragValue. Press alone must not emit SetKnob.
+        let press = Pos2::new(rect.center().x, y);
+        let messages = run_panel_sized(
+            &ctx,
+            &mirror,
+            vec![
+                Event::PointerMoved(press),
+                Event::PointerButton {
+                    pos: press,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            1.0,
+            narrow,
+        );
+        let press_executes: Vec<_> = messages
+            .iter()
+            .filter(|m| matches!(m, KernelMessage::Execute(_)))
+            .collect();
+        assert!(
+            press_executes.is_empty(),
+            "press must not emit SetKnob, got {messages:?}"
+        );
+        feed(messages, &mut mirror, &mut dag, &mut undo);
+
+        // Drag right across 5 intermediate frames without releasing the button.
+        // The pointer drifts above/below the rail on purpose.
+        let mut emitted_values = Vec::new();
+        for (i, target) in [5.0_f64, 6.0, 7.0, 8.0, 9.0].iter().enumerate() {
+            let drift = if i % 2 == 0 { -3.0 } else { 3.0 };
+            let x = rect.left() + ((*target - 4.0) * 12.0) as f32;
+            let pos = Pos2::new(x, y + drift);
+            let messages =
+                run_panel_sized(&ctx, &mirror, vec![Event::PointerMoved(pos)], 1.0, narrow);
+            // Collect emitted SetKnob values first, then feed to mirror/dag.
+            {
+                for message in &messages {
+                    if let KernelMessage::Execute(UndoableCommand::SetKnob {
+                        knob, value, ..
+                    }) = message
+                    {
+                        if knob == "defocus" {
+                            if let KnobValue::Float(v) = value {
+                                emitted_values.push(*v);
+                            }
+                        }
+                    }
+                }
+            }
+            feed(messages, &mut mirror, &mut dag, &mut undo);
+        }
+
+        // Every intermediate frame must have tracked the pointer: a frozen
+        // DragValue would leave the value flat until the release frame.
+        assert!(
+            emitted_values.len() >= 3,
+            "defocus DragValue must emit SetKnob on intermediate frames during drag, got {emitted_values:?}"
+        );
+        for pair in emitted_values.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "defocus stalled during drag, samples: {emitted_values:?}"
+            );
+        }
+        // The last emitted value must be greater than the first (drag moved).
+        assert!(
+            emitted_values.last().copied().unwrap_or(0.0) > emitted_values[0],
+            "defocus must increase during drag, samples: {emitted_values:?}"
+        );
+
+        // Release is bookkeeping only: it must not be the first update.
+        let release = Pos2::new(rect.right(), y);
+        let messages = run_panel_sized(
+            &ctx,
+            &mirror,
+            vec![Event::PointerButton {
+                pos: release,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+            1.0,
+            narrow,
+        );
+        feed(messages, &mut mirror, &mut dag, &mut undo);
+        let final_defocus = mirror
+            .node(NODE)
+            .unwrap()
+            .knobs
+            .get("defocus")
+            .cloned()
+            .unwrap();
+        assert!(
+            matches!(final_defocus, KnobValue::Float(v) if v > 4.0),
+            "the drag must increase defocus above 4.0, got {final_defocus:?}"
         );
     }
 }

@@ -23,6 +23,7 @@ const GENERATORS: &[&str] = &[
     "CheckerBoard2",
     "ColorBars",
     "ColorWheel",
+    "Ramp",
 ];
 
 /// Classes that never leave a node on the stack.
@@ -1077,6 +1078,33 @@ Grade {
 
         let mut dag = Dag::new();
         load_nk_into_dag(script, &mut dag).expect("dag load should succeed");
+    }
+
+    #[test]
+    fn ramp_is_a_generator_and_does_not_consume_the_upstream_pipe() {
+        tanova_nodes::ensure_linked();
+        let mut dag = Dag::new();
+        let parsed = load_nk_into_dag(
+            "Constant {\n name source\n}\nRamp {\n name ramp\n}\nGrade {\n name grade\n}\n",
+            &mut dag,
+        )
+        .unwrap();
+        let ramp = parsed
+            .nodes
+            .iter()
+            .find(|node| node.class == "Ramp")
+            .unwrap()
+            .id;
+        let grade = parsed
+            .nodes
+            .iter()
+            .find(|node| node.class == "Grade")
+            .unwrap()
+            .id;
+        assert!(!dag.edges().any(|edge| edge.to_node == ramp));
+        assert!(dag.edges().any(|edge| edge.from_node == ramp
+            && edge.to_node == grade
+            && edge.to_port == PortId(0)));
     }
 
     #[test]

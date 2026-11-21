@@ -14,6 +14,7 @@ use tanova_kernel::{FrameNotification, KernelMessage, KnobValue, NodeId, Packet,
 use tanova_render::{BBox, DisplayTransform, Mat3x3, Raster2D, ViewerChannel};
 
 use crate::canvas::GraphMirror;
+use crate::properties::{effective_knob_value, set_curve_values};
 
 const VIEWER_BG: Color32 = Color32::from_rgb(14, 14, 17);
 const CHECKER_DARK: Color32 = Color32::from_rgb(26, 26, 30);
@@ -85,6 +86,8 @@ pub struct ViewerPanel {
     pub display_transform: DisplayTransform,
     /// Viewer channel solo (`Rgba`, `R`, `G`, `B`, `A`; default `Rgba`).
     pub channel: ViewerChannel,
+    /// Playhead used to evaluate overlay knobs and auto-key animated edits.
+    pub current_frame: f64,
     frame: Option<Arc<Packet>>,
     texture: Option<TextureHandle>,
     dirty: bool,
@@ -95,6 +98,11 @@ pub struct ViewerPanel {
     last_sent_frame: Option<i64>,
     /// In-flight transform jack drag, if any.
     jack_drag: Option<JackDragState>,
+    /// In-flight corner-pin handle drag: `(node_id, corner_index)`.
+    dragging_corner: Option<(NodeId, usize)>,
+    corner_drag_value: Option<[f32; 2]>,
+    #[cfg(test)]
+    image_rect_for_test: Option<Rect>,
 }
 
 impl Default for ViewerPanel {
@@ -107,11 +115,16 @@ impl Default for ViewerPanel {
             zoom: 1.0,
             display_transform: DisplayTransform::Linear,
             channel: ViewerChannel::Rgba,
+            current_frame: 1.0,
             frame: None,
             texture: None,
             dirty: true,
             last_sent_frame: None,
             jack_drag: None,
+            dragging_corner: None,
+            corner_drag_value: None,
+            #[cfg(test)]
+            image_rect_for_test: None,
         }
     }
 }
@@ -171,6 +184,11 @@ impl ViewerPanel {
         self.viewer_node
     }
 
+    /// `true` while a CornerPin2D corner handle is being dragged on the Viewer.
+    pub fn is_dragging_overlay(&self) -> bool {
+        self.dragging_corner.is_some()
+    }
+
     /// Binds the viewer to a node (or clears it).
     ///
     /// The previous frame is dropped so a stale image never stands in for the
@@ -209,6 +227,7 @@ impl ViewerPanel {
         self.frame = None;
         self.texture = None;
         self.reset_jack_drag();
+        self.reset_corner_drag();
         if had_content {
             self.dirty = true;
         }
@@ -257,8 +276,6 @@ impl ViewerPanel {
         painter.rect_filled(rect, 0, VIEWER_BG);
         draw_checkerboard(&painter, rect);
 
-        self.handle_navigation(ui, &response);
-
         // Pointer-scoped channel soloing: plain `R`/`G`/`B`/`A` toggle a
         // channel solo only while the pointer hovers the viewer viewport and
         // no widget owns the keyboard. The pointer cannot be over the viewer
@@ -287,6 +304,8 @@ impl ViewerPanel {
         let frame = self.frame.clone();
         let Some(raster) = frame.as_ref().and_then(|packet| packet.get::<Raster2D>()) else {
             self.reset_jack_drag();
+            self.reset_corner_drag();
+            self.handle_navigation(ui, &response);
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -305,7 +324,25 @@ impl ViewerPanel {
         }
 
         let format = raster.format.to_bbox();
+        // Capture primary presses before navigation, using the same fitted
+        // image rect that both the HUD and the overlay will draw against.
+        let was_dragging_corner = self.is_dragging_overlay();
+        messages.extend(self.handle_corner_pin_input(
+            ui,
+            &response,
+            self.image_rect(rect, raster),
+            format,
+            graph,
+            selected,
+        ));
+        if !was_dragging_corner && !self.is_dragging_overlay() && messages.is_empty() {
+            self.handle_navigation(ui, &response);
+        }
         let image_rect = self.image_rect(rect, raster);
+        #[cfg(test)]
+        {
+            self.image_rect_for_test = Some(image_rect);
+        }
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
 
         if let Some(texture) = &self.texture {
@@ -344,6 +381,7 @@ impl ViewerPanel {
                 ui, &painter, &response, image_rect, format, graph, selected,
             ),
         );
+        self.draw_corner_pin_overlay(ui, &painter, image_rect, format, graph, selected);
         messages
     }
 
@@ -697,6 +735,16 @@ impl ViewerPanel {
         Vec2::new(delta.x / scale_x, -delta.y / scale_y)
     }
 
+    /// Inverse of `world_to_screen_point`, shared by the HUD and corner drags.
+    fn screen_to_image(&self, image_rect: Rect, format: BBox, pointer: Pos2) -> [f32; 2] {
+        let u = (pointer.x - image_rect.left()) / image_rect.width().max(1e-6);
+        let v = (pointer.y - image_rect.top()) / image_rect.height().max(1e-6);
+        [
+            format.min_x as f32 + u * format.width().max(1) as f32,
+            format.min_y as f32 + (1.0 - v) * format.height().max(1) as f32,
+        ]
+    }
+
     /// Draws the selected Transform node's Nuke-style jack and turns primary
     /// drags into `SetKnob` commands for the `translate` knob.
     ///
@@ -859,6 +907,192 @@ impl ViewerPanel {
         self.jack_drag = None;
     }
 
+    /// Captures handle presses before navigation, without waiting for egui's
+    /// drag threshold (which can move the pointer outside the hit zone).
+    #[allow(clippy::too_many_arguments)]
+    fn handle_corner_pin_input(
+        &mut self,
+        ui: &Ui,
+        response: &egui::Response,
+        image_rect: Rect,
+        format: BBox,
+        graph: &GraphMirror,
+        selected: Option<NodeId>,
+    ) -> Vec<KernelMessage> {
+        let Some(node_id) = selected.filter(|id| {
+            graph
+                .node(*id)
+                .is_some_and(|node| node.kind == "CornerPin2D")
+        }) else {
+            self.reset_corner_drag();
+            return Vec::new();
+        };
+
+        let node = graph.node(node_id).unwrap();
+        if self.dragging_corner.is_some_and(|(id, _)| id != node_id) {
+            self.reset_corner_drag();
+        }
+        let corners = self.corner_pin_corners(node, format);
+        let corner_names = ["to1", "to2", "to3", "to4"];
+
+        let pressed = ui.input(|input| input.pointer.primary_pressed());
+        if pressed && response.contains_pointer() {
+            if let Some(pointer) = ui.input(|input| input.pointer.press_origin()) {
+                for (i, &corner) in corners.iter().enumerate() {
+                    let screen =
+                        self.world_to_screen_point(image_rect, format, corner[0], corner[1]);
+                    if pointer.distance(screen) <= 12.0 {
+                        self.dragging_corner = Some((node_id, i));
+                        self.corner_drag_value = Some(corner);
+                        ui.ctx().request_repaint();
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut messages = Vec::new();
+
+        if let Some((_, corner_idx)) = self.dragging_corner {
+            let pointer = ui.input(|input| input.pointer.interact_pos());
+            if !pressed && let Some(pointer) = pointer {
+                let [x, y] = self.screen_to_image(image_rect, format, pointer);
+                let fw = format.width() as f32;
+                let fh = format.height() as f32;
+                let xy = [x.clamp(-fw, 2.0 * fw), y.clamp(-fh, 2.0 * fh)];
+                let current = self.corner_drag_value.unwrap_or(corners[corner_idx]);
+                if xy.iter().zip(current).any(|(a, b)| (a - b).abs() > 1e-4) {
+                    let name = corner_names[corner_idx];
+                    let value = KnobValue::Color([xy[0], xy[1], 0.0, 0.0]);
+                    let set = UndoableCommand::SetKnob {
+                        node: node_id,
+                        knob: name.to_string(),
+                        value: value.clone(),
+                        previous: node
+                            .knobs
+                            .get(name)
+                            .cloned()
+                            .unwrap_or(KnobValue::Color([current[0], current[1], 0.0, 0.0])),
+                    };
+                    let command = match node.curves.get(name) {
+                        Some(previous) if previous.iter().any(|curve| !curve.is_empty()) => {
+                            UndoableCommand::Batch(vec![
+                                set,
+                                UndoableCommand::SetKnobCurve {
+                                    node: node_id,
+                                    name: name.to_string(),
+                                    curves: set_curve_values(
+                                        previous.clone(),
+                                        &value,
+                                        self.current_frame,
+                                    ),
+                                    previous: previous.clone(),
+                                },
+                            ])
+                        }
+                        _ => set,
+                    };
+                    messages.push(KernelMessage::Execute(command));
+                    self.corner_drag_value = Some(xy);
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+
+        // Also release capture when the window loses the pointer/button.
+        if !ui.input(|input| input.pointer.primary_down()) {
+            self.reset_corner_drag();
+        }
+        messages
+    }
+
+    fn corner_pin_corners(&self, node: &crate::canvas::CanvasNode, format: BBox) -> [[f32; 2]; 4] {
+        let fw = format.width() as f32;
+        let fh = format.height() as f32;
+        let defaults = [[0.0, 0.0], [fw, 0.0], [fw, fh], [0.0, fh]];
+        std::array::from_fn(|i| {
+            if self.dragging_corner == Some((node.id, i))
+                && let Some(xy) = self.corner_drag_value
+            {
+                return xy;
+            }
+            let name = format!("to{}", i + 1);
+            let base = node.knobs.get(&name).cloned().unwrap_or(KnobValue::Color([
+                defaults[i][0],
+                defaults[i][1],
+                0.0,
+                0.0,
+            ]));
+            match effective_knob_value(node, &name, &base, self.current_frame) {
+                KnobValue::Color(c) => [c[0], c[1]],
+                _ => defaults[i],
+            }
+        })
+    }
+
+    /// Paint the quad after the image, using the same effective values as hit testing.
+    fn draw_corner_pin_overlay(
+        &self,
+        ui: &Ui,
+        painter: &egui::Painter,
+        image_rect: Rect,
+        format: BBox,
+        graph: &GraphMirror,
+        selected: Option<NodeId>,
+    ) {
+        let Some(node) = selected
+            .and_then(|id| graph.node(id))
+            .filter(|node| node.kind == "CornerPin2D")
+        else {
+            return;
+        };
+        let node_id = node.id;
+        let corners = self.corner_pin_corners(node, format);
+        // Draw the wireframe quad: to1 -> to2 -> to3 -> to4 -> to1.
+        let screen_corners: [Pos2; 4] =
+            corners.map(|c| self.world_to_screen_point(image_rect, format, c[0], c[1]));
+        for i in 0..4 {
+            let next = (i + 1) % 4;
+            painter.line_segment(
+                [screen_corners[i], screen_corners[next]],
+                Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 175, 55, 200)),
+            );
+        }
+
+        // Draw handles.
+        for (i, &screen) in screen_corners.iter().enumerate() {
+            let is_dragging = self
+                .dragging_corner
+                .is_some_and(|(n, idx)| n == node_id && idx == i);
+            let hovered = ui.input(|input| {
+                input
+                    .pointer
+                    .hover_pos()
+                    .is_some_and(|p| p.distance(screen) <= 12.0)
+            });
+            let color = if hovered || is_dragging {
+                JACK_HOVER
+            } else {
+                JACK
+            };
+            let label = (i + 1).to_string();
+            painter.circle_filled(screen, 7.0, color);
+            painter.circle_stroke(screen, 7.0, Stroke::new(1.0, Color32::WHITE));
+            painter.text(
+                screen + Vec2::new(JACK_RADIUS + 2.0, 0.0),
+                Align2::LEFT_CENTER,
+                label,
+                FontId::proportional(10.0),
+                color,
+            );
+        }
+    }
+
+    fn reset_corner_drag(&mut self) {
+        self.dragging_corner = None;
+        self.corner_drag_value = None;
+    }
+
     fn upload(&mut self, ctx: &egui::Context, raster: &Raster2D) {
         let width = raster.format.width.max(1) as usize;
         let height = raster.format.height.max(1) as usize;
@@ -895,13 +1129,8 @@ impl ViewerPanel {
 
         if let Some(pointer) = pointer {
             if image_rect.contains(pointer) {
-                let width = format.width().max(1) as f32;
-                let height = format.height().max(1) as f32;
-                let u = (pointer.x - image_rect.left()) / image_rect.width().max(1e-6);
-                let v = (pointer.y - image_rect.top()) / image_rect.height().max(1e-6);
-                let x = format.min_x + (u * width).floor() as i32;
-                // Screen +Y points down; Nuke pixel coordinates point up.
-                let y = format.min_y + ((1.0 - v) * height).floor() as i32;
+                let [x, y] = self.screen_to_image(image_rect, format, pointer);
+                let (x, y) = (x.floor() as i32, y.floor() as i32);
                 let [r, g, b, a] = raster.sample_rgba(x, y);
                 text = format!("XY: ({x}, {y}) | RGBA: ({r:.4}, {g:.4}, {b:.4}, {a:.4})");
             }
@@ -1330,5 +1559,217 @@ mod tests {
         assert_eq!(viewer.channel, ViewerChannel::Blue);
         run_frame(&mut viewer, Key::A);
         assert_eq!(viewer.channel, ViewerChannel::Alpha);
+    }
+
+    fn corner_pin_test_scene() -> (ViewerPanel, GraphMirror) {
+        tanova_nodes::ensure_linked();
+        let mut graph = GraphMirror::default();
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(1),
+            kind: "CornerPin2D".to_string(),
+            x: 0.0,
+            y: 0.0,
+        });
+
+        let mut viewer = ViewerPanel::new();
+        viewer.viewer_node = Some(NodeId(1));
+        let mut packet = Packet::new();
+        packet.insert(Raster2D::for_format(Format::new("test", 256, 256, 1.0)));
+        viewer.frame = Some(Arc::new(packet));
+        (viewer, graph)
+    }
+
+    fn run_corner_viewer(
+        ctx: &egui::Context,
+        viewer: &mut ViewerPanel,
+        graph: &GraphMirror,
+        events: Vec<egui::Event>,
+    ) -> Vec<KernelMessage> {
+        let mut messages = Vec::new();
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        messages = viewer.show(ui, graph, Some(NodeId(1)));
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        messages
+    }
+
+    fn pointer_button(pos: Pos2, button: PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn viewer_corner_pin_handle_drag_emits_set_knob_without_panning() {
+        for (zoom, pan) in [(0.6, Vec2::new(15.0, -12.0)), (0.95, Vec2::new(-8.0, 9.0))] {
+            let (mut viewer, graph) = corner_pin_test_scene();
+            viewer.zoom = zoom;
+            viewer.pan = pan;
+            let ctx = egui::Context::default();
+            run_corner_viewer(&ctx, &mut viewer, &graph, vec![]);
+            let image_rect = viewer.image_rect_for_test.unwrap();
+            let start = image_rect.left_bottom();
+            // Warm hover, then press: capture must happen on press, not on
+            // the first move after egui's drag threshold.
+            run_corner_viewer(
+                &ctx,
+                &mut viewer,
+                &graph,
+                vec![egui::Event::PointerMoved(start)],
+            );
+            let pressed = run_corner_viewer(
+                &ctx,
+                &mut viewer,
+                &graph,
+                vec![pointer_button(start, PointerButton::Primary, true)],
+            );
+            assert!(pressed.is_empty());
+            assert_eq!(viewer.dragging_corner, Some((NodeId(1), 0)));
+            assert!(viewer.is_dragging_overlay());
+            let end = start + Vec2::new(50.0, -30.0);
+            let messages = run_corner_viewer(
+                &ctx,
+                &mut viewer,
+                &graph,
+                vec![
+                    pointer_button(start, PointerButton::Middle, true),
+                    egui::Event::PointerMoved(end),
+                ],
+            );
+            let [
+                KernelMessage::Execute(UndoableCommand::SetKnob {
+                    node, knob, value, ..
+                }),
+            ] = messages.as_slice()
+            else {
+                panic!("expected real SetKnob, got {messages:?}")
+            };
+            assert_eq!(*node, NodeId(1));
+            assert_eq!(knob, "to1");
+            let KnobValue::Color(c) = value else {
+                panic!("expected XY")
+            };
+            assert!((c[0] - 50.0 * 256.0 / image_rect.width()).abs() < 1e-3);
+            assert!((c[1] - 30.0 * 256.0 / image_rect.height()).abs() < 1e-3);
+            assert_eq!([c[2], c[3]], [0.0, 0.0]);
+            assert_eq!(viewer.pan, pan);
+            // No accumulated deltas or snapback even before the mirror echoes.
+            assert!(run_corner_viewer(&ctx, &mut viewer, &graph, vec![]).is_empty());
+            let screen =
+                viewer.world_to_screen_point(image_rect, BBox::new(0, 0, 256, 256), c[0], c[1]);
+            assert!(screen.distance(end) < 1e-3);
+            run_corner_viewer(
+                &ctx,
+                &mut viewer,
+                &graph,
+                vec![
+                    pointer_button(end, PointerButton::Primary, false),
+                    pointer_button(end, PointerButton::Middle, false),
+                ],
+            );
+            assert!(!viewer.is_dragging_overlay());
+            assert_eq!(viewer.pan, pan);
+        }
+    }
+
+    #[test]
+    fn viewer_corner_pin_animated_handle_evaluates_and_auto_keys() {
+        use tanova_kernel::{AnimationCurve, InterpMode};
+        let (mut viewer, mut graph) = corner_pin_test_scene();
+        let mut x = AnimationCurve::new();
+        x.set_key(1.0, 10.0, InterpMode::Linear);
+        x.set_key(11.0, 30.0, InterpMode::Linear);
+        let previous = vec![x, AnimationCurve::from_constant(30.0)];
+        graph.apply_command(&UndoableCommand::SetKnobCurve {
+            node: NodeId(1),
+            name: "to1".into(),
+            curves: previous.clone(),
+            previous: vec![],
+        });
+        viewer.current_frame = 6.0;
+        let ctx = egui::Context::default();
+        run_corner_viewer(&ctx, &mut viewer, &graph, vec![]);
+        let rect = viewer.image_rect_for_test.unwrap();
+        let format = BBox::new(0, 0, 256, 256);
+        let start = viewer.world_to_screen_point(rect, format, 20.0, 30.0);
+        run_corner_viewer(
+            &ctx,
+            &mut viewer,
+            &graph,
+            vec![egui::Event::PointerMoved(start)],
+        );
+        run_corner_viewer(
+            &ctx,
+            &mut viewer,
+            &graph,
+            vec![pointer_button(start, PointerButton::Primary, true)],
+        );
+        assert!(
+            viewer.is_dragging_overlay(),
+            "hit testing must use evaluated curves"
+        );
+        let end = viewer.world_to_screen_point(rect, format, 45.0, 55.0);
+        let messages = run_corner_viewer(
+            &ctx,
+            &mut viewer,
+            &graph,
+            vec![egui::Event::PointerMoved(end)],
+        );
+        let [KernelMessage::Execute(UndoableCommand::Batch(commands))] = messages.as_slice() else {
+            panic!("animated drag must emit a batch: {messages:?}");
+        };
+        let [
+            UndoableCommand::SetKnob {
+                value,
+                previous: base,
+                ..
+            },
+            UndoableCommand::SetKnobCurve {
+                curves,
+                previous: old,
+                ..
+            },
+        ] = commands.as_slice()
+        else {
+            panic!("expected knob and curve commands");
+        };
+        assert_eq!(
+            base,
+            &KnobValue::Color([0.0; 4]),
+            "undo restores the static base, not the evaluated value"
+        );
+        assert_eq!(old, &previous);
+        for (i, expected) in [45.0, 55.0].into_iter().enumerate() {
+            assert!((curves[i].evaluate(6.0) - expected).abs() < 1e-3);
+            assert!(curves[i].has_key_at(6.0));
+        }
+        assert!(
+            matches!(value, KnobValue::Color(c) if (c[0] - 45.0).abs() < 1e-3 && (c[1] - 55.0).abs() < 1e-3)
+        );
+        assert!(curves[0].has_key_at(1.0) && curves[0].has_key_at(11.0));
+        graph.apply_command(&UndoableCommand::Batch(commands.clone()));
+        run_corner_viewer(
+            &ctx,
+            &mut viewer,
+            &graph,
+            vec![pointer_button(end, PointerButton::Primary, false)],
+        );
+        let corners = viewer.corner_pin_corners(graph.node(NodeId(1)).unwrap(), format);
+        assert!((corners[0][0] - 45.0).abs() < 1e-3);
+        assert_eq!(viewer.pan, Vec2::ZERO);
     }
 }
