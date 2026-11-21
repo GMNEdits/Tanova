@@ -48,7 +48,7 @@ Save your graph as a native `.tnv` project or open and export supported Nuke `.n
 
 ## Minimum requirements
 
-- **OS:** Linux, macOS, or Windows
+- **OS:** Linux & Windows
 - **RAM:** 4 GB minimum (8 GB recommended)
 - **GPU:** Any adapter supporting Vulkan, Metal, or DirectX 12 (via `wgpu`)
 - **Rust:** Stable toolchain (to build from source)
