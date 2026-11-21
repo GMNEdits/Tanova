@@ -4,12 +4,30 @@
 
 Tanova is a GPU-accelerated, tile-based compositing engine and desktop app written in Rust. Inspired by Nuke’s directed acyclic graph (DAG) workflow, it lets you wire image-processing nodes together, preview the results in a live viewer, and render scripts from the command line. A microkernel evaluates the graph on a background thread while the desktop UI communicates with it through a message bus.
 
+[Quick start](#quick-start) · [What you can do](#what-you-can-do) · [Shortcuts](#essential-shortcuts) · [Architecture](ARCHITECTURE.md)
+
+## What you can do
+
+### Build a composite
+
+A graph starts with a source. Use `Read` for an OpenEXR image or sequence, or make a source with `Constant` or `CheckerBoard2`. Connect nodes to adjust color, blur or reposition an image, and combine images with `Merge2`. Select a node to edit its settings in the properties panel. Use `Dot` to route connections and `BackdropNode` to group related parts of the graph visually.
+
+### Preview and animate
+
+Connect a `Viewer` node to the result in Viewer Node mode, or preview a node directly in Direct Target mode. Use comparison slots `1` and `2` to move between two points in the graph. The viewer offers `Linear`, `sRGB`, `Rec.709`, and `ACES` filmic display transforms, gain and gamma controls, individual RGBA channels, and a pixel probe that shows RGBA values under the pointer.
+
+Move the playhead on the full-width timeline to inspect another frame. Use the keyframe control beside a supported setting to add a key at the current frame. Editing an animated setting creates or updates a key there. The timeline displays keyframe markers and has controls to jump to the previous or next key. Undo and redo cover graph edits, and repeated changes during a knob drag can coalesce into one undo step.
+
+### Save a project or render it
+
+Save your graph as a native `.tnv` project or open and export supported Nuke `.nk` scripts. Supported `{curve ...}` keyframes survive a save-and-reopen round trip. Use a `Write` node to render an OpenEXR sequence from the desktop, with RGBA or all available channels. Extra channels such as depth are commonly called AOVs. The CLI can render a single frame from a script to PPM or OpenEXR.
+
 ## Key highlights in v0.5.0
 
-- **Microkernel.** The eight-crate workspace separates UI state from kernel execution. `RenderEpoch` preempts stale render work, `MemoryGovernor` caps governed RAM allocations, and a bounded GreedyDual-Size cache evicts DAG results that hold rendered tiles.
-- **Tiled rendering.** The RGBA/AOV pipeline uses `wgpu` compute with Vulkan support and CPU fallbacks for GPU-accelerated operations. Gaussian blur runs in two separable passes, and `TransformChain` concatenates adjacent transforms for a single resampling step.
-- **Animation and scripts.** Edit and preview live `{curve ...}` keyframes with a full-width timeline scrubber and previous/next keyframe controls. Continuous edits coalesce into a single undo step. Parse and export supported `.nk` and native `.tnv` scripts with keyframe round-tripping.
-- **Viewer.** Choose `Linear`, `sRGB`, `Rec.709`, or `ACES` filmic tone mapping, solo the `R`, `G`, `B`, or `A` channel, adjust display gain and gamma, and inspect RGBA values with the live pixel probe.
+- **Animation.** Live evaluation of Nuke-style `{curve ...}` keyframes, a full-width scrubber, and undo coalescing for animated knob edits.
+- **Viewer.** Display transforms and RGBA channel soloing.
+- **Nodes and rendering.** Thirteen new cartridges bring the registry to 24. `Switch` evaluates the selected branch, and `TimeOffset` and `FrameHold` request a different upstream frame. Gaussian blur uses two separable passes on GPU and CPU, and `TransformChain` combines adjacent transforms so the result samples the original image.
+- **Cache.** The bounded GreedyDual-Size cache evicts DAG results based on their size and estimated cost to recompute.
 
 ### Built-in cartridges
 
@@ -24,6 +42,10 @@ Tanova registers 24 cartridges, including the internal `Dummy` test cartridge.
 | Merge & Utility | `Merge2`, `Switch`, `Viewer`, `Dot`, `BackdropNode`, `Dummy` |
 
 ## Workspace architecture
+
+The eight-crate microkernel keeps graph evaluation on a background thread and exchanges commands and events with the UI. The kernel evaluates the upstream nodes a render needs and caches their results. `RenderEpoch` lets the engine abandon stale work when a newer render is requested, while `MemoryGovernor` caps tracked RAM allocations.
+
+The render pipeline stores RGBA and extra channels in tiles. Supported operations use `wgpu` compute with Vulkan support and CPU fallbacks. Node cartridges register with the kernel and supply the image-processing logic.
 
 | Crate | Role |
 | --- | --- |
@@ -45,6 +67,18 @@ From the workspace root, launch the desktop GUI with a working `wgpu` graphics a
 ```bash
 cargo run --release -p tanova-app
 ```
+
+The desktop opens a starter graph, `Constant → Grade → Viewer`. Select `Grade` and adjust its gain in the properties panel to see the result in the viewer. Press `Tab` over the graph canvas to search for a node.
+
+### Render a frame from a script
+
+```bash
+cargo run --release -p tanova-cli -- --script path/to/shot.nk --frame 12 --out-exr frame.0012.exr
+```
+
+Use `--node Viewer1` to select a target by name, or `--out-ppm frame.ppm` for PPM output.
+
+### Verify a build
 
 Run the CLI and desktop smoke checks headlessly. The desktop check still initializes the GPU.
 
