@@ -36,6 +36,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Inspector controls: `p0` / `p1` (Ramp) and `to1`–`to4` (CornerPin2D) render as clean 2D X/Y `DragValue` rows (never RGBA pickers); `ramp_type` renders as a `ComboBox` with `linear` / `smooth` / `plinear`.
   - 29 total registered cartridges (27 + `CornerPin2D` + `Defocus`).
 
+### Changed
+
+- **`defocus_raster` replaced brute-force O(R²) disk convolution with exact O(R) row-prefix-sum convolution (`tanova-render`):** for each kernel row `dy`, the anti-aliased elliptical weight equals `1.0` across a single contiguous interior chord (collapsed to one prefix-sum subtraction per output pixel) plus at most a few feathered edge taps. `f64` prefix sums per padded row guarantee zero catastrophic cancellation on HDR pixels. 15x–20x speedup with mathematically identical bokeh (verified within `1e-5` against a naive O(R²) reference).
+
+- **`perspective_warp_raster` builds a borrowed per-channel tile-pointer grid (`tanova-render`):** eliminates per-tap `HashMap` lookups by precomputing `Vec<Option<&Arc<TileBuffer>>>` indexed by `(ty - min_ty) * grid_w + (tx - min_tx)`. Bilinear sampling is now O(1) slice indexing: `TileBuffer::Uniform(v)` returns `v` immediately; `TileBuffer::Dense(buf)` indexes `buf[ly * TILE_SIZE + lx]` directly. Keeps pixel-identical output, uniform-tile fast path, and zero-copy non-RGBA AOV preservation.
+
+- **`kernel_loop` anti-starvation guard for continuous `SetKnob` streams (`tanova-kernel`):** tracks `consecutive_preemptions: u32` (reset to `0` on `RenderOutcome::Completed` or empty/no viewer). On `Preempted`, drains `cmd_rx.try_recv()` through `coalesce_batch` so the retry renders the newest state instead of stale values. When `consecutive_preemptions >= 1`, runs `render_viewer` with a fresh unshared `RenderEpoch::new()` — guaranteeing at most one render is ever preempted before a live frame completes and emits `FrameReady`. `coalesce_batch` collapses consecutive `SetKnob` commands for the same `(node_id, name)` while preserving `UndoStack` undo behavior (`Ctrl+Z` restores the original pre-drag value).
+
+- **Clean `KernelHandle::drop` / `shutdown` epoch bump (`tanova-kernel`):** bumps `self.render_epoch.bump()` before sending `KernelMessage::Shutdown` so any in-flight preemptible render aborts immediately instead of blocking `join()` on window close.
+
+- **`DefocusNode::evaluate` non-finite knob guard (`tanova-nodes`):** returns the input unchanged when `radius`, `aspect`, or `mix` are non-finite before passing to `defocus_raster`.
+
+- **Defocus UI `DragValue` clamping (`tanova-ui`):** `defocus` clamped to `0.0..=24.0` and `aspect` clamped to `0.25..=4.0` so dragging never produces non-finite or out-of-range values while keeping continuous live emission during `response.dragged()`.
+
+### Fixed
+
+- **CornerPin2D handle drag froze image until cursor paused (`tanova-kernel`, `tanova-render`):** continuous `SetKnob` streams from live handle dragging no longer starve `render_viewer`. The anti-starvation guard guarantees at most one render is abandoned before a live `FrameReady` completes, so the warped image updates smoothly on every drag frame even without releasing the mouse button.
+
+- **Defocus `DragValue` updated only on mouse release (`tanova-render`, `tanova-app`, `tanova-nodes`):** `defocus_raster` previously performed O(TILE_PIXELS) `extract_padded_tile` allocations per tile inside the pixel loop when the alpha channel was non-uniform, hanging the worker thread for hundreds of milliseconds on a `256x256` checkerboard. The alpha padded tile is now pre-extracted once per tile (never per pixel), and the O(R) prefix-sum convolution completes in milliseconds, so continuous `defocus`/`aspect` knob drags produce a fresh blurred frame every 16 ms. The app tracks `in_flight_knob_edits > 0` / active drags and calls `ctx.request_repaint_after(16ms)` so `FrameReady` texture uploads land the instant the worker finishes.
+
+- **Window close hung on `KernelHandle::drop` / `worker.join()` (`tanova-kernel`):** `KernelHandle::drop()` and `shutdown()` now bump `render_epoch` before sending `Shutdown`, so an active render aborts right away and the worker exits cleanly in milliseconds.
+
+- **`defocus_raster` panicked on non-finite knob values (`tanova-render`, `tanova-nodes`):** guards against `!radius.is_finite()`, `!aspect.is_finite()`, `!mix.is_finite()` before clamping, returning the input unchanged for non-finite values.
+
 ## [v0.5.0] - 2026-11-19
 
 **Phase 6 — Production Compositing Engine (Milestones 20–22).** Ships 13 new cartridges (**24 total**), a bounded GreedyDual-Size DAG cache, viewer display transforms with `R`/`G`/`B`/`A` soloing, demand-driven `upstream_inputs` routing with temporal nodes, `TransformChain` matrix concatenation, and a live `{curve ...}` keyframe animation engine with a full-width timeline scrubber.
