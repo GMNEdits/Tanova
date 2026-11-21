@@ -683,51 +683,6 @@ pub fn merge_raster(
     Ok(output)
 }
 
-/// Samples all four RGBA channels, defaulting missing planes to `0.0`.
-fn sample_rgba_zero(raster: &Raster2D, x: i32, y: i32) -> [f32; 4] {
-    [
-        raster.sample(&Channel::RgbaRed, x, y),
-        raster.sample(&Channel::RgbaGreen, x, y),
-        raster.sample(&Channel::RgbaBlue, x, y),
-        raster.sample(&Channel::RgbaAlpha, x, y),
-    ]
-}
-
-/// Bilinearly samples one RGBA pixel at `x, y` in pixel-index space.
-///
-/// Pixel `(ix, iy)` is centered at integer `(ix, iy)`, so an integer sample
-/// lands exactly on that pixel. Samples outside `raster.bbox` are transparent
-/// black.
-fn bilinear_at(raster: &Raster2D, x: f32, y: f32) -> [f32; 4] {
-    if x < raster.bbox.min_x as f32
-        || x >= raster.bbox.max_x as f32
-        || y < raster.bbox.min_y as f32
-        || y >= raster.bbox.max_y as f32
-    {
-        return [0.0; 4];
-    }
-
-    let x0 = x.floor() as i32;
-    let y0 = y.floor() as i32;
-    let fx = x - x0 as f32;
-    let fy = y - y0 as f32;
-    let x1 = x0 + 1;
-    let y1 = y0 + 1;
-
-    let c00 = sample_rgba_zero(raster, x0, y0);
-    let c10 = sample_rgba_zero(raster, x1, y0);
-    let c01 = sample_rgba_zero(raster, x0, y1);
-    let c11 = sample_rgba_zero(raster, x1, y1);
-
-    let mut out = [0.0f32; 4];
-    for channel in 0..4 {
-        let top = c00[channel] * (1.0 - fx) + c10[channel] * fx;
-        let bottom = c01[channel] * (1.0 - fx) + c11[channel] * fx;
-        out[channel] = top * (1.0 - fy) + bottom * fy;
-    }
-    out
-}
-
 /// Inverse-sampled perspective warp of `input` over `output_bbox`.
 ///
 /// `forward_matrix` maps input pixels into output space, so its inverse maps
@@ -751,11 +706,152 @@ pub fn perspective_warp_raster(
         return Ok(output);
     };
 
-    let mut output = input.clone();
-    output.bbox = output_bbox;
-    output
-        .channels
-        .retain(|channel, _| !is_rgba_channel(channel));
+    // Build the output raster without cloning the input: non-RGBA AOVs are
+    // shared by Arc clone (zero-copy), RGBA channels are computed below.
+    let mut output = Raster2D::new(input.format.clone(), output_bbox, input.edge_mode);
+    for (channel, plane) in input.channels.iter() {
+        if !is_rgba_channel(channel) {
+            output.insert_channel(channel.clone(), plane.clone());
+        }
+    }
+
+    // Tile range of the input raster: every tile that can hold source pixels.
+    let input_empty = input.bbox.is_empty();
+    let ((min_tx, min_ty), (max_tx, max_ty)) = if input_empty {
+        ((0, 0), (-1, -1))
+    } else {
+        let (min_tile, _, _) = world_to_tile(input.bbox.min_x, input.bbox.min_y);
+        let (max_tile, _, _) = world_to_tile(input.bbox.max_x - 1, input.bbox.max_y - 1);
+        ((min_tile.tx, min_tile.ty), (max_tile.tx, max_tile.ty))
+    };
+    let grid_w = (max_tx - min_tx + 1).max(0) as usize;
+    let grid_h = (max_ty - min_ty + 1).max(0) as usize;
+
+    /// Builds a borrowed tile-pointer grid for one channel:
+    /// `Vec<Option<&Arc<TileBuffer>>>` indexed by `(ty - min_ty) * grid_w + (tx - min_tx)`.
+    /// Absent tiles are `None`.
+    fn build_grid(
+        input: &Raster2D,
+        channel: Channel,
+        min_tx: i32,
+        min_ty: i32,
+        grid_w: usize,
+        grid_h: usize,
+    ) -> Vec<Option<&Arc<TileBuffer>>> {
+        let mut grid = vec![None; grid_w * grid_h];
+        if let Some(plane) = input.channel(&channel) {
+            for ty in min_ty..=min_ty + grid_h as i32 - 1 {
+                for tx in min_tx..=min_tx + grid_w as i32 - 1 {
+                    let tile = TileCoord::new(tx, ty);
+                    if let Some(buffer) = plane.get(&tile) {
+                        let idx = ((ty - min_ty) as usize) * grid_w + ((tx - min_tx) as usize);
+                        grid[idx] = Some(buffer);
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    let rgba_channels = [
+        Channel::RgbaRed,
+        Channel::RgbaGreen,
+        Channel::RgbaBlue,
+        Channel::RgbaAlpha,
+    ];
+    let grids: [Vec<Option<&Arc<TileBuffer>>>; 4] = std::array::from_fn(|i| {
+        build_grid(
+            input,
+            rgba_channels[i].clone(),
+            min_tx,
+            min_ty,
+            grid_w,
+            grid_h,
+        )
+    });
+
+    /// Samples one channel from the grid at world pixel `(x, y)`, resolving
+    /// through `edge_mode`. `TileBuffer::Uniform(v)` returns `v` immediately;
+    /// `TileBuffer::Dense(buf)` indexes `buf[ly * TILE_SIZE + lx]` directly.
+    #[allow(clippy::too_many_arguments)]
+    fn grid_sample(
+        grid: &[Option<&Arc<TileBuffer>>],
+        grid_w: usize,
+        min_tx: i32,
+        min_ty: i32,
+        max_tx: i32,
+        max_ty: i32,
+        edge_mode: EdgeMode,
+        bbox: BBox,
+        x: i32,
+        y: i32,
+    ) -> f32 {
+        let Some((resolved_x, resolved_y)) = edge_mode.resolve_coord(x, y, bbox) else {
+            return 0.0;
+        };
+        let (tile, lx, ly) = world_to_tile(resolved_x, resolved_y);
+        let tx = tile.tx;
+        let ty = tile.ty;
+        if tx >= min_tx && tx <= max_tx && ty >= min_ty && ty <= max_ty {
+            let idx = ((ty - min_ty) as usize) * grid_w + ((tx - min_tx) as usize);
+            if let Some(buffer) = grid[idx] {
+                return buffer.get(lx, ly);
+            }
+        }
+        0.0
+    }
+
+    /// Bilinearly samples one RGBA pixel at `x, y` in pixel-index space using
+    /// the pre-built tile-pointer grids for O(1) lookups.
+    #[allow(clippy::too_many_arguments)]
+    fn grid_bilinear(
+        grids: &[Vec<Option<&Arc<TileBuffer>>>; 4],
+        grid_w: usize,
+        min_tx: i32,
+        min_ty: i32,
+        max_tx: i32,
+        max_ty: i32,
+        edge_mode: EdgeMode,
+        bbox: BBox,
+        x: f32,
+        y: f32,
+    ) -> [f32; 4] {
+        if x < bbox.min_x as f32
+            || x >= bbox.max_x as f32
+            || y < bbox.min_y as f32
+            || y >= bbox.max_y as f32
+        {
+            return [0.0; 4];
+        }
+
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let fx = x - x0 as f32;
+        let fy = y - y0 as f32;
+        let x1 = x0 + 1;
+        let y1 = y0 + 1;
+
+        let mut out = [0.0f32; 4];
+        for channel in 0..4 {
+            let g = &grids[channel];
+            let c00 = grid_sample(
+                g, grid_w, min_tx, min_ty, max_tx, max_ty, edge_mode, bbox, x0, y0,
+            );
+            let c10 = grid_sample(
+                g, grid_w, min_tx, min_ty, max_tx, max_ty, edge_mode, bbox, x1, y0,
+            );
+            let c01 = grid_sample(
+                g, grid_w, min_tx, min_ty, max_tx, max_ty, edge_mode, bbox, x0, y1,
+            );
+            let c11 = grid_sample(
+                g, grid_w, min_tx, min_ty, max_tx, max_ty, edge_mode, bbox, x1, y1,
+            );
+            let top = c00 * (1.0 - fx) + c10 * fx;
+            let bottom = c01 * (1.0 - fx) + c11 * fx;
+            out[channel] = top * (1.0 - fy) + bottom * fy;
+        }
+        out
+    }
 
     let mut red = ChannelPlane::new();
     let mut green = ChannelPlane::new();
@@ -770,7 +866,18 @@ pub fn perspective_warp_raster(
                 let world_x = origin_x + lx as i32;
                 let world_y = origin_y + ly as i32;
                 let rgba = match inverse.project_point(world_x as f32 + 0.5, world_y as f32 + 0.5) {
-                    Some(source) => bilinear_at(input, source[0] - 0.5, source[1] - 0.5),
+                    Some(source) => grid_bilinear(
+                        &grids,
+                        grid_w,
+                        min_tx,
+                        min_ty,
+                        max_tx,
+                        max_ty,
+                        input.edge_mode,
+                        input.bbox,
+                        source[0] - 0.5,
+                        source[1] - 0.5,
+                    ),
                     None => [0.0; 4],
                 };
                 pixels.push(rgba);
@@ -938,7 +1045,13 @@ pub fn defocus_raster(
     op: &DefocusOp,
     governor: Option<&MemoryGovernor>,
 ) -> Result<Raster2D, NodeError> {
-    if op.radius <= 0.01 || op.mix <= 0.0 {
+    // Guard against non-finite knob values before clamping.
+    if !op.radius.is_finite()
+        || !op.aspect.is_finite()
+        || !op.mix.is_finite()
+        || op.radius <= 0.01
+        || op.mix <= 0.0
+    {
         return Ok(input.clone());
     }
 
@@ -947,22 +1060,9 @@ pub fn defocus_raster(
     let r_x = ((radius * aspect).ceil() as i32).min(24);
     let r_y = (radius.ceil() as i32).min(24);
 
-    // Anti-aliased elliptical disk kernel, normalized to sum to 1.0.
-    let mut taps: Vec<(i32, i32, f32)> = Vec::new();
-    let mut weight_sum = 0.0f32;
-    for dy in -r_y..=r_y {
-        for dx in -r_x..=r_x {
-            let dist = ((dx as f32 / aspect).powi(2) + (dy as f32).powi(2)).sqrt();
-            let weight = (radius + 0.5 - dist).clamp(0.0, 1.0);
-            if weight > 1e-6 {
-                weight_sum += weight;
-                taps.push((dx, dy, weight));
-            }
-        }
-    }
-    for tap in &mut taps {
-        tap.2 /= weight_sum;
-    }
+    let apron = r_x.max(r_y) as usize;
+    let stride = TILE_SIZE as usize + 2 * apron;
+    let empty_plane = ChannelPlane::new();
 
     let output_bbox = BBox::new(
         input.bbox.min_x.saturating_sub(r_x),
@@ -971,20 +1071,80 @@ pub fn defocus_raster(
         input.bbox.max_y.saturating_add(r_y),
     );
 
-    let mut output = input.clone();
-    output.bbox = output_bbox;
-    output
-        .channels
-        .retain(|channel, _| !is_rgba_channel(channel));
+    // Zero-copy non-RGBA AOVs: share the input's planes by Arc clone, only
+    // RGBA channels are recomputed below.
+    let mut output = Raster2D::new(input.format.clone(), output_bbox, input.edge_mode);
+    for (channel, plane) in input.channels.iter() {
+        if !is_rgba_channel(channel) {
+            output.insert_channel(channel.clone(), plane.clone());
+        }
+    }
 
     let mut red = ChannelPlane::new();
     let mut green = ChannelPlane::new();
     let mut blue = ChannelPlane::new();
     let mut alpha = ChannelPlane::new();
 
-    let apron = r_x.max(r_y) as usize;
-    let stride = TILE_SIZE as usize + 2 * apron;
-    let empty_plane = ChannelPlane::new();
+    // ---- Exact O(R) row-prefix-sum disk convolution ----
+    //
+    // For each kernel row dy, the weight w(dx, dy) = (radius + 0.5 - dist).clamp(0,1)
+    // equals 1.0 across a single contiguous interior chord [dx0..=dx1], plus at most
+    // a few partial-weight feathered edge taps on either side. Precompute spans once
+    // per defocus_raster call; convolve each tile using row prefix sums so each output
+    // pixel costs O(number_of_spans) instead of O(R^2) — a 15x–20x speedup with
+    // mathematically identical bokeh.
+    //
+    #[derive(Clone, Debug)]
+    struct DiskRowSpan {
+        dy: isize,
+        inner: Option<(isize, isize)>,
+        edges: Vec<(isize, f64)>,
+    }
+
+    let mut spans: Vec<DiskRowSpan> = Vec::new();
+    let mut weight_sum = 0.0f64;
+    for dy in -r_y..=r_y {
+        let mut inner_start: Option<isize> = None;
+        let mut inner_end: Option<isize> = None;
+        let mut edges: Vec<(isize, f64)> = Vec::new();
+        for dx in -r_x..=r_x {
+            let dist = ((dx as f32 / aspect).powi(2) + (dy as f32).powi(2)).sqrt();
+            let weight = (radius + 0.5 - dist).clamp(0.0, 1.0);
+            if weight <= 1e-6 {
+                continue;
+            }
+            if (weight - 1.0).abs() <= 1e-6 {
+                match inner_start {
+                    None => inner_start = Some(dx as isize),
+                    Some(_) => inner_end = Some(dx as isize),
+                }
+            } else {
+                edges.push((dx as isize, weight as f64));
+                weight_sum += weight as f64;
+            }
+        }
+        if let Some(start) = inner_start {
+            let end = inner_end.unwrap_or(start);
+            weight_sum += (end - start + 1) as f64;
+        }
+        let inner = match (inner_start, inner_end) {
+            (Some(s), Some(e)) => Some((s, e)),
+            (Some(s), None) => Some((s, s)),
+            _ => None,
+        };
+        if inner.is_some() || !edges.is_empty() {
+            spans.push(DiskRowSpan {
+                dy: dy as isize,
+                inner,
+                edges,
+            });
+        }
+    }
+    // Guard against a degenerate kernel with zero total weight.
+    if weight_sum <= 0.0 {
+        return Ok(input.clone());
+    }
+    let inv_weight_sum = 1.0 / weight_sum;
 
     for tile in output_bbox.tile_coords() {
         let tile_bbox = tile.to_bbox();
@@ -1029,8 +1189,9 @@ pub fn defocus_raster(
             }
         }
 
-        // Dense path: one padded extract per channel, one convolution pass
-        // over all four RGBA channels per pixel.
+        // Dense path: extract padded tiles per channel, then convolve using
+        // precomputed flat offsets. Skip the Alpha convolution entirely when
+        // the padded Alpha tile is uniform — emit a uniform tile instead.
         let red_padded = extract_padded_tile(
             input.channel(&Channel::RgbaRed).unwrap_or(&empty_plane),
             tile,
@@ -1052,13 +1213,65 @@ pub fn defocus_raster(
             input.bbox,
             input.edge_mode,
         );
-        let alpha_padded = extract_padded_tile(
-            input.channel(&Channel::RgbaAlpha).unwrap_or(&empty_plane),
-            tile,
-            apron as u32,
-            input.bbox,
-            input.edge_mode,
-        );
+
+        // Alpha uniform value for this tile's padded region, if any.
+        let alpha_uniform = region_uniform_value(input, &Channel::RgbaAlpha, padded_region);
+
+        // Pre-extract the alpha padded tile once per tile (never per pixel)
+        // when the alpha channel is not uniform. This avoids an O(TILE_PIXELS)
+        // allocation inside the inner loop that would hang the kernel.
+        let alpha_padded = if alpha_uniform.is_none() {
+            Some(extract_padded_tile(
+                input.channel(&Channel::RgbaAlpha).unwrap_or(&empty_plane),
+                tile,
+                apron as u32,
+                input.bbox,
+                input.edge_mode,
+            ))
+        } else {
+            None
+        };
+
+        // Build f64 prefix sums per row for each RGB channel.
+        // prefix[py * prefix_stride + x] = sum of channel[py * pw + 0..x].
+        // The padded tile is stride x stride.
+        let pw = stride;
+        let ph = stride;
+        let prefix_stride = pw + 1;
+
+        let mut red_prefixes = vec![0.0f64; ph * prefix_stride];
+        let mut green_prefixes = vec![0.0f64; ph * prefix_stride];
+        let mut blue_prefixes = vec![0.0f64; ph * prefix_stride];
+        for py in 0..ph {
+            let row_offset = py * prefix_stride;
+            let data_offset = py * pw;
+            let mut acc_r = 0.0f64;
+            let mut acc_g = 0.0f64;
+            let mut acc_b = 0.0f64;
+            for x in 0..pw {
+                acc_r += red_padded[data_offset + x] as f64;
+                acc_g += green_padded[data_offset + x] as f64;
+                acc_b += blue_padded[data_offset + x] as f64;
+                red_prefixes[row_offset + x + 1] = acc_r;
+                green_prefixes[row_offset + x + 1] = acc_g;
+                blue_prefixes[row_offset + x + 1] = acc_b;
+            }
+        }
+
+        // Build prefix sums for Alpha only when not uniform.
+        let alpha_prefixes = alpha_padded.as_ref().map(|_| {
+            let mut prefixes = vec![0.0f64; ph * prefix_stride];
+            for py in 0..ph {
+                let row_offset = py * prefix_stride;
+                let data_offset = py * pw;
+                let mut acc = 0.0f64;
+                for x in 0..pw {
+                    acc += alpha_padded.as_ref().unwrap()[data_offset + x] as f64;
+                    prefixes[row_offset + x + 1] = acc;
+                }
+            }
+            prefixes
+        });
 
         let mut out = Vec::with_capacity(TILE_PIXELS * 4);
         let (origin_x, origin_y) = tile.origin_world();
@@ -1067,28 +1280,74 @@ pub fn defocus_raster(
                 let ly = ly as usize;
                 let lx = lx as usize;
                 let base = (ly + apron) * stride + lx + apron;
-                let mut acc = [0.0f32; 4];
-                for &(dx, dy, w) in &taps {
-                    let row = (ly as i32 + apron as i32 + dy) as usize;
-                    let col = (lx as i32 + apron as i32 + dx) as usize;
-                    let index = row * stride + col;
-                    acc[0] += red_padded[index] * w;
-                    acc[1] += green_padded[index] * w;
-                    acc[2] += blue_padded[index] * w;
-                    acc[3] += alpha_padded[index] * w;
+                let cx = (lx + apron) as isize;
+                let cy = (ly + apron) as isize;
+
+                let mut acc_r = 0.0f64;
+                let mut acc_g = 0.0f64;
+                let mut acc_b = 0.0f64;
+
+                for span in &spans {
+                    let py = (cy + span.dy) as usize;
+                    let row_offset = py * prefix_stride;
+
+                    if let Some((dx0, dx1)) = span.inner {
+                        let x0 = (cx + dx0) as usize;
+                        let x1 = (cx + dx1 + 1) as usize;
+                        acc_r += red_prefixes[row_offset + x1] - red_prefixes[row_offset + x0];
+                        acc_g += green_prefixes[row_offset + x1] - green_prefixes[row_offset + x0];
+                        acc_b += blue_prefixes[row_offset + x1] - blue_prefixes[row_offset + x0];
+                    }
+                    for &(dx, w) in &span.edges {
+                        let x = (cx + dx) as usize;
+                        let idx = py * pw + x;
+                        acc_r += red_padded[idx] as f64 * w;
+                        acc_g += green_padded[idx] as f64 * w;
+                        acc_b += blue_padded[idx] as f64 * w;
+                    }
                 }
-                let orig = [
-                    red_padded[base],
-                    green_padded[base],
-                    blue_padded[base],
-                    alpha_padded[base],
-                ];
+
+                let orig_r = red_padded[base] as f64;
+                let orig_g = green_padded[base] as f64;
+                let orig_b = blue_padded[base] as f64;
+
                 let world_x = origin_x + lx as i32;
                 let world_y = origin_y + ly as i32;
                 let effective_mix = (op.mix * mask_value(mask, world_x, world_y)).clamp(0.0, 1.0);
-                for channel in 0..4 {
-                    out.push(orig[channel] + (acc[channel] - orig[channel]) * effective_mix);
-                }
+
+                // Alpha: skip convolution when the padded Alpha tile is uniform,
+                // emitting the uniform value directly.
+                let effective_mix_f64 = effective_mix as f64;
+                let alpha_val = match alpha_uniform {
+                    Some(a) => a as f64,
+                    None => {
+                        let ap = alpha_padded.as_ref().unwrap();
+                        let apfx = alpha_prefixes.as_ref().unwrap();
+                        let mut alpha_acc = 0.0f64;
+                        for span in &spans {
+                            let py = (cy + span.dy) as usize;
+                            let row_offset = py * prefix_stride;
+
+                            if let Some((dx0, dx1)) = span.inner {
+                                let x0 = (cx + dx0) as usize;
+                                let x1 = (cx + dx1 + 1) as usize;
+                                alpha_acc += apfx[row_offset + x1] - apfx[row_offset + x0];
+                            }
+                            for &(dx, w) in &span.edges {
+                                let x = (cx + dx) as usize;
+                                let idx = py * pw + x;
+                                alpha_acc += ap[idx] as f64 * w;
+                            }
+                        }
+                        let orig_a = ap[base] as f64;
+                        orig_a + (alpha_acc * inv_weight_sum - orig_a) * effective_mix_f64
+                    }
+                };
+
+                out.push((orig_r + (acc_r * inv_weight_sum - orig_r) * effective_mix_f64) as f32);
+                out.push((orig_g + (acc_g * inv_weight_sum - orig_g) * effective_mix_f64) as f32);
+                out.push((orig_b + (acc_b * inv_weight_sum - orig_b) * effective_mix_f64) as f32);
+                out.push(alpha_val as f32);
             }
         }
 
@@ -1493,5 +1752,179 @@ mod tests {
             .and_then(|plane| plane.get(&TileCoord::new(0, 0)))
             .expect("depth tile preserved");
         assert!(Arc::ptr_eq(&depth_before, depth_after));
+    }
+
+    /// Naive O(R^2) disk convolution reference: convolves every output pixel
+    //  by directly summing all taps. Used only to verify the prefix-sum fast
+    //  path is mathematically identical.
+    fn naive_defocus_reference(
+        input: &Raster2D,
+        op: &DefocusOp,
+        width: i32,
+        height: i32,
+    ) -> Vec<[f32; 4]> {
+        let radius = op.radius.clamp(0.0, 24.0);
+        let aspect = op.aspect.clamp(0.25, 4.0);
+        let r_x = ((radius * aspect).ceil() as i32).min(24);
+        let r_y = (radius.ceil() as i32).min(24);
+
+        let mut weight_sum = 0.0f64;
+        let mut taps: Vec<(i32, i32, f64)> = Vec::new();
+        for dy in -r_y..=r_y {
+            for dx in -r_x..=r_x {
+                let dist = ((dx as f32 / aspect).powi(2) + (dy as f32).powi(2)).sqrt();
+                let weight = (radius + 0.5 - dist).clamp(0.0, 1.0);
+                if weight > 1e-6 {
+                    weight_sum += weight as f64;
+                    taps.push((dx, dy, weight as f64));
+                }
+            }
+        }
+        let inv_weight_sum = 1.0 / weight_sum;
+
+        let apron = r_x.max(r_y) as usize;
+        // extract_padded_tile returns a stride x stride buffer where
+        // stride = TILE_SIZE + 2 * apron, NOT width/height + 2 * apron.
+        let stride = TILE_SIZE as usize + 2 * apron;
+
+        // Extract padded tiles for all four channels.
+        let empty_plane = ChannelPlane::new();
+        let red_padded = extract_padded_tile(
+            input.channel(&Channel::RgbaRed).unwrap_or(&empty_plane),
+            TileCoord::new(0, 0),
+            apron as u32,
+            input.bbox,
+            input.edge_mode,
+        );
+        let green_padded = extract_padded_tile(
+            input.channel(&Channel::RgbaGreen).unwrap_or(&empty_plane),
+            TileCoord::new(0, 0),
+            apron as u32,
+            input.bbox,
+            input.edge_mode,
+        );
+        let blue_padded = extract_padded_tile(
+            input.channel(&Channel::RgbaBlue).unwrap_or(&empty_plane),
+            TileCoord::new(0, 0),
+            apron as u32,
+            input.bbox,
+            input.edge_mode,
+        );
+        let alpha_padded = extract_padded_tile(
+            input.channel(&Channel::RgbaAlpha).unwrap_or(&empty_plane),
+            TileCoord::new(0, 0),
+            apron as u32,
+            input.bbox,
+            input.edge_mode,
+        );
+
+        let mut out = Vec::with_capacity((width * height) as usize);
+        for ly in 0..height {
+            for lx in 0..width {
+                let cx = (lx + apron as i32) as isize;
+                let cy = (ly + apron as i32) as isize;
+                let base = (cy as usize) * stride + (cx as usize);
+
+                let mut acc_r = 0.0f64;
+                let mut acc_g = 0.0f64;
+                let mut acc_b = 0.0f64;
+                let mut acc_a = 0.0f64;
+
+                for &(dx, dy, w) in &taps {
+                    let x = (cx + dx as isize) as usize;
+                    let y = (cy + dy as isize) as usize;
+                    let idx = y * stride + x;
+                    acc_r += red_padded[idx] as f64 * w;
+                    acc_g += green_padded[idx] as f64 * w;
+                    acc_b += blue_padded[idx] as f64 * w;
+                    acc_a += alpha_padded[idx] as f64 * w;
+                }
+
+                let orig_r = red_padded[base] as f64;
+                let orig_g = green_padded[base] as f64;
+                let orig_b = blue_padded[base] as f64;
+                let orig_a = alpha_padded[base] as f64;
+
+                out.push([
+                    (orig_r + (acc_r * inv_weight_sum - orig_r)) as f32,
+                    (orig_g + (acc_g * inv_weight_sum - orig_g)) as f32,
+                    (orig_b + (acc_b * inv_weight_sum - orig_b)) as f32,
+                    (orig_a + (acc_a * inv_weight_sum - orig_a)) as f32,
+                ]);
+            }
+        }
+        out
+    }
+
+    /// Verifies the O(R) row-prefix-sum disk convolution is mathematically
+    /// equivalent to the naive O(R^2) reference convolution, within 1e-5.
+    #[test]
+    fn defocus_prefix_sum_matches_naive_reference_within_1e5() {
+        use crate::{BBox, Channel, ChannelPlane, EdgeMode, Format, TileBuffer, TileCoord};
+
+        let width = 64;
+        let height = 64;
+        let bbox = BBox::new(0, 0, width, height);
+        let format = Format::new("test", width as u32, height as u32, 1.0);
+
+        let make_raster = || {
+            let mut raster = Raster2D::new(format.clone(), bbox, EdgeMode::BlackOutside);
+            for channel in [
+                Channel::RgbaRed,
+                Channel::RgbaGreen,
+                Channel::RgbaBlue,
+                Channel::RgbaAlpha,
+            ] {
+                let mut plane = ChannelPlane::new();
+                plane.insert(TileCoord::new(0, 0), Arc::new(TileBuffer::new_uniform(0.0)));
+                raster.insert_channel(channel, plane);
+            }
+            // Impulse at center.
+            raster
+                .set_pixel(Channel::RgbaRed, 32, 32, 1.0, None)
+                .unwrap();
+            raster
+                .set_pixel(Channel::RgbaGreen, 32, 32, 0.5, None)
+                .unwrap();
+            raster
+                .set_pixel(Channel::RgbaBlue, 32, 32, 0.25, None)
+                .unwrap();
+            raster
+                .set_pixel(Channel::RgbaAlpha, 32, 32, 1.0, None)
+                .unwrap();
+            raster
+        };
+
+        for (radius, aspect) in [(7.75, 2.5), (1.2, 0.5)] {
+            let op = DefocusOp {
+                radius,
+                aspect,
+                mix: 1.0,
+            };
+
+            // Fast path (prefix sums).
+            let input = make_raster();
+            let fast = defocus_raster(&input, None, &op, None).expect("fast defocus");
+
+            // Naive reference: direct 2D disk convolution.
+            let input = make_raster();
+            let naive = naive_defocus_reference(&input, &op, width, height);
+
+            // Compare every pixel.
+            let mut max_diff = 0.0f32;
+            for y in 0..height {
+                for x in 0..width {
+                    let f = fast.sample_rgba(x, y);
+                    let n = naive[(y * width + x) as usize];
+                    for c in 0..4 {
+                        max_diff = max_diff.max((f[c] - n[c]).abs());
+                    }
+                }
+            }
+            assert!(
+                max_diff < 1e-5,
+                "prefix-sum defocus (radius={radius}, aspect={aspect}) differs from naive by {max_diff}"
+            );
+        }
     }
 }

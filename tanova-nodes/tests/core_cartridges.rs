@@ -44,14 +44,16 @@ fn single_tile_raster(color: [f32; 4]) -> Raster2D {
 fn registry_links_every_core_cartridge() {
     ensure_linked();
     let kinds = registered_cartridge_kinds();
-    assert_eq!(kinds.len(), 27);
+    assert_eq!(kinds.len(), 29);
     for expected in [
         "BackdropNode",
         "Blur",
         "CheckerBoard2",
         "Clamp",
+        "CornerPin2D",
         "Crop",
         "Constant",
+        "Defocus",
         "Dot",
         "Dummy",
         "FrameHold",

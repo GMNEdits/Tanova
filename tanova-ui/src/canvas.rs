@@ -62,6 +62,11 @@ const CONTEXT_MENU_KINDS: &[&str] = &[
     "Viewer",
     "Dot",
     "BackdropNode",
+    "Mirror",
+    "Ramp",
+    "CornerPin2D",
+    "Defocus",
+    "Glow",
 ];
 
 const WIRE_ACTIVE: Color32 = Color32::from_rgb(245, 220, 120);
@@ -332,11 +337,45 @@ impl GraphMirror {
                     // format is active, stamp the real resolution so a fresh
                     // Constant matches the viewer instead of oversizing.
                     if let Some(format) = self.project_format {
-                        if knobs.contains_key("format_width") {
+                        if knobs.get("format_width") == Some(&KnobValue::Int(1920))
+                            && knobs.get("format_height") == Some(&KnobValue::Int(1080))
+                        {
                             knobs.insert("format_width", KnobValue::Int(format.width as i64));
-                        }
-                        if knobs.contains_key("format_height") {
                             knobs.insert("format_height", KnobValue::Int(format.height as i64));
+                        }
+                        // Stamp Ramp's `p1` corner onto the project format so
+                        // the ramp handle sits on the format corner instead of
+                        // the 256px cartridge default.
+                        if kind == "Ramp" {
+                            if let Some(KnobValue::Color(c)) = knobs.get("p1") {
+                                if *c == [256.0, 256.0, 0.0, 0.0]
+                                    && (format.width as f32 != 256.0
+                                        || format.height as f32 != 256.0)
+                                {
+                                    knobs.insert(
+                                        "p1",
+                                        KnobValue::Color([
+                                            format.width as f32,
+                                            format.height as f32,
+                                            0.0,
+                                            0.0,
+                                        ]),
+                                    );
+                                }
+                            }
+                        }
+                        if kind == "CornerPin2D" {
+                            let w = format.width as f32;
+                            let h = format.height as f32;
+                            for (name, default, stamped) in [
+                                ("to2", [256.0, 0.0, 0.0, 0.0], [w, 0.0, 0.0, 0.0]),
+                                ("to3", [256.0, 256.0, 0.0, 0.0], [w, h, 0.0, 0.0]),
+                                ("to4", [0.0, 256.0, 0.0, 0.0], [0.0, h, 0.0, 0.0]),
+                            ] {
+                                if knobs.get(name) == Some(&KnobValue::Color(default)) {
+                                    knobs.insert(name, KnobValue::Color(stamped));
+                                }
+                            }
                         }
                     }
                     self.nodes.push(CanvasNode {
@@ -2963,9 +3002,9 @@ pub fn input_port_side(kind: &str, input_count: usize, port_index: usize) -> Por
 /// Number of input ports a cartridge exposes to the canvas.
 fn input_port_count(kind: &str) -> usize {
     match kind {
-        "Constant" | "Read" | "BackdropNode" | "CheckerBoard2" => 0,
+        "Constant" | "Read" | "BackdropNode" | "CheckerBoard2" | "Ramp" => 0,
         "Merge2" => 3,
-        "Grade" | "Switch" | "Clamp" | "Saturation" => 2,
+        "Grade" | "Switch" | "Clamp" | "Saturation" | "Glow" | "Defocus" => 2,
         _ => 1,
     }
 }
@@ -3866,10 +3905,11 @@ mod tests {
         graph.apply_event(&KernelEvent::Applied(add_node(2, 40.0, 160.0)));
         graph.apply_event(&KernelEvent::Applied(connect(1, 2)));
 
+        let original_knobs = graph.node(NodeId(2)).unwrap().knobs.clone();
         let command = graph.removal_command(NodeId(2)).expect("snapshot");
         match &command {
             UndoableCommand::RemoveNode { knobs, edges, .. } => {
-                assert_eq!(knobs.len(), 0);
+                assert_eq!(knobs.as_ref(), &original_knobs);
                 assert_eq!(edges.len(), 1);
             }
             other => panic!("expected RemoveNode, got {other:?}"),
@@ -3882,6 +3922,7 @@ mod tests {
         graph.apply_event(&KernelEvent::Undone(command));
         assert_eq!(graph.node_count(), 2);
         assert_eq!(graph.edge_count(), 1);
+        assert_eq!(graph.node(NodeId(2)).unwrap().knobs, original_knobs);
         assert_eq!(
             graph.node(NodeId(2)).map(|node| (node.x, node.y)),
             Some((40.0, 160.0))
@@ -6029,6 +6070,149 @@ mod tests {
                 "pan at drag point {i} must be finite, got {:?}",
                 pan
             );
+        }
+    }
+
+    #[test]
+    fn phase_seven_cartridges_spawnable_with_expected_ports_and_2d_knobs() {
+        use crate::theme::NodeCategory;
+        use tanova_kernel::UndoableCommand;
+
+        tanova_nodes::ensure_linked();
+        let mut graph = GraphMirror::default();
+
+        // Spawn each Phase 7 cartridge via AddNode through GraphMirror.
+        for (kind, expected_ports, category, xy_rows) in [
+            ("Ramp", 0, NodeCategory::Color, 2),
+            ("Mirror", 1, NodeCategory::Transform, 0),
+            ("CornerPin2D", 1, NodeCategory::Transform, 4),
+            ("Defocus", 2, NodeCategory::Filter, 0),
+            ("Glow", 2, NodeCategory::Filter, 0),
+        ] {
+            assert!(CONTEXT_MENU_KINDS.contains(&kind));
+            assert!(spawnable_kinds(ViewerWorkflow::Nuke).contains(&kind));
+            let id = graph.next_node_id();
+            graph.apply_command(&UndoableCommand::AddNode {
+                id,
+                kind: kind.to_string(),
+                x: 0.0,
+                y: 0.0,
+            });
+            let node = graph.node(id).expect("{kind} must be in mirror");
+            assert_eq!(
+                input_port_count(&node.kind),
+                expected_ports,
+                "{kind} must expose {expected_ports} input port(s)"
+            );
+            assert_eq!(node_category(&node.kind), category, "{kind}");
+            if expected_ports == 2 {
+                assert_eq!(input_port_label(kind, 2, 0), "in");
+                assert_eq!(input_port_label(kind, 2, 1), "M");
+                assert_eq!(input_port_side(kind, 2, 0), PortSide::Top);
+                assert_eq!(input_port_side(kind, 2, 1), PortSide::Right);
+            }
+
+            // Inspect real PropertiesPanel paint output rather than duplicating
+            // its dispatch condition in the test.
+            let ctx = egui::Context::default();
+            let mut panel = crate::properties::PropertiesPanel::default();
+            let output = ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 1600.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            assert!(panel.show(ui, &graph, Some(id), None).is_empty());
+                        });
+                    });
+                },
+            );
+            fn collect_text(shape: &egui::Shape, text: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(s) => text.push(s.galley.text().to_owned()),
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            collect_text(shape, text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut labels = Vec::new();
+            for shape in &output.shapes {
+                collect_text(&shape.shape, &mut labels);
+            }
+            assert_eq!(
+                labels.iter().filter(|text| *text == "X").count(),
+                xy_rows,
+                "{kind}: {labels:?}"
+            );
+            assert_eq!(
+                labels.iter().filter(|text| *text == "Y").count(),
+                xy_rows,
+                "{kind}: {labels:?}"
+            );
+            if kind == "CornerPin2D" {
+                assert!(
+                    !labels
+                        .iter()
+                        .any(|text| ["R", "G", "B", "A"].contains(&text.as_str()))
+                );
+            }
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn phase_seven_format_stamps_match_kernel_and_survive_echoes() {
+        tanova_nodes::ensure_linked();
+        for (width, height) in [(256, 256), (1280, 720), (1920, 1080), (2048, 1556)] {
+            let format = ProjectFormat { width, height };
+            let mut dag = tanova_kernel::Dag::new();
+            dag.set_project_format(Some(format));
+            let mut graph = GraphMirror::default();
+            graph.set_project_format(format);
+            for kind in ["Ramp", "CornerPin2D"] {
+                let id = graph.next_node_id();
+                let add = UndoableCommand::AddNode {
+                    id,
+                    kind: kind.into(),
+                    x: 0.0,
+                    y: 0.0,
+                };
+                dag.apply_command(add.clone()).unwrap();
+                graph.apply_command(&add);
+                assert_eq!(graph.node(id).unwrap().knobs, dag.node(id).unwrap().knobs);
+                let w = width as f32;
+                let h = height as f32;
+                let expected = if kind == "Ramp" {
+                    vec![("p1", [w, h, 0.0, 0.0])]
+                } else {
+                    vec![
+                        ("to2", [w, 0.0, 0.0, 0.0]),
+                        ("to3", [w, h, 0.0, 0.0]),
+                        ("to4", [0.0, h, 0.0, 0.0]),
+                    ]
+                };
+                for (name, value) in &expected {
+                    assert_eq!(
+                        graph.node(id).unwrap().knobs.get(name),
+                        Some(&KnobValue::Color(*value))
+                    );
+                }
+                let edit = UndoableCommand::SetKnob {
+                    node: id,
+                    knob: expected[0].0.into(),
+                    value: KnobValue::Color([17.0, 23.0, 0.0, 0.0]),
+                    previous: KnobValue::Color(expected[0].1),
+                };
+                dag.apply_command(edit.clone()).unwrap();
+                graph.apply_command(&edit);
+                graph.apply_command(&add);
+                assert_eq!(graph.node(id).unwrap().knobs, dag.node(id).unwrap().knobs);
+            }
         }
     }
 }

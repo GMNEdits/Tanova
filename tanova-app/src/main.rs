@@ -633,6 +633,7 @@ impl TanovaApp {
             if self.in_flight_knob_edits > 0
                 || self.properties.is_dragging_knob()
                 || self.curve_editor.is_dragging_key()
+                || self.viewer.is_dragging_overlay()
             {
                 return;
             }
@@ -1184,6 +1185,7 @@ impl TanovaApp {
             .min_size(200.0)
             .show(ui, |ui| {
                 let keyframes = self.graph.keyframe_times(self.canvas.primary_selected);
+                self.viewer.current_frame = self.timeline.current;
                 let mut messages = self
                     .viewer
                     .show(ui, &self.graph, self.canvas.primary_selected);
@@ -1300,7 +1302,13 @@ impl TanovaApp {
         }
 
         // The kernel runs on its own thread; poll it at display cadence.
-        if self.awaiting_kernel {
+        // Keep repainting while any drag is live so `FrameReady` texture
+        // uploads are displayed the instant the worker finishes — even if the
+        // mouse isn't moving and no new kernel messages are in flight.
+        let is_dragging = self.properties.is_dragging_knob()
+            || self.curve_editor.is_dragging_key()
+            || self.viewer.is_dragging_overlay();
+        if self.awaiting_kernel || is_dragging {
             ui.ctx().request_repaint();
         }
         // Playback must tick even while the pointer is motionless.

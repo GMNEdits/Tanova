@@ -722,6 +722,45 @@ impl Dag {
             node.knobs
                 .insert("format_height", KnobValue::Int(format.height as i64));
         }
+        if node.kind == "Ramp"
+            && node.knobs.get("p1") == Some(&KnobValue::Color([256.0, 256.0, 0.0, 0.0]))
+        {
+            node.knobs.insert(
+                "p1",
+                KnobValue::Color([format.width as f32, format.height as f32, 0.0, 0.0]),
+            );
+        }
+
+        // Stamp CornerPin2D destination corners onto the project format so all
+        // four handles sit squarely on the format corners when freshly spawned.
+        if node.kind == "CornerPin2D" {
+            let w = format.width as f32;
+            let h = format.height as f32;
+            // to1 defaults to [0,0,0,0] — never stamp (it's already the origin).
+            let to2_default = matches!(
+                node.knobs.get("to2"),
+                Some(KnobValue::Color(c)) if *c == [256.0, 0.0, 0.0, 0.0]
+            );
+            let to3_default = matches!(
+                node.knobs.get("to3"),
+                Some(KnobValue::Color(c)) if *c == [256.0, 256.0, 0.0, 0.0]
+            );
+            let to4_default = matches!(
+                node.knobs.get("to4"),
+                Some(KnobValue::Color(c)) if *c == [0.0, 256.0, 0.0, 0.0]
+            );
+            if to2_default {
+                node.knobs
+                    .insert("to2", KnobValue::Color([w, 0.0, 0.0, 0.0]));
+            }
+            if to3_default {
+                node.knobs.insert("to3", KnobValue::Color([w, h, 0.0, 0.0]));
+            }
+            if to4_default {
+                node.knobs
+                    .insert("to4", KnobValue::Color([0.0, h, 0.0, 0.0]));
+            }
+        }
     }
 
     /// Adds a node with its cartridge attached.

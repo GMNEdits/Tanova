@@ -5,7 +5,9 @@ All notable changes to Tanova are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - Phase 7
+## [0.6.0] - 2026-11-22
+
+**Phase 7 — Studio Compositing, Spatial Warping & Curve Editor (Milestones 23–24).** Ships an Interactive Curve Editor tab, Node Graph Minimap, projective 4-point homography `CornerPin2D`, optical circular/anamorphic disk `Defocus`, `Mirror`/`Ramp`/`Glow` cartridges (**29 total**), and live-GUI responsiveness fixes for continuous knob/handle dragging.
 
 ### Added
 
@@ -22,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `CanvasState.show_minimap` (default `false`) plus a pure-ASCII `[Map]` toggle in the Node Graph header bar next to `zoom XX%`.
   - When enabled, a `170 x 110` semi-transparent dark inset in the bottom-right corner draws category-colored node rectangles (orange outline for selected) and a translucent viewport indicator.
   - Input priority: pointer interaction inside the minimap is checked before canvas panning, node hit-testing, or box selection, so clicking/dragging inside the minimap pans `state.pan` to center the clicked world point without dragging nodes or starting box selection underneath.
+
+- **Milestone 24 — `CornerPin2D` & `Defocus` cartridges + Phase 7 UI integration (`tanova-nodes`, `tanova-kernel`, `tanova-parse`, `tanova-ui`, `tanova-app`):**
+  - New `"CornerPin2D"` cartridge: one input, four corner knobs (`to1`–`to4`) stored as `Color([x, y, 0, 0])`, plus an `invert` knob. Solves a `Mat3x3` homography from the input's source quad to the destination quad and warps via `perspective_warp_raster`. Zero-copy identity fast path, OOM-safe clamped output bbox, and `serialize_to_tcl` round-trip.
+  - New `"Defocus"` cartridge: two inputs (main + optional `mask` on `PortId(1)`), `defocus` radius, `aspect`, and `mix` knobs. Blurs via `defocus_raster` with an anti-aliased elliptical disk kernel; non-RGBA AOVs pass through by `Arc` clone.
+  - New `CornerPin2D` Viewer overlay: a translucent orange wireframe quad connecting four labeled handles, using the same forward/inverse image mapping as the pixel HUD. Handle presses take priority over panning; absolute pointer drags emit `SetKnob`, or an atomic knob/curve auto-key batch for animated corners at the playhead. `TanovaApp::fold_event` protects the mirror with `|| self.viewer.is_dragging_overlay()`.
+  - `Ramp` added to the 0-input `GENERATORS` list so `.nk`/`.tnv` loading never auto-connects an upstream pipe.
+  - `ProjectFormat` stamping: `Ramp`'s `p1` corner and `CornerPin2D`'s `to2`–`to4` corners are stamped onto the project format when freshly spawned at defaults.
+  - Theme categories: `Ramp` → `Color`; `Mirror` / `CornerPin2D` → `Transform`; `Glow` / `Defocus` → `Filter`.
+  - Spawn menus and port counts: all five Phase 7 cartridges appear in context menu / Tab search / `+ Add Node`. `Ramp` → 0 inputs, `Mirror` / `CornerPin2D` → 1 input, `Glow` / `Defocus` → 2 inputs.
+  - Inspector controls: `p0` / `p1` (Ramp) and `to1`–`to4` (CornerPin2D) render as clean 2D X/Y `DragValue` rows (never RGBA pickers); `ramp_type` renders as a `ComboBox` with `linear` / `smooth` / `plinear`.
+  - 29 total registered cartridges (27 + `CornerPin2D` + `Defocus`).
 
 ## [v0.5.0] - 2026-11-19
 
@@ -125,6 +138,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Mix slider froze mid-drag and jumped to the release position (`tanova-ui`, `tanova-app`, `tanova-kernel`):** the properties bin disables drag-to-scroll on its `ScrollArea` (a horizontal drag could be interpreted as a scroll gesture), pins the `mix` widget to a stable id, and fixes the readout width with `custom_formatter("{value:.2}")` instead of `fixed_decimals` (which mutated the bound value). The kernel now keeps draining and applying messages **until its queue is empty** and then renders once, instead of paying one GPU render per drag frame, and it retires a burst of auto-key `Batch([SetKnob, SetKnobCurve])` messages in the same drain. `TanovaApp::dispatch` bumps the shared `render_epoch` for knob and time updates so a render already running for an older value is abandoned, and `render_viewer` keeps the last good image when a render is preempted instead of blanking the viewer. The app additionally tracks `in_flight_knob_edits` and refuses to fold a knob `Applied` echo back into the mirror while edits are outstanding or a drag is live, so an intermediate drag step can never roll the thumb backward.
 
 - **Viewer `Display transform` combo box showed a blank closed button (`tanova-ui`):** the combo box now sets `.selected_text(...)` from a `DisplayTransform` label helper, so the active transform (`Linear`, `sRGB`, `Rec.709`, or `ACES`) is always visible without opening the dropdown.
+
+- **CornerPin2D handle drag froze the image until cursor paused (`tanova-kernel`, `tanova-render`):** continuous `SetKnob` streams from live handle dragging no longer starve `render_viewer`. `kernel_loop` tracks `consecutive_preemptions`, drains `cmd_rx.try_recv()` through `coalesce_batch` before each retry so the newest state renders first, and switches to a fresh unshared `RenderEpoch` after one preemption — guaranteeing at most one render is abandoned before a live `FrameReady` completes. `perspective_warp_raster` now builds a borrowed per-channel tile-pointer grid (`Vec<Option<&TileBuffer>>`) for O(1) bilinear sampling instead of per-tap `HashMap` lookups, keeping zero governor bytes on identity and zero-copy non-RGBA AOVs.
+
+- **Defocus DragValue updated only on mouse release (`tanova-render`, `tanova-app`, `tanova-nodes`):** `defocus_raster` now uses an exact O(R) `f64` row-prefix-sum disk convolution (interior chord collapsed to one prefix-sum subtraction per row plus feathered edge taps), a 15x–20x speedup over brute-force O(R²) taps, so continuous `defocus`/`aspect` knob drags produce a fresh blurred frame every 16 ms. The kernel tracks `in_flight_knob_edits > 0` / active drags and calls `ctx.request_repaint_after(16ms)` so `FrameReady` uploads land the instant the worker finishes. `KernelHandle::drop()` bumps `render_epoch` before `Shutdown` so the worker aborts and exits cleanly on window close.
 
 ## [v0.4.5] - 2026-11-16
 

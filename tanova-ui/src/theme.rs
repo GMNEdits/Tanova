@@ -32,10 +32,10 @@ pub fn node_category(kind: &str) -> NodeCategory {
     match kind {
         "Read" | "Write" => NodeCategory::Io,
         "Constant" | "Grade" | "ColorCorrect" | "Invert" | "Premult" | "Unpremult" | "Clamp"
-        | "Saturation" | "CheckerBoard2" => NodeCategory::Color,
+        | "Saturation" | "CheckerBoard2" | "Ramp" => NodeCategory::Color,
         "Merge2" | "Switch" | "Shuffle" => NodeCategory::Merge,
-        "Blur" | "TimeOffset" | "FrameHold" => NodeCategory::Filter,
-        "Transform" | "Crop" | "Reformat" => NodeCategory::Transform,
+        "Blur" | "TimeOffset" | "FrameHold" | "Glow" | "Defocus" => NodeCategory::Filter,
+        "Transform" | "Crop" | "Reformat" | "Mirror" | "CornerPin2D" => NodeCategory::Transform,
         "Viewer" => NodeCategory::Viewer,
         _ => NodeCategory::Other,
     }
