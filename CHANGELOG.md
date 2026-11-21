@@ -60,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`defocus_raster` panicked on non-finite knob values (`tanova-render`, `tanova-nodes`):** guards against `!radius.is_finite()`, `!aspect.is_finite()`, `!mix.is_finite()` before clamping, returning the input unchanged for non-finite values.
 
+### Known Limitations
+
+- **No auto-save or crash recovery:** The Milestone 14 unsaved-changes guard prompts on close, but there is no periodic auto-save. A crash or kill loses all work since the last manual `Save`/`Save As`.
+- **Sequence render has no resume / checkpoint:** The Milestone 16 `Write` sequence render reports `WriteFrameRendered` (`frame of first..last`) and `WriteCompleted`, but if a render is interrupted there is no checkpoint; re-running always restarts from frame `first` of `first..=last`.
+- **Color management lacks OpenColorIO integration:** OpenEXR files are read, processed, and displayed in the Viewer as raw linear data without display transforms (e.g., sRGB/ACES).
+- **Graph parallelism is single-threaded:** Branch evaluation in `Dag::pull` is currently single-threaded; large multi-branch graphs cannot parallelize across CPU cores.
+- **File browser filters to supported extensions only:** File dialogs only surface `.tnv`, `.nk`, and `.exr` files (via `is_supported_script_file` / `is_supported_exr_file`). There is no "all files" mode and no recently-opened scripts list.
+
 ## [v0.5.0] - 2026-11-19
 
 **Phase 6 — Production Compositing Engine (Milestones 20–22).** Ships 13 new cartridges (**24 total**), a bounded GreedyDual-Size DAG cache, viewer display transforms with `R`/`G`/`B`/`A` soloing, demand-driven `upstream_inputs` routing with temporal nodes, `TransformChain` matrix concatenation, and a live `{curve ...}` keyframe animation engine with a full-width timeline scrubber.
