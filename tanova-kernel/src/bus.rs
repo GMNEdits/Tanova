@@ -4,14 +4,16 @@
 //! one channel and receives [`KernelEvent`]s over another, so the microkernel
 //! can live on its own thread while the UI stays stateless.
 
+use std::io::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 
 use crate::command::EdgeSnapshot;
-use crate::dag::Dag;
+use crate::dag::{Dag, TANOVA_SCHEMA_VERSION};
 use crate::governor::{MemoryGovernor, RenderEpoch};
 use crate::knobs::{KnobTable, KnobValue};
 use crate::registry::find_cartridge;
@@ -36,6 +38,82 @@ pub type FrameExporterFn = std::sync::Arc<
 /// (which requires `Clone + Send + Sync`).
 #[derive(Clone)]
 pub struct FrameExporter(pub FrameExporterFn);
+
+/// Monotonic counter keeping temp-file names unique within one process.
+static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Writes `contents` to `path` atomically, using only the standard library.
+///
+/// The bytes go to a unique hidden temp file **in the same directory** as the
+/// destination, are flushed and `fsync`ed, and only then renamed over `path`.
+/// Same-directory placement matters: renaming across filesystems fails with
+/// `EXDEV` on Linux, which would break a `/tmp`-based temp file for a project
+/// stored on another mount.
+///
+/// If any step fails the temp file is removed best-effort, so no orphaned
+/// `.tanova-tmp-*` files are left behind and the previous `path` contents
+/// survive untouched.
+pub fn atomic_write_string(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tanova-project");
+    let counter = ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(".{file_name}.tanova-tmp-{}-{counter}", std::process::id());
+    let tmp_path = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => std::path::PathBuf::from(tmp_name),
+    };
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        // Drop the handle before renaming: Windows refuses to rename an open
+        // file, and closing first is correct everywhere.
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+/// Inserts `# tanova_recovery_source <path>` right after the schema line.
+///
+/// The path is flattened to a single line (`\r`/`\n` stripped) so a hostile or
+/// accidental newline can never inject extra TCL commands into the snapshot.
+fn tcl_with_recovery_source(tcl: &str, source: &std::path::Path) -> String {
+    let sanitized: String = source
+        .to_string_lossy()
+        .chars()
+        .filter(|character| *character != '\r' && *character != '\n')
+        .collect();
+    let marker = format!("# tanova_schema {TANOVA_SCHEMA_VERSION}\n");
+    match tcl.find(&marker) {
+        Some(position) => {
+            let insert_at = position + marker.len();
+            let mut out = String::with_capacity(tcl.len() + sanitized.len() + 32);
+            out.push_str(&tcl[..insert_at]);
+            out.push_str(&format!("# tanova_recovery_source {sanitized}\n"));
+            out.push_str(&tcl[insert_at..]);
+            out
+        }
+        None => format!("# tanova_recovery_source {sanitized}\n{tcl}"),
+    }
+}
 
 /// A state change the UI asks the kernel to perform.
 ///
@@ -351,6 +429,18 @@ pub enum KernelMessage {
     },
     /// Persist the current DAG to a `.nk` file.
     SaveScript { path: std::path::PathBuf },
+    /// Write a crash-recovery snapshot atomically.
+    ///
+    /// Never touches the undo stack, the dirty flag, or the viewer: an
+    /// auto-save is a background safety net, not a user save. When
+    /// `source_path` is set it is recorded as `# tanova_recovery_source` so a
+    /// restored session re-binds to the real project, not the snapshot.
+    WriteAutoSave {
+        /// Snapshot destination (typically `<recovery>/autosave.tnv`).
+        path: std::path::PathBuf,
+        /// Original project path, when the project has been saved before.
+        source_path: Option<std::path::PathBuf>,
+    },
     /// Render a `Write` node's frame sequence to disk via the registered
     /// `FrameExporter`. Does not mark the project dirty.
     ExecuteWriteNode { node: NodeId },
@@ -1369,15 +1459,41 @@ fn apply_kernel_message(
         }
         KernelMessage::SaveScript { path } => {
             let tcl = dag.export_to_tcl();
-            match std::fs::write(&path, &tcl) {
+            match atomic_write_string(&path, &tcl) {
                 Ok(()) => {
                     undo.mark_saved();
                     let _ = events.send(KernelEvent::ScriptSaved { path: path.clone() });
                     let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
                 }
                 Err(e) => {
+                    // A failed save must leave the graph dirty so the user is
+                    // never told an unwritten file is safe. Re-broadcast the
+                    // authoritative dirty state alongside the error.
                     let _ = events.send(KernelEvent::ScriptError {
                         message: e.to_string(),
+                    });
+                    let _ = events.send(KernelEvent::DirtyStateChanged {
+                        is_dirty: undo.is_dirty(),
+                    });
+                }
+            }
+        }
+        KernelMessage::WriteAutoSave { path, source_path } => {
+            // A background snapshot is not a user save: never touch the undo
+            // stack, the dirty flag, or the viewer.
+            let tcl = dag.export_to_tcl();
+            let snapshot = match &source_path {
+                Some(source) => tcl_with_recovery_source(&tcl, source),
+                None => tcl,
+            };
+            match atomic_write_string(&path, &snapshot) {
+                Ok(()) => {
+                    // A background snapshot is not a user save: no event is
+                    // emitted on success so nothing in the UI changes.
+                }
+                Err(e) => {
+                    let _ = events.send(KernelEvent::ScriptError {
+                        message: format!("auto-save failed: {e}"),
                     });
                 }
             }

@@ -234,7 +234,10 @@ fn run_desktop() -> Result<(), AppError> {
         Box::new(|cc| {
             let gpu = gpu_from_render_state(cc)?;
             let kernel = KernelHandle::spawn().map_err(kernel_error)?;
-            Ok(Box::new(TanovaApp::new(kernel, gpu)))
+            let mut app = TanovaApp::new(kernel, gpu);
+            app.recovery_dir = TanovaApp::default_recovery_dir();
+            app.check_for_recovery_snapshot();
+            Ok(Box::new(app))
         }),
     )
     .map_err(|error| -> AppError { Box::new(std::io::Error::other(error.to_string())) })
@@ -407,6 +410,27 @@ struct TanovaApp {
     /// Whether the CentralPanel is showing the Curve Editor (`true`) or the
     /// Node Graph (`false`).
     pub curve_editor_view: bool,
+    /// Follow-up action to run once `ScriptSaved` confirms a save
+    /// (e.g. save-then-quit). Only applied after the kernel confirms.
+    pub pending_post_save: Option<PendingUnsavedAction>,
+    /// True while a `SaveScript` is awaiting its `ScriptSaved` confirmation.
+    pub save_in_flight: bool,
+    /// Recovery directory (`Some` only in live desktop startup; `None` in
+    /// headless/tests so tests never touch the user's real `$HOME`).
+    pub recovery_dir: Option<PathBuf>,
+    /// Last user interaction time, used for idle auto-save gating.
+    /// Only set on graph-mutating edits — never on passive mouse movement.
+    pub last_user_action: Option<Instant>,
+    /// Last auto-save write time, enforcing the 30s minimum interval.
+    /// `None` until the first auto-save has completed.
+    pub last_auto_save: Option<Instant>,
+    /// True when there are unsaved changes since the last auto-save.
+    /// Prevents repeated auto-saves of the same state.
+    pub autosave_dirty: bool,
+    /// Path of the pending recovery snapshot, removed on clean exit.
+    pub recovery_snapshot_path: Option<PathBuf>,
+    /// Snapshot awaiting a crash-restore decision, if any.
+    pub pending_recovery: Option<PathBuf>,
 }
 
 impl TanovaApp {
@@ -439,6 +463,14 @@ impl TanovaApp {
             in_flight_knob_edits: 0,
             curve_editor: CurveEditorPanel::default(),
             curve_editor_view: false,
+            pending_post_save: None,
+            save_in_flight: false,
+            recovery_dir: None,
+            last_user_action: None,
+            last_auto_save: None,
+            autosave_dirty: false,
+            recovery_snapshot_path: None,
+            pending_recovery: None,
         };
         app.seed_graph();
         app
@@ -575,9 +607,23 @@ impl TanovaApp {
             KernelEvent::DirtyStateChanged { is_dirty } => {
                 self.is_dirty = *is_dirty;
             }
-            KernelEvent::ScriptSaved { .. } => {}
+            KernelEvent::ScriptSaved { path } => {
+                // Only the kernel's confirmation makes a save official: bind
+                // the path, clear the dirty flag, and drop any recovery
+                // snapshot now that the work is durably stored.
+                self.script_path = Some(path.clone());
+                self.is_dirty = false;
+                self.save_in_flight = false;
+                self.last_auto_save = None;
+                self.autosave_dirty = false;
+                self.clear_recovery_snapshot();
+                // `pending_post_save` is executed in `draw()` where `ctx` is
+                // available (needed for save-then-quit).
+            }
             KernelEvent::ScriptError { message } => {
                 self.last_script_error = Some(message.clone());
+                // A failed save is no longer in flight, so a retry can proceed.
+                self.save_in_flight = false;
             }
             KernelEvent::WriteFrameRendered {
                 node: _,
@@ -869,6 +915,18 @@ impl TanovaApp {
             if let KernelMessage::Execute(_) = &message {
                 self.is_dirty = true;
             }
+            // Track graph-mutating edits centrally for idle auto-save gating.
+            // Never reset on passive mouse movement or idle frames.
+            if matches!(
+                &message,
+                KernelMessage::Execute(_)
+                    | KernelMessage::Undo
+                    | KernelMessage::Redo
+                    | KernelMessage::RouteNukeViewer { .. }
+            ) {
+                self.last_user_action = Some(Instant::now());
+                self.autosave_dirty = true;
+            }
             if let KernelMessage::SetViewerNode(node) = &message {
                 self.viewer.bind(*node);
             }
@@ -969,6 +1027,9 @@ impl TanovaApp {
         self.script_path = None;
         self.is_dirty = false;
         self.last_script_error = None;
+        self.last_auto_save = None;
+        self.autosave_dirty = false;
+        self.clear_recovery_snapshot();
     }
 
     /// Opens a `.nk` script from `path`, replacing the current graph. Returns
@@ -996,6 +1057,9 @@ impl TanovaApp {
         self.script_path = Some(path.clone());
         self.is_dirty = false;
         self.last_script_error = None;
+        self.last_auto_save = None;
+        self.autosave_dirty = false;
+        self.clear_recovery_snapshot();
 
         self.kernel
             .send(KernelMessage::ReplaceDag {
@@ -1007,12 +1071,16 @@ impl TanovaApp {
         Ok(())
     }
 
-    /// Saves the current graph to `path` (appending `.tnv` when no recognized
-    /// extension is present) and marks the script clean.
-    pub fn execute_save_to_path(&mut self, path: PathBuf) {
+    /// Sends the current graph to the kernel for atomic saving to `path`
+    /// (appending `.tnv` when no recognized extension is present).
+    ///
+    /// The script is **not** marked clean here: `script_path` and `is_dirty`
+    /// are only updated when the kernel echoes `ScriptSaved`. `follow_up`, if
+    /// set, runs only after that confirmation (save-then-quit etc.).
+    pub fn execute_save_to_path(&mut self, path: PathBuf, follow_up: Option<PendingUnsavedAction>) {
         let path = ensure_script_extension(path);
-        self.script_path = Some(path.clone());
-        self.is_dirty = false;
+        self.pending_post_save = follow_up;
+        self.save_in_flight = true;
         let _ = self.kernel.send(KernelMessage::SaveScript { path });
     }
 }
@@ -1020,6 +1088,12 @@ impl TanovaApp {
 impl eframe::App for TanovaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
+    }
+
+    /// Called once on shutdown by eframe: clear any pending recovery snapshot
+    /// so it does not linger after the user has saved or quit cleanly.
+    fn on_exit(&mut self) {
+        self.clear_recovery_snapshot();
     }
 }
 
@@ -1030,6 +1104,26 @@ impl TanovaApp {
     /// plain `egui::Ui` instead of an `eframe::Frame`.
     fn draw(&mut self, ui: &mut egui::Ui) {
         self.pump();
+
+        // Run any deferred follow-up (save-then-quit etc.) only after the
+        // kernel has confirmed the save via `ScriptSaved`.
+        if self.pending_post_save.is_some() && !self.save_in_flight {
+            if let Some(action) = self.pending_post_save.take() {
+                match action {
+                    PendingUnsavedAction::NewScript => self.execute_new_script(),
+                    PendingUnsavedAction::OpenScript => self.open_file_modal(),
+                    PendingUnsavedAction::QuitApp => {
+                        self.allow_close = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+
+        // Idle background auto-save (live desktop only; no-op in tests).
+        // `last_user_action` is updated centrally in `dispatch` on graph edits,
+        // never on passive mouse movement or idle frames.
+        self.maybe_trigger_autosave(ui.ctx(), Instant::now());
 
         // Apply studio theme visuals to the egui context (cache-safe: only
         // updates when panel_fill actually changes).
@@ -1291,6 +1385,12 @@ impl TanovaApp {
                 }
             });
 
+        // Crash-recovery modal: offered before any file or unsaved-changes
+        // modal, so a restored session re-binds to its real project path.
+        if self.pending_recovery.is_some() {
+            self.draw_crash_recovery_modal(ui.ctx());
+        }
+
         // File browser modal (Open / Save As).
         if self.file_modal.is_some() {
             self.draw_file_modal(ui.ctx());
@@ -1542,7 +1642,7 @@ impl TanovaApp {
             }
             if ui.button("Save (Ctrl+S)").clicked() {
                 match &self.script_path {
-                    Some(path) => self.execute_save_to_path(path.clone()),
+                    Some(path) => self.execute_save_to_path(path.clone(), None),
                     None => self.request_save_as(ui.ctx(), None),
                 }
                 ui.close();
@@ -1581,7 +1681,7 @@ impl TanovaApp {
                     egui::Key::O => self.request_open_script(ctx),
                     egui::Key::S if modifiers.shift => self.request_save_as(ctx, None),
                     egui::Key::S => match &self.script_path {
-                        Some(path) => self.execute_save_to_path(path.clone()),
+                        Some(path) => self.execute_save_to_path(path.clone(), None),
                         None => self.request_save_as(ctx, None),
                     },
                     egui::Key::Q => self.request_close(PendingUnsavedAction::QuitApp, ctx),
@@ -1919,17 +2019,10 @@ impl TanovaApp {
                 self.last_script_error = None;
             }
             ModalOutcome::ConfirmSave { path, follow_up } => {
-                self.execute_save_to_path(path);
-                if let Some(action) = follow_up {
-                    match action {
-                        PendingUnsavedAction::NewScript => self.execute_new_script(),
-                        PendingUnsavedAction::OpenScript => self.open_file_modal(),
-                        PendingUnsavedAction::QuitApp => {
-                            self.allow_close = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    }
-                }
+                // Save now; the follow_up runs only after `ScriptSaved`
+                // confirms (see `draw()`), so a save-then-quit never acts on
+                // an unsaved file.
+                self.execute_save_to_path(path, follow_up);
             }
             ModalOutcome::ConfirmOpen { path } => {
                 if self.execute_open_path(path).is_err() {
@@ -2194,19 +2287,12 @@ impl TanovaApp {
         if do_save {
             match &self.script_path {
                 Some(path) => {
-                    self.execute_save_to_path(path.clone());
-                    // Complete the pending action after save.
-                    match action.clone() {
-                        PendingUnsavedAction::NewScript => self.execute_new_script(),
-                        PendingUnsavedAction::OpenScript => self.open_file_modal(),
-                        PendingUnsavedAction::QuitApp => {
-                            self.allow_close = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    }
+                    // Save now; complete the pending action only after
+                    // `ScriptSaved` confirms (see `draw()`).
+                    self.execute_save_to_path(path.clone(), Some(action.clone()));
                 }
                 None => {
-                    // Save As first, then complete the action.
+                    // Save As first, then complete the action after save.
                     self.request_save_as(ctx, Some(action.clone()));
                 }
             }
@@ -2220,6 +2306,174 @@ impl TanovaApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
+        }
+    }
+
+    /// Helper: OS data recovery directory (pure std; None if home unavailable).
+    /// Resolves to `$XDG_DATA_HOME/tanova/recovery` if `XDG_DATA_HOME` is set
+    /// and non-empty, else `$HOME/.local/share/tanova/recovery`.
+    fn default_recovery_dir() -> Option<PathBuf> {
+        let base = std::env::var("XDG_DATA_HOME")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::home_dir().map(|home| home.join(".local").join("share")));
+        base.map(|base| base.join("tanova").join("recovery"))
+    }
+
+    /// Returns how long to wait before the next idle auto-save, or `None` if
+    /// auto-save is gated off. Pure helper — no side effects, no repaints.
+    pub fn next_autosave_delay(&self, now: Instant) -> Option<Duration> {
+        const IDLE_DELAY: Duration = Duration::from_secs(3);
+        const MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+        let Some(_recovery_dir) = &self.recovery_dir else {
+            return None;
+        };
+        if !self.is_dirty
+            || self.save_in_flight
+            || self.pending_recovery.is_some()
+            || self.file_modal.is_some()
+            || self.pending_unsaved.is_some()
+            || !self.autosave_dirty
+        {
+            return None;
+        }
+        let is_dragging = self.properties.is_dragging_knob()
+            || self.curve_editor.is_dragging_key()
+            || self.viewer.is_dragging_overlay();
+        if is_dragging {
+            return None;
+        }
+
+        let last_edit = self.last_user_action?;
+        let idle_rem = IDLE_DELAY.saturating_sub(now.saturating_duration_since(last_edit));
+        let interval_rem = self.last_auto_save.map_or(Duration::ZERO, |t| {
+            MIN_INTERVAL.saturating_sub(now.saturating_duration_since(t))
+        });
+        Some(idle_rem.max(interval_rem))
+    }
+
+    /// Triggers an idle background auto-save when gating allows.
+    ///
+    /// Wakes `eframe` once via `ctx.request_repaint_after` when the timer has
+    /// not yet expired, so `draw()` is called again right after the delay.
+    /// When the delay is zero, writes the snapshot immediately and schedules
+    /// nothing — preserving ~0% idle CPU and zero repeated SSD writes.
+    fn maybe_trigger_autosave(&mut self, ctx: &egui::Context, now: Instant) {
+        match self.next_autosave_delay(now) {
+            None => {}
+            Some(delay) if delay == Duration::ZERO => {
+                let Some(recovery_dir) = &self.recovery_dir else {
+                    return;
+                };
+                let path = recovery_dir.join("autosave.tnv");
+                let source_path = self.script_path.clone();
+                self.last_auto_save = Some(now);
+                self.autosave_dirty = false;
+                self.recovery_snapshot_path = Some(path.clone());
+                let _ = self
+                    .kernel
+                    .send(KernelMessage::WriteAutoSave { path, source_path });
+            }
+            Some(wait) => {
+                ctx.request_repaint_after(wait + Duration::from_millis(25));
+            }
+        }
+    }
+
+    /// Removes the pending recovery snapshot (called after confirmed save/clean exit).
+    fn clear_recovery_snapshot(&mut self) {
+        if let Some(path) = self.recovery_snapshot_path.take() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Stages a crash-recovery modal if an autosave snapshot exists at startup.
+    fn check_for_recovery_snapshot(&mut self) {
+        let Some(recovery_dir) = &self.recovery_dir else {
+            return;
+        };
+        let snapshot = recovery_dir.join("autosave.tnv");
+        if snapshot.exists() {
+            self.pending_recovery = Some(snapshot);
+        }
+    }
+
+    /// Restores the staged recovery snapshot to its `recovery_source` path, dirty.
+    ///
+    /// Keeps `autosave.tnv` on disk after restore so a second crash before
+    /// saving still preserves the recovered session. The file is cleaned up
+    /// on save, new script, open, discard, or clean exit.
+    fn restore_recovery_snapshot(&mut self) {
+        let Some(snapshot) = self.pending_recovery.take() else {
+            return;
+        };
+        let Ok(content) = std::fs::read_to_string(&snapshot) else {
+            let _ = std::fs::remove_file(&snapshot);
+            return;
+        };
+        let mut dag = Dag::new();
+        if let Ok(parsed) = load_nk_into_dag(&content, &mut dag) {
+            let recovery_source = parsed.recovery_source.clone();
+            let viewer_target = match self.workflow {
+                ViewerWorkflow::Nuke => dag
+                    .nodes()
+                    .find(|node| node.kind == "Viewer")
+                    .map(|node| node.id),
+                ViewerWorkflow::Fusion => None,
+            };
+            self.graph = GraphMirror::from_dag(&dag, viewer_target, self.graph.project_format());
+            self.canvas.reset_for_script(&self.graph);
+            self.viewer.clear_frame();
+            self.script_path = recovery_source;
+            self.is_dirty = true;
+            self.last_script_error = None;
+            self.last_auto_save = None;
+            self.autosave_dirty = true;
+            self.last_user_action = Some(Instant::now());
+            // Track the existing snapshot so it can be removed on save/new/
+            // open/exit; do NOT delete it here (second-crash safety).
+            self.recovery_snapshot_path = Some(snapshot.clone());
+            let _ = self.kernel.send(KernelMessage::ReplaceDag {
+                dag: Box::new(dag),
+                viewer_target,
+            });
+        } else {
+            let _ = std::fs::remove_file(&snapshot);
+        }
+    }
+
+    /// Centered ASCII "Crash Recovery" modal (Restore / Discard).
+    fn draw_crash_recovery_modal(&mut self, ctx: &egui::Context) {
+        let snapshot = self.pending_recovery.clone().unwrap_or_default();
+        let mut restore = false;
+        let mut discard = false;
+        egui::Window::new("Crash Recovery")
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("A saved recovery snapshot was found. Restore it?");
+                ui.label(snapshot.display().to_string());
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Restore").clicked() {
+                        restore = true;
+                    }
+                    if ui.button("Discard").clicked() {
+                        discard = true;
+                    }
+                });
+            });
+        if restore {
+            self.restore_recovery_snapshot();
+            self.pending_recovery = None;
+        }
+        if discard {
+            let _ = std::fs::remove_file(&snapshot);
+            self.pending_recovery = None;
+            self.recovery_snapshot_path = None;
         }
     }
 
@@ -3248,7 +3502,7 @@ mod tests {
 
         // Save to a temp .tnv file.
         let temp_path = std::env::temp_dir().join("tanova_test_comp.tnv");
-        app.execute_save_to_path(temp_path.clone());
+        app.execute_save_to_path(temp_path.clone(), None);
         // Wait for the kernel to process SaveScript and write the file.
         let save_deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < save_deadline && !temp_path.exists() {
@@ -3354,7 +3608,7 @@ mod tests {
 
         // Save to a temp .nk file.
         let temp_path = std::env::temp_dir().join("tanova_test_comp.nk");
-        app.execute_save_to_path(temp_path.clone());
+        app.execute_save_to_path(temp_path.clone(), None);
         // Wait for the kernel to process SaveScript and write the file.
         let save_deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < save_deadline && !temp_path.exists() {
@@ -6538,6 +6792,324 @@ mod tests {
             "curve editor must populate selected_curve from the inspected node's animated curves"
         );
 
+        app.kernel.shutdown();
+    }
+
+    /// Milestone 25: a failed `SaveScript` must emit `ScriptError`, leave the
+    /// project dirty, and never call `mark_saved()` (no optimistic clean).
+    #[test]
+    fn save_failure_leaves_dirty_and_emits_script_error() {
+        tanova_nodes::ensure_linked();
+
+        let (_gpu_lock, gpu) = test_gpu();
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Dirty the graph.
+        app.dispatch(vec![KernelMessage::Execute(UndoableCommand::SetKnob {
+            node: CONSTANT,
+            knob: "color".to_string(),
+            value: KnobValue::Color([1.0, 0.0, 0.0, 1.0]),
+            previous: KnobValue::Color(STARTER_COLOR),
+        })]);
+        let dirty_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < dirty_deadline && !app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.is_dirty, "edit must make the project dirty");
+
+        // Point script_path at a location whose parent is a regular file, so
+        // the atomic same-directory write cannot create its temp file.
+        let not_a_dir = std::env::temp_dir().join(format!("tanova_notadir_{}", std::process::id()));
+        let _ = std::fs::write(&not_a_dir, "i am a file, not a directory");
+        app.script_path = Some(not_a_dir.join("child.tnv"));
+
+        app.execute_save_to_path(app.script_path.clone().unwrap(), None);
+
+        let err_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < err_deadline && app.last_script_error.is_none() {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.last_script_error.is_some(),
+            "save failure must emit ScriptError"
+        );
+        assert!(
+            app.is_dirty,
+            "failed save must leave the project dirty (no optimistic clean)"
+        );
+
+        let _ = std::fs::remove_file(&not_a_dir);
+        app.kernel.shutdown();
+    }
+
+    /// Milestone 25: `WriteAutoSave` must never call `mark_saved()`, never
+    /// change `is_dirty`, and never trigger `render_viewer()`. It writes the
+    /// snapshot to `recovery_dir/autosave.tnv` and leaves the project dirty.
+    #[test]
+    fn autosave_write_does_not_mark_saved_or_change_dirty() {
+        tanova_nodes::ensure_linked();
+
+        let (_gpu_lock, gpu) = test_gpu();
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Dirty the graph.
+        app.dispatch(vec![KernelMessage::Execute(UndoableCommand::SetKnob {
+            node: CONSTANT,
+            knob: "color".to_string(),
+            value: KnobValue::Color([1.0, 0.0, 0.0, 1.0]),
+            previous: KnobValue::Color(STARTER_COLOR),
+        })]);
+        let dirty_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < dirty_deadline && !app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.is_dirty, "edit must make the project dirty");
+
+        // Point recovery_dir at an isolated temp dir (never $HOME).
+        let recovery_dir =
+            std::env::temp_dir().join(format!("tanova_autosave_{}", std::process::id()));
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        app.recovery_dir = Some(recovery_dir.clone());
+
+        let snapshot = recovery_dir.join("autosave.tnv");
+        app.kernel
+            .send(KernelMessage::WriteAutoSave {
+                path: snapshot.clone(),
+                source_path: None,
+            })
+            .expect("WriteAutoSave send");
+
+        let saved_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < saved_deadline && !snapshot.exists() {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            snapshot.exists(),
+            "autosave snapshot must be written to disk"
+        );
+
+        // Auto-save must NOT mark the project saved or clear the dirty flag.
+        assert!(app.is_dirty, "autosave must not clear is_dirty");
+        assert!(
+            app.last_script_error.is_none(),
+            "autosave must not emit ScriptError"
+        );
+
+        let _ = std::fs::remove_dir_all(&recovery_dir);
+        app.kernel.shutdown();
+    }
+
+    /// Milestone 25: crash recovery restore binds `script_path` to the
+    /// snapshot's `recovery_source` (never the hidden `autosave.tnv`) and
+    /// marks the project dirty.
+    #[test]
+    fn recovery_restore_uses_recovery_source_and_marks_dirty() {
+        tanova_nodes::ensure_linked();
+
+        let (_gpu_lock, gpu) = test_gpu();
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Build a real script, export it, then attach a recovery_source line.
+        let mut dag = Dag::new();
+        dag.add_node(NodeId(1), "Constant").unwrap();
+        let tcl = dag.export_to_tcl();
+        let snapshot_tcl = format!("{tcl}# tanova_recovery_source /real/project/path.tnv\n");
+
+        let snapshot_path =
+            std::env::temp_dir().join(format!("tanova_snap_{}.tnv", std::process::id()));
+        std::fs::write(&snapshot_path, &snapshot_tcl).unwrap();
+
+        // Stage the snapshot for recovery, then restore it.
+        app.pending_recovery = Some(snapshot_path.clone());
+        app.restore_recovery_snapshot();
+
+        // script_path must be the recovery_source, NOT the snapshot path.
+        assert_eq!(
+            app.script_path.as_deref(),
+            Some(std::path::Path::new("/real/project/path.tnv")),
+            "recovery must bind script_path to recovery_source, never to autosave.tnv"
+        );
+        assert!(app.is_dirty, "recovery restore must mark the project dirty");
+        // Snapshot is kept on disk after restore for second-crash safety;
+        // it is removed on save, new script, open, discard, or exit.
+        assert!(
+            snapshot_path.exists(),
+            "snapshot must be kept after restore for second-crash safety"
+        );
+        assert_eq!(
+            app.recovery_snapshot_path.as_deref(),
+            Some(std::path::Path::new(&snapshot_path)),
+            "recovery_snapshot_path must track the kept snapshot"
+        );
+
+        let _ = std::fs::remove_file(&snapshot_path);
+        app.kernel.shutdown();
+    }
+
+    /// Milestone 25: auto-save schedules a wake-up, fires after idle, then
+    /// stops spinning (no repeated writes, no repeated repaints).
+    #[test]
+    fn autosave_schedules_wakeup_fires_after_idle_and_stops_spinning() {
+        tanova_nodes::ensure_linked();
+
+        let (_gpu_lock, gpu) = test_gpu();
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        // Isolated temp recovery dir — never $HOME.
+        let recovery_dir =
+            std::env::temp_dir().join(format!("tanova_wakeup_{}", std::process::id()));
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        app.recovery_dir = Some(recovery_dir.clone());
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Pump until starter comp is loaded.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "starter comp must load");
+
+        // Save first (ScriptSaved) so last_auto_save / autosave_dirty reset.
+        let save_path = recovery_dir.join("m25_test.tnv");
+        app.execute_save_to_path(save_path.clone(), None);
+        // Wait for the kernel to confirm the save (save_in_flight cleared).
+        let saved_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < saved_deadline && app.save_in_flight {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.save_in_flight, "save must be confirmed by kernel");
+        assert!(!app.is_dirty, "after save, app must be clean");
+        assert!(save_path.exists(), "saved file must exist");
+        assert!(
+            std::fs::read_to_string(&save_path)
+                .unwrap()
+                .contains("# tanova_schema 1"),
+            "saved file must contain schema header"
+        );
+
+        // Dispatch a node edit at t0.
+        let t0 = Instant::now();
+        app.dispatch(vec![KernelMessage::Execute(UndoableCommand::SetKnob {
+            node: CONSTANT,
+            knob: "color".to_string(),
+            value: KnobValue::Color([1.0, 0.0, 0.0, 1.0]),
+            previous: KnobValue::Color(STARTER_COLOR),
+        })]);
+        // Pump until dirty state is confirmed.
+        let dirty_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < dirty_deadline && !app.is_dirty {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.is_dirty, "after edit, app must be dirty");
+        assert!(app.autosave_dirty, "autosave_dirty must be true after edit");
+
+        // After t0, next_autosave_delay must be Some(d) with 0 < d <= 3s.
+        let d = app
+            .next_autosave_delay(t0)
+            .expect("delay must be Some after edit");
+        assert!(
+            d > Duration::ZERO && d <= Duration::from_secs(3),
+            "delay must be >0 and <=3s after edit, got {d:?}"
+        );
+
+        // Immediately afterward (t0 + 3.1s), call maybe_trigger_autosave —
+        // the snapshot must be written and the app must remain dirty.
+        let t1 = t0 + Duration::from_secs(3) + Duration::from_millis(100);
+        let snapshot = recovery_dir.join("autosave.tnv");
+        app.maybe_trigger_autosave(&ctx, t1);
+        app.pump();
+        std::thread::sleep(Duration::from_millis(50));
+        app.pump();
+
+        assert!(
+            snapshot.exists(),
+            "autosave.tnv must exist after idle auto-save"
+        );
+        let snapshot_content = std::fs::read_to_string(&snapshot).unwrap();
+        assert!(
+            snapshot_content.contains("# tanova_schema 1"),
+            "autosave.tnv must contain schema header"
+        );
+        assert!(
+            app.is_dirty,
+            "app must remain dirty after auto-save (no mark_saved)"
+        );
+        assert!(
+            !app.autosave_dirty,
+            "autosave_dirty must be false after auto-save"
+        );
+
+        // With no further edits, next_autosave_delay must return None at
+        // t0 + 3.2s and t0 + 40.0s (no repeated writes, no repaint spinning).
+        assert_eq!(
+            app.next_autosave_delay(t0 + Duration::from_secs(3) + Duration::from_millis(200)),
+            None,
+            "no further writes after auto-save (dirty flag cleared)"
+        );
+        assert_eq!(
+            app.next_autosave_delay(t0 + Duration::from_secs(40)),
+            None,
+            "no repeated writes after 30s cooldown without new edits"
+        );
+
+        // Dispatch a second edit at t0 + 5.0s. At t0 + 9.0s, delay must
+        // reflect the remaining 30s cooldown (~24s), not fire immediately.
+        app.dispatch(vec![KernelMessage::Execute(UndoableCommand::SetKnob {
+            node: GRADE,
+            knob: "mix".to_string(),
+            value: KnobValue::Float(0.35),
+            previous: KnobValue::Float(1.0),
+        })]);
+        let d2 = app
+            .next_autosave_delay(t0 + Duration::from_secs(9))
+            .expect("delay must be Some after second edit");
+        // idle_rem = 0 (already idle >3s), interval_rem = 30s - 4s = ~26s
+        assert!(
+            d2 > Duration::from_secs(20) && d2 <= Duration::from_secs(30),
+            "delay must reflect 30s cooldown (~26s), got {d2:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&recovery_dir);
         app.kernel.shutdown();
     }
 }

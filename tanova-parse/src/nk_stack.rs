@@ -78,6 +78,17 @@ pub struct ParsedScript {
     pub viewer_target: Option<NodeId>,
     /// Node left on top of the root stack.
     pub stack_top: Option<NodeId>,
+    /// Tanova schema version from a `# tanova_schema N` header, when present.
+    ///
+    /// `None` for legacy `.tnv` files (v0.4–v0.6) and for external `.nk`
+    /// scripts, both of which keep loading exactly as before.
+    pub schema_version: Option<u32>,
+    /// Original project path recorded in a recovery snapshot
+    /// (`# tanova_recovery_source ...`), when present.
+    ///
+    /// A restored crash session is re-bound to this path, never to the hidden
+    /// `autosave.tnv` file.
+    pub recovery_source: Option<std::path::PathBuf>,
 }
 
 impl ParsedScript {
@@ -131,6 +142,40 @@ impl<'a> Machine<'a> {
 
         while index < lines.len() {
             let line_number = index + 1;
+
+            // Tanova metadata lives in `#` comment lines, which
+            // `strip_comment` would otherwise erase. Inspect the raw line
+            // first so schema versioning and recovery provenance survive.
+            let raw_line = lines[index].trim();
+            if let Some(rest) = raw_line.strip_prefix("# tanova_schema ") {
+                let version: u32 = rest.trim().parse().map_err(|_| {
+                    self.syntax(
+                        line_number,
+                        format!("invalid Tanova schema version `{}`", rest.trim()),
+                    )
+                })?;
+                if version == 0 || version > tanova_kernel::TANOVA_SCHEMA_VERSION {
+                    return Err(self.syntax(
+                        line_number,
+                        format!(
+                            "Unsupported Tanova schema version {version} (max supported: {})",
+                            tanova_kernel::TANOVA_SCHEMA_VERSION
+                        ),
+                    ));
+                }
+                self.script.schema_version = Some(version);
+                index += 1;
+                continue;
+            }
+            if let Some(rest) = raw_line.strip_prefix("# tanova_recovery_source ") {
+                let source = rest.trim();
+                if !source.is_empty() {
+                    self.script.recovery_source = Some(std::path::PathBuf::from(source));
+                }
+                index += 1;
+                continue;
+            }
+
             let line = strip_comment(lines[index]).trim().to_string();
             index += 1;
 
@@ -1191,5 +1236,44 @@ Grade {
             .expect("reloaded Grade pulls");
         let raster = packet.get::<Raster2D>().expect("Grade emits a Raster2D");
         assert_pixel(raster.sample_rgba(10, 10), [0.3, 0.6, 0.9, 1.0], 6.0);
+    }
+
+    #[test]
+    fn tanova_schema_header_accepts_v1_rejects_v0_and_v2() {
+        let body = "\
+set N1 [stack 0]
+Constant {
+ color {0.2 0.4 0.6 1}
+}
+push $N1
+";
+
+        // v1 (current) is accepted.
+        let parsed = parse_nk_script(&format!("version 15.0 v5\n# tanova_schema 1\n{body}"))
+            .expect("schema v1 must load");
+        assert_eq!(parsed.schema_version, Some(1));
+
+        // Missing header loads normally (legacy .tnv / external .nk).
+        let parsed = parse_nk_script(&format!("version 15.0 v5\n{body}"))
+            .expect("no schema header must load");
+        assert_eq!(parsed.schema_version, None);
+
+        // v0 is rejected.
+        let err =
+            parse_nk_script(&format!("version 15.0 v5\n# tanova_schema 0\n{body}")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unsupported Tanova schema version 0"),
+            "unexpected error: {err}"
+        );
+
+        // v2 > max is rejected.
+        let err =
+            parse_nk_script(&format!("version 15.0 v5\n# tanova_schema 2\n{body}")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unsupported Tanova schema version 2 (max supported: 1)"),
+            "unexpected error: {err}"
+        );
     }
 }

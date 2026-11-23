@@ -18,6 +18,13 @@ use crate::knobs::{KnobTable, KnobValue, canonical_f64};
 use crate::registry::find_cartridge;
 use crate::types::{AnimationCurve, EvalContext, NodeError, NodeTrait, Packet, ProjectFormat};
 
+/// Schema version stamped into every script Tanova exports.
+///
+/// Line 1 stays Nuke's own `version 15.0 v5` header so external Nuke keeps
+/// loading our files; line 2 is a TCL comment (`#`) carrying Tanova's schema,
+/// which Nuke ignores and Tanova uses to migrate or reject incompatible files.
+pub const TANOVA_SCHEMA_VERSION: u32 = 1;
+
 /// Static cartridge default width for source nodes (`Constant`).
 ///
 /// Duplicated from `tanova-nodes` because the kernel cannot depend on the
@@ -523,6 +530,9 @@ impl Dag {
         }
 
         let mut out = String::from("version 15.0 v5\n");
+        // Tanova's own schema marker. `#` is a TCL comment, so Nuke ignores
+        // it while Tanova can version (and safely reject) its own scripts.
+        out.push_str(&format!("# tanova_schema {TANOVA_SCHEMA_VERSION}\n"));
         for id in &order {
             let Some(node) = self.nodes.get(id) else {
                 continue;

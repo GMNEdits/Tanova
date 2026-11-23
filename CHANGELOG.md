@@ -5,6 +5,35 @@ All notable changes to Tanova are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - v0.6.5
+
+**Phase 8 — Project Format Versioning, Atomic Save & Crash Recovery (Milestone 25).**
+
+### Added
+
+- **Schema versioning:** `TANOVA_SCHEMA_VERSION = 1` exported from `tanova-kernel`/`tanova-app`. `export_to_tcl` now writes `# tanova_schema 1` on line 2 of every `.tnv` (line 1 stays Nuke's `version 15.0 v5` so Nuke keeps loading).
+- **Parser validation:** `parse_nk_script`/`load_nk_into_dag` read `# tanova_schema N`; `v == 0 || v > TANOVA_SCHEMA_VERSION` is rejected with `Unsupported Tanova schema version {v} (max supported: {})`. Missing header = `None` and loads normally (legacy `.tnv` / external `.nk`).
+- **Recovery provenance:** `# tanova_recovery_source <path>` is parsed into `ParsedScript.recovery_source`; a restored crash session re-binds to this path, never to the hidden `autosave.tnv`.
+- **`ParsedScript` gains `schema_version: Option<u32>` and `recovery_source: Option<PathBuf>`.**
+- **`tanova_kernel::atomic_write_string`**: pure-std atomic write — hidden temp file in the same directory as the target, `create_new`, `write_all`, `flush`, `sync_all`, drop handle, `rename`, best-effort `remove_file` of the temp on failure (avoids `EXDEV` cross-filesystem renames).
+- **`KernelMessage::WriteAutoSave`** for idle background crash-recovery snapshots.
+- **`tanova-app` recovery fields:** `recovery_dir` (`Some` only in live desktop startup; `None` in headless/tests), `last_user_action`, `last_auto_save`, `recovery_snapshot_path`, `pending_recovery`, `pending_post_save`, `save_in_flight`.
+- **Centered ASCII "Crash Recovery" modal** (Restore / Discard) offered before file/unsaved modals.
+- **`on_exit` shutdown hook** removes any pending recovery snapshot.
+
+### Changed
+
+- **Save is confirmed-only:** `execute_save_to_path` no longer sets `script_path` or `is_dirty = false`; only `ScriptSaved` applies them. Follow-up actions (`pending_post_save`) run only after `ScriptSaved`.
+- **`SaveScript` uses `atomic_write_string`** (same-directory atomic write) instead of `std::fs::write`.
+- **Failed `SaveScript`** emits `ScriptError` plus `DirtyStateChanged { is_dirty: undo_stack.is_dirty() }` and does NOT call `mark_saved()`, so a failed save leaves the project dirty.
+- **`WriteAutoSave`** never calls `mark_saved()`, never changes `is_dirty`, never triggers `render_viewer()`.
+- **Auto-save gating:** idle ≥ 3 s, min interval 30 s, not dragging, no modal/pending recovery, not already saving.
+- Existing save tests now pump until `ScriptSaved` confirms clean state.
+
+### Fixed
+
+- `export_to_tcl` line 1 kept as `version 15.0 v5\n`; schema marker inserted on line 2.
+
 ## [0.6.0] - 2026-11-22
 
 **Phase 7 — Studio Compositing, Spatial Warping & Curve Editor (Milestones 23–24).** Ships an Interactive Curve Editor tab, Node Graph Minimap, projective 4-point homography `CornerPin2D`, optical circular/anamorphic disk `Defocus`, `Mirror`/`Ramp`/`Glow` cartridges (**29 total**), and live-GUI responsiveness fixes for continuous knob/handle dragging.

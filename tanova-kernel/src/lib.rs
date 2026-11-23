@@ -14,10 +14,10 @@ pub mod types;
 
 pub use bus::{
     FrameExporter, FrameNotification, KernelEvent, KernelHandle, KernelMessage, NodeId, PortId,
-    UndoStack, UndoableCommand,
+    UndoStack, UndoableCommand, atomic_write_string,
 };
 pub use command::{EdgeSnapshot, NodeSnapshot};
-pub use dag::{Dag, DagNode, Edge, OpHash, RamCache};
+pub use dag::{Dag, DagNode, Edge, OpHash, RamCache, TANOVA_SCHEMA_VERSION};
 pub use governor::{MemoryGovernor, MemoryPermit, RenderEpoch, evaluate_with_airbag};
 pub use knobs::{KnobTable, KnobValue};
 pub use registry::{NodeCartridgeDescriptor, find_cartridge, registered_cartridge_kinds};
