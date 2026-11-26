@@ -275,13 +275,15 @@ mod tests {
     use super::*;
 
     fn assert_close(actual: Mat3x3, expected: Mat3x3) {
-        for row in 0..3 {
-            for column in 0..3 {
+        for (row, (actual_row, expected_row)) in
+            actual.rows.iter().zip(expected.rows.iter()).enumerate()
+        {
+            for (column, (&actual_value, &expected_value)) in
+                actual_row.iter().zip(expected_row.iter()).enumerate()
+            {
                 assert!(
-                    (actual.rows[row][column] - expected.rows[row][column]).abs() < 1e-5,
-                    "row {row} column {column}: {} vs {}",
-                    actual.rows[row][column],
-                    expected.rows[row][column]
+                    (actual_value - expected_value).abs() < 1e-5,
+                    "row {row} column {column}: {actual_value} vs {expected_value}"
                 );
             }
         }
@@ -332,13 +334,16 @@ mod tests {
             &chained.source_raster,
             &chain.source_raster
         ));
+        let identity = Mat3x3::identity();
         let mut max_diff = 0.0f32;
-        for row in 0..3 {
-            for column in 0..3 {
-                let diff = (chained.combined_matrix.rows[row][column]
-                    - Mat3x3::identity().rows[row][column])
-                    .abs();
-                max_diff = max_diff.max(diff);
+        for (actual_row, expected_row) in chained
+            .combined_matrix
+            .rows
+            .iter()
+            .zip(identity.rows.iter())
+        {
+            for (&actual_value, &expected_value) in actual_row.iter().zip(expected_row.iter()) {
+                max_diff = max_diff.max((actual_value - expected_value).abs());
             }
         }
         assert!(

@@ -20,7 +20,6 @@ repository = "https://github.com/GMNEdits/Tanova"
 
 [workspace.dependencies]
 # Kernel: blackboard, hashing, messaging, cartridge registry.
-anymap = "0.12"
 blake3 = "1"
 crossbeam-channel = "0.5"
 indexmap = "2"

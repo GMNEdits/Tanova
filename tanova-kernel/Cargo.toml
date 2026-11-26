@@ -8,7 +8,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-anymap.workspace = true
 blake3.workspace = true
 crossbeam-channel.workspace = true
 indexmap.workspace = true

@@ -8,20 +8,150 @@
 //! Both are type maps: any `Send + Sync` value can be stored under its own
 //! type, which keeps the kernel blind to VFX-specific data.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 
 use crate::PortId;
 use crate::governor::MemoryGovernor;
 use crate::knobs::KnobTable;
 
+/// Object-safe extension of `std::any::Any` that can clone itself, used as the
+/// value trait for [`TypeMap`].
+///
+/// This is the pure-`std` replacement for `anymap::any::CloneAny`: values are
+/// stored as `Box<dyn CloneAny>` and downcast on demand, so no `unsafe` code is
+/// required.
+trait CloneAny: Any + Send + Sync {
+    fn clone_box(&self) -> Box<dyn CloneAny>;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+impl<T: Any + Send + Sync + Clone> CloneAny for T {
+    fn clone_box(&self) -> Box<dyn CloneAny> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+/// Clones a stored value through its concrete `CloneAny` implementation.
+///
+/// The receiver is taken as `&dyn CloneAny` on purpose: `Box<dyn CloneAny>`
+/// itself satisfies the blanket `CloneAny` impl, so calling `clone_box` on the
+/// box would recurse into this blanket impl forever.
+fn clone_boxed(value: &dyn CloneAny) -> Box<dyn CloneAny> {
+    value.clone_box()
+}
+
+/// Unboxes a stored value back to its concrete type.
+fn take_boxed<T: Any + Send + Sync + Clone>(value: Box<dyn CloneAny>) -> Option<T> {
+    CloneAny::into_any(value)
+        .downcast::<T>()
+        .ok()
+        .map(|boxed| *boxed)
+}
+
+impl Clone for TypeMap {
+    fn clone(&self) -> Self {
+        Self {
+            values: self
+                .values
+                .iter()
+                .map(|(&type_id, value)| (type_id, clone_boxed(&**value)))
+                .collect(),
+        }
+    }
+}
+
 /// The backing type map: one value per concrete type, safe to move between
 /// the UI and the kernel thread.
 ///
-/// anymap keys on its own `Any` trait (a `std`-`Any` extension), which is what
-/// makes the `Send + Sync` bounds expressible. `CloneAny` keeps packets
-/// cheaply copyable for the RAM cache; heavy payloads should be stored behind
-/// an `Arc` so a clone does not copy pixels.
-pub type TypeMap = anymap::Map<dyn anymap::any::CloneAny + Send + Sync>;
+/// Values must be `Clone` so packets stay cheaply copyable for the RAM cache;
+/// heavy payloads should be stored behind an `Arc` so a clone does not copy
+/// pixels.
+#[derive(Default)]
+pub struct TypeMap {
+    values: HashMap<TypeId, Box<dyn CloneAny>>,
+}
+
+impl std::fmt::Debug for TypeMap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TypeMap")
+            .field("len", &self.values.len())
+            .finish()
+    }
+}
+
+impl TypeMap {
+    /// Creates an empty map.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates an empty map with room for `capacity` values.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            values: HashMap::with_capacity(capacity),
+        }
+    }
+
+    /// Inserts a value, returning the previous value of the same type, if any.
+    pub fn insert<T: Any + Send + Sync + Clone>(&mut self, value: T) -> Option<T> {
+        let previous = self.values.insert(TypeId::of::<T>(), Box::new(value))?;
+        take_boxed::<T>(previous)
+    }
+
+    /// Borrows the value of type `T`.
+    pub fn get<T: Any + Send + Sync + Clone>(&self) -> Option<&T> {
+        let value: &dyn CloneAny = &**self.values.get(&TypeId::of::<T>())?;
+        value.as_any().downcast_ref::<T>()
+    }
+
+    /// Mutably borrows the value of type `T`.
+    pub fn get_mut<T: Any + Send + Sync + Clone>(&mut self) -> Option<&mut T> {
+        let value: &mut dyn CloneAny = &mut **self.values.get_mut(&TypeId::of::<T>())?;
+        value.as_any_mut().downcast_mut::<T>()
+    }
+
+    /// Removes and returns the value of type `T`.
+    pub fn remove<T: Any + Send + Sync + Clone>(&mut self) -> Option<T> {
+        let value = self.values.remove(&TypeId::of::<T>())?;
+        take_boxed::<T>(value)
+    }
+
+    /// Returns `true` if the map holds a value of type `T`.
+    pub fn contains<T: Any + Send + Sync + Clone>(&self) -> bool {
+        self.values.contains_key(&TypeId::of::<T>())
+    }
+
+    /// Number of values in the map.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Returns `true` if the map holds no values.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Drops every value from the map.
+    pub fn clear(&mut self) {
+        self.values.clear();
+    }
+}
 
 /// Render state carried top-down: the current timeline frame.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
@@ -575,5 +705,44 @@ mod tests {
         }
         assert_eq!(ProxyScale::scale_dim(65, 0.5), 33);
         assert_eq!(ProxyScale::scale_dim(1, 0.25), 1);
+    }
+
+    #[test]
+    fn type_map_blackboards_are_thread_safe_cloneable_and_removable() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Packet>();
+        assert_send_sync::<EvalContext>();
+        assert_send_sync::<TypeMap>();
+
+        let mut packet = Packet::new();
+        packet.insert(7u32);
+        packet.insert("shared".to_string());
+
+        let cloned = packet.clone();
+        assert_eq!(cloned.get::<u32>(), Some(&7));
+        assert_eq!(cloned.get::<String>().map(String::as_str), Some("shared"));
+
+        // Mutating the clone leaves the original untouched.
+        let mut cloned = cloned;
+        cloned.insert(9u32);
+        assert_eq!(cloned.get::<u32>(), Some(&9));
+        assert_eq!(packet.get::<u32>(), Some(&7));
+
+        // Removal still works after a clone, on both copies independently.
+        assert_eq!(cloned.remove::<u32>(), Some(9));
+        assert!(!cloned.contains::<u32>());
+        assert_eq!(packet.remove::<u32>(), Some(7));
+        assert!(!packet.contains::<u32>());
+        assert_eq!(packet.get::<String>().map(String::as_str), Some("shared"));
+
+        let mut ctx = EvalContext::new();
+        ctx.insert(Time(3.0));
+        let mut ctx_clone = ctx.clone();
+        ctx_clone.insert(Time(4.0));
+        assert_eq!(ctx.time(), Some(3.0));
+        assert_eq!(ctx_clone.time(), Some(4.0));
+        assert_eq!(ctx_clone.remove::<Time>().map(|time| time.0), Some(4.0));
+        assert!(ctx_clone.time().is_none());
+        assert_eq!(ctx.time(), Some(3.0));
     }
 }

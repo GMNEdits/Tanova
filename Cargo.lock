@@ -71,12 +71,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anymap"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33954243bd79057c2de7338850b85983a44588021f8a5fee574a8888c6de4344"
-
-[[package]]
 name = "arboard"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2403,7 +2397,6 @@ dependencies = [
 name = "tanova-kernel"
 version = "0.1.0"
 dependencies = [
- "anymap",
  "blake3",
  "crossbeam-channel",
  "indexmap",
