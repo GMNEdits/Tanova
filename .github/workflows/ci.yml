@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-render0-dev libvulkan1 mesa-vulkan-drivers pkg-config
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo run -p tanova-cli -- --check-headless
+      - run: cargo run -p tanova-app -- --check-headless
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.continue-on-error }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - checks: bans licenses sources
+            continue-on-error: false
+          - checks: advisories
+            continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          command-arguments: ${{ matrix.checks }}

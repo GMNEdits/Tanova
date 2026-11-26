@@ -16,7 +16,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tanova/tanova"
+repository = "https://github.com/GMNEdits/Tanova"
 
 [workspace.dependencies]
 # Kernel: blackboard, hashing, messaging, cartridge registry.
