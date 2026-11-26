@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use tanova_kernel::{MemoryGovernor, NodeError};
+use tanova_kernel::{MemoryGovernor, NodeError, ProxyScale};
 
 use crate::coords::{BBox, EdgeMode, TILE_PIXELS, TILE_SIZE, TileCoord, world_to_tile};
 use crate::matrix::Mat3x3;
@@ -949,6 +949,116 @@ pub fn merge_raster(
     Ok(output)
 }
 
+/// Builds a proxy raster by bilinearly sampling source pixel centers.
+///
+/// Partial edge pixels clamp the source taps to its data window. Each plane
+/// (including AOVs) keeps its own tiles and the output retains the edge mode.
+pub fn downsample_raster(
+    input: &Raster2D,
+    scale: f32,
+    governor: Option<&MemoryGovernor>,
+) -> Result<Raster2D, NodeError> {
+    let scale = ProxyScale::sanitized(scale);
+    if (scale - 1.0).abs() <= 1e-4 {
+        return Ok(input.clone());
+    }
+    let source = input.bbox;
+    let scale_coord = |value: i32| f64::from(value) * f64::from(scale);
+    let dst_bbox = if source.is_empty() {
+        BBox::new(0, 0, 0, 0)
+    } else {
+        BBox::new(
+            scale_coord(source.min_x).floor() as i32,
+            scale_coord(source.min_y).floor() as i32,
+            scale_coord(source.max_x).ceil() as i32,
+            scale_coord(source.max_y).ceil() as i32,
+        )
+    };
+    let mut output = Raster2D::new(
+        input.format.clone().scaled(scale),
+        dst_bbox,
+        input.edge_mode,
+    );
+    let tiles = dst_bbox.tile_coords();
+    let inv = f64::from(scale).recip();
+    let taps = |range: std::ops::Range<i32>, low: i32, high: i32| {
+        range
+            .map(|dst| {
+                let sample =
+                    ((f64::from(dst) + 0.5) * inv - 0.5).clamp(f64::from(low), f64::from(high));
+                let a = sample.floor() as i32;
+                let b = (sample.ceil() as i32).min(high);
+                (a, b, (sample - f64::from(a)) as f32)
+            })
+            .collect::<Vec<_>>()
+    };
+    for (channel, plane) in &input.channels {
+        let render_tile = |tile: &TileCoord| -> Result<Arc<TileBuffer>, NodeError> {
+            let region = tile.to_bbox().intersection(&dst_bbox);
+            let xs = taps(region.min_x..region.max_x, source.min_x, source.max_x - 1);
+            let ys = taps(region.min_y..region.max_y, source.min_y, source.max_y - 1);
+            let (first, _, _) = world_to_tile(xs[0].0, ys[0].0);
+            let (last, _, _) = world_to_tile(xs[xs.len() - 1].1, ys[ys.len() - 1].1);
+            // Only look up the small source footprint this output tile touches.
+            let columns = (last.tx - first.tx + 1) as usize;
+            let grid: Vec<_> = (first.ty..=last.ty)
+                .flat_map(|ty| {
+                    (first.tx..=last.tx).map(move |tx| plane.get(&TileCoord::new(tx, ty)))
+                })
+                .collect();
+            let uniform = |buffer: Option<&Arc<TileBuffer>>| {
+                buffer.map_or(Some(0.0), |buffer| buffer.is_uniform())
+            };
+            if let Some(value) = uniform(grid[0])
+                && grid.iter().all(|&buffer| {
+                    uniform(buffer).is_some_and(|other| other.to_bits() == value.to_bits())
+                })
+            {
+                return Ok(Arc::new(TileBuffer::new_uniform(value)));
+            }
+            let sample = |x, y| {
+                let (coord, lx, ly) = world_to_tile(x, y);
+                let index =
+                    (coord.ty - first.ty) as usize * columns + (coord.tx - first.tx) as usize;
+                grid[index].map_or(0.0, |buf| buf.get(lx, ly))
+            };
+            let blend = |a: f32, b: f32, weight: f32| {
+                if a.to_bits() == b.to_bits() || weight == 0.0 {
+                    a
+                } else {
+                    a * (1.0 - weight) + b * weight
+                }
+            };
+            // Reserve the dense tile before allocating it, including in workers.
+            let mut buffer = TileBuffer::new_dense(0.0, governor)?;
+            let pixels = buffer.as_dense_slice_mut().expect("new dense tile");
+            let (ox, oy) = tile.origin_world();
+            let left = (region.min_x - ox) as usize;
+            let bottom = (region.min_y - oy) as usize;
+            for (row, &(y0, y1, fy)) in ys.iter().enumerate() {
+                let offset = (row + bottom) * TILE_SIZE as usize + left;
+                for (pixel, &(x0, x1, fx)) in pixels[offset..offset + xs.len()].iter_mut().zip(&xs)
+                {
+                    let lower = blend(sample(x0, y0), sample(x1, y0), fx);
+                    *pixel = if y0 == y1 {
+                        lower
+                    } else {
+                        blend(lower, blend(sample(x0, y1), sample(x1, y1), fx), fy)
+                    };
+                }
+            }
+            Ok(Arc::new(buffer))
+        };
+        let buffers = parallel_map_ordered(&tiles, render_tile)?;
+        let mut dst = ChannelPlane::new();
+        for (&tile, buffer) in tiles.iter().zip(buffers) {
+            dst.insert(tile, buffer);
+        }
+        output.insert_channel(channel.clone(), dst);
+    }
+    Ok(output)
+}
+
 /// Inverse-sampled perspective warp of `input` over `output_bbox`.
 ///
 /// `forward_matrix` maps input pixels into output space, so its inverse maps
@@ -1695,6 +1805,56 @@ pub fn defocus_raster(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn downsample_preserves_planes_bounds_uniform_tiles_and_governor() {
+        use super::*;
+        use crate::Format;
+
+        let bbox = BBox::new(-3, -1, 513, 9);
+        let mut input = Raster2D::new(
+            Format::new("odd", 513, 9, 1.5),
+            bbox,
+            EdgeMode::BlackOutside,
+        );
+        let mut depth = ChannelPlane::new();
+        let uniform = Arc::new(TileBuffer::new_uniform(9.0));
+        for tile in bbox.tile_coords() {
+            depth.insert(tile, Arc::clone(&uniform));
+        }
+        input.insert_channel(Channel::DepthZ, depth);
+        let governor = MemoryGovernor::new(0);
+        let cloned = downsample_raster(&input, 1.0, Some(&governor)).unwrap();
+        assert!(Arc::ptr_eq(
+            cloned
+                .channel(&Channel::DepthZ)
+                .unwrap()
+                .get(&TileCoord::new(0, 0))
+                .unwrap(),
+            &uniform
+        ));
+        let half = downsample_raster(&input, 0.5, Some(&governor)).unwrap();
+        assert_eq!((half.format.width, half.format.height), (257, 5));
+        assert_eq!(half.format.logical_size(0.5), (513, 9));
+        assert_eq!(half.format.pixel_aspect, 1.5);
+        assert_eq!(half.bbox, BBox::new(-2, -1, 257, 5));
+        assert_eq!(half.sample(&Channel::DepthZ, -2, -1), 9.0);
+        assert_eq!(half.sample(&Channel::DepthZ, 256, 4), 9.0);
+        assert_eq!(governor.allocated_bytes(), 0);
+
+        input.set_pixel(Channel::RgbaRed, 0, 0, 4.0, None).unwrap();
+        assert!(matches!(
+            downsample_raster(&input, 0.5, Some(&governor)),
+            Err(NodeError::MemoryExceeded { .. })
+        ));
+        let governor = MemoryGovernor::new(crate::TILE_BYTES);
+        let half = downsample_raster(&input, 0.5, Some(&governor)).unwrap();
+        assert_eq!(half.sample(&Channel::RgbaRed, 0, 0), 1.0);
+        assert_eq!(half.sample(&Channel::RgbaRed, -1, 0), 0.0);
+        assert_eq!(governor.allocated_bytes(), crate::TILE_BYTES);
+        drop(half);
+        assert_eq!(governor.allocated_bytes(), 0);
+    }
+
     use super::*;
 
     #[test]

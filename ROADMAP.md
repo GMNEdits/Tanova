@@ -96,11 +96,14 @@ Interactive curve editor with draggable keyframes and interpolation modes (`tano
 # TANOVA ROADMAP - PHASE 8: PROJECT FORMAT VERSIONING, ATOMIC SAVE & CRASH RECOVERY
 *AI DIRECTIVE: Execute one milestone at a time. Do not skip or combine milestones.*
 
-**Milestone 25: `.tnv` Schema Versioning, Atomic Save, Confirmed Dirty-State Save, Idle Auto-Save & Crash Recovery** — v0.6.5-testing (uncommitted for live GUI verification)
+**Milestone 25: `.tnv` Schema Versioning, Atomic Save, Confirmed Dirty-State Save, Idle Auto-Save & Crash Recovery** — COMPLETE (v0.6.5)
 Stamps every exported `.tnv` with `# tanova_schema 1` on line 2 (line 1 stays Nuke's `version 15.0 v5`). Parser validates the header: `v == 0 || v > TANOVA_SCHEMA_VERSION` is rejected; a missing header loads normally (legacy `.tnv` / external `.nk`). Adds `# tanova_recovery_source <path>` metadata parsed into `ParsedScript.recovery_source`. Save becomes atomic: hidden temp file in the same directory, `create_new`, `write_all`, `flush`, `sync_all`, drop, `rename`, best-effort temp removal on failure. A failed `SaveScript` emits `ScriptError` plus `DirtyStateChanged { is_dirty: undo_stack.is_dirty() }` and must NOT call `mark_saved()`. Save is confirmed-only: `execute_save_to_path` no longer clears dirty or binds `script_path`; only `ScriptSaved` does, and follow-up actions (`pending_post_save`) run only after confirmation. `WriteAutoSave` never touches `mark_saved()`, `is_dirty`, or `render_viewer()`. Auto-save gating: idle ≥ 3 s, min interval 30 s, not dragging, no modal/pending recovery, not already saving. `recovery_dir` is `Some(...)` only in live desktop startup; `None` in headless/tests. Recovery restore uses `parsed.recovery_source` for `script_path` (never the hidden `autosave.tnv`) and marks `is_dirty = true`. Centered ASCII "Crash Recovery" modal (Restore / Discard). Clean-exit cleanup via `on_exit` removes any pending snapshot.
 
-**Milestone 26: (planned) Schema migration path for v2+ headers.**
-**Milestone 27: (planned) Incremental auto-save snapshots & multi-version recovery pruning.**
+**Milestone 26: Real GUI RAM Budget, Cooperative Cache Eviction & 1080p Speed Gate** — COMPLETE (v0.6.5)
+Real 1–2 GiB auto-scaled GUI `MemoryGovernor` cap; cooperative `Dag` cache eviction (evicts lowest-priority entry on `MemoryExceeded`, retries once); `DiskCache::clear()` releases `MemoryPermit`s; `PurgeCache` + live top-bar `RAM` meter & `Purge` button; safe `N - 2` `std::thread::scope` tile multi-threading; per-node timing heat bars + non-blocking hover tooltips; `tanova-cli --bench-1080p` speed gate.
+
+**Milestone 27: Full-Res-Safe Viewer Proxy & Remaining Cleanup** — COMPLETE (v0.6.5)
+`1:1` / `1:2` / `1:4` Viewer Proxy (`ProxyScale`, `Ctrl+P`, amber `PROXY` badge, full-res logical handles & full-res `Write` lock); direct-slice + parallel `to_top_left_rgba8_with_view`; layout-only `MoveNode` render skip & `Arc<Packet>` upload dedupe; surgical downstream cache invalidation on `AddNode`/`ConnectEdge`/`Batch`; `1920×1080` knob fix across `Constant`/`CheckerBoard2`/`Ramp`/`Reformat`/`Crop`; `CornerPin2D` upstream format inheritance + `[Set to Input]`; top-bar `1280px` fit + bottom-dock export pill; unused `RamCache` removal; `Cargo.toml` repo URL fix; `LICENSE-MIT`/`LICENSE-APACHE`, `deny.toml`, `.github/workflows/ci.yml`; plain-English `README.md` rewrite.
 
 ## Release & Tagging Policy
 

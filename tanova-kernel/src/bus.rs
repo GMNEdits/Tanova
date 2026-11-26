@@ -17,7 +17,9 @@ use crate::dag::{Dag, TANOVA_SCHEMA_VERSION};
 use crate::governor::{MemoryGovernor, RenderEpoch};
 use crate::knobs::{KnobTable, KnobValue};
 use crate::registry::find_cartridge;
-use crate::types::{AnimationCurve, EvalContext, NodeError, Packet, Time};
+use crate::types::{
+    AnimationCurve, EvalContext, NodeError, Packet, ProxyScale, RenderForExport, Time,
+};
 
 /// Identifies a node instance in the graph.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -253,6 +255,25 @@ pub enum UndoableCommand {
 }
 
 impl UndoableCommand {
+    /// Whether this command only changes canvas positions, not pixels.
+    pub fn is_layout_only(&self) -> bool {
+        match self {
+            Self::MoveNode { .. } => true,
+            Self::Batch(commands) => {
+                !commands.is_empty() && commands.iter().all(Self::is_layout_only)
+            }
+            _ => false,
+        }
+    }
+
+    fn contains_curve_edit(&self) -> bool {
+        match self {
+            Self::SetKnobCurve { .. } => true,
+            Self::Batch(commands) => commands.iter().any(Self::contains_curve_edit),
+            _ => false,
+        }
+    }
+
     /// Builds a [`Batch`] from a vector of commands, collapsing a single
     /// command back to itself and returning `None` for an empty vector.
     pub fn from_vec(cmds: Vec<UndoableCommand>) -> Option<UndoableCommand> {
@@ -456,6 +477,9 @@ pub enum KernelMessage {
     /// Purge the DAG cache and any injected external cache (e.g. disk cache),
     /// then report memory stats. Does not touch the viewer frame or dirty flag.
     PurgeCache,
+    /// Change the viewer proxy scale (`1.0` = 1:1, `0.5` = 1:2, `0.25` = 1:4).
+    /// Coalesced with consecutive `SetProxyScale` messages like `SetTime`.
+    SetProxyScale(f32),
 }
 
 /// Notifications sent from the kernel thread back to the UI.
@@ -554,6 +578,8 @@ pub struct FrameNotification {
     pub node: Option<NodeId>,
     /// Render epoch that produced the frame.
     pub epoch: u64,
+    /// Proxy scale the kernel rendered the pixels at (`1.0` = full resolution).
+    pub proxy_scale: f32,
     /// The evaluated packet, ready for the UI to inspect.
     pub packet: Arc<Packet>,
 }
@@ -564,6 +590,7 @@ impl FrameNotification {
         Self {
             node: Some(node),
             epoch,
+            proxy_scale: 1.0,
             packet,
         }
     }
@@ -573,6 +600,7 @@ impl FrameNotification {
         Self {
             node,
             epoch,
+            proxy_scale: 1.0,
             packet: Arc::new(Packet::new()),
         }
     }
@@ -1080,6 +1108,15 @@ fn coalesce_batch(batch: Vec<KernelMessage>) -> Vec<KernelMessage> {
                 *last_frame = *frame;
                 true
             }
+            // Only the latest proxy scale matters; collapse consecutive
+            // `SetProxyScale`s so a burst of proxy toggles evaluates once.
+            (
+                KernelMessage::SetProxyScale(scale),
+                Some(KernelMessage::SetProxyScale(last_scale)),
+            ) => {
+                *last_scale = *scale;
+                true
+            }
             (
                 KernelMessage::Execute(UndoableCommand::SetKnob {
                     node,
@@ -1373,25 +1410,7 @@ fn apply_kernel_message(
 ) {
     match message {
         KernelMessage::Execute(command) => {
-            match &command {
-                UndoableCommand::SetKnob { node, .. }
-                | UndoableCommand::SetDisabled { node, .. }
-                | UndoableCommand::SetKnobCurve { node, .. } => {
-                    dag.invalidate_downstream(*node);
-                }
-                UndoableCommand::Batch(cmds) => {
-                    for cmd in cmds {
-                        if let UndoableCommand::SetKnob { node, .. }
-                        | UndoableCommand::SetDisabled { node, .. }
-                        | UndoableCommand::SetKnobCurve { node, .. } = cmd
-                        {
-                            dag.invalidate_downstream(*node);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            if apply_and_record(dag, undo, events, command) {
+            if apply_and_record(dag, undo, events, command) == Some(true) {
                 *render_dirty = true;
             }
         }
@@ -1399,7 +1418,7 @@ fn apply_kernel_message(
             if let Some(command) = undo.undo() {
                 match dag.undo_command(&command) {
                     Ok(()) => {
-                        dag.cache_mut().clear();
+                        dag.clear_cache();
                         *render_dirty = true;
                         let _ = events.send(KernelEvent::Undone(command));
                         let _ = events.send(KernelEvent::DirtyStateChanged {
@@ -1419,7 +1438,7 @@ fn apply_kernel_message(
             if let Some(command) = undo.redo() {
                 match dag.apply_command(command.clone()) {
                     Ok(_) => {
-                        dag.cache_mut().clear();
+                        dag.clear_cache();
                         *render_dirty = true;
                         let _ = events.send(KernelEvent::Redone(command));
                         let _ = events.send(KernelEvent::DirtyStateChanged {
@@ -1474,6 +1493,11 @@ fn apply_kernel_message(
             let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
             *render_dirty = true;
         }
+        KernelMessage::SetProxyScale(scale) => {
+            base_ctx.insert(ProxyScale(ProxyScale::sanitized(scale)));
+            let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+            *render_dirty = true;
+        }
         KernelMessage::MarkClean => {
             undo.clear_and_mark_clean();
             let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
@@ -1496,6 +1520,7 @@ fn apply_kernel_message(
             viewer_target,
         } => {
             *dag = *new_dag;
+            dag.clear_cache();
             undo.clear_and_mark_clean();
             *viewer_node = viewer_target;
             let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
@@ -1584,6 +1609,12 @@ fn apply_kernel_message(
             }
 
             let saved_time = base_ctx.time();
+            let saved_proxy = base_ctx.proxy_scale();
+            // Write ALWAYS exports full 1:1 resolution even when the Viewer is
+            // in 1:2 or 1:4 Proxy mode: force the base context to full res for
+            // the whole sequence, then restore the interactive scale when done.
+            base_ctx.insert(ProxyScale(1.0));
+            let previous_export = base_ctx.insert(RenderForExport);
             let mut frames_written = 0usize;
             let mut last_path: Option<std::path::PathBuf> = None;
 
@@ -1620,10 +1651,16 @@ fn apply_kernel_message(
                 }
             }
 
-            // Restore the original time and clear the cache so the next
-            // viewer render is unaffected by the sequence evaluation.
+            // Restore the original time, proxy scale, and clear the cache so the
+            // next viewer render is unaffected by the sequence evaluation.
             if let Some(t) = saved_time {
                 base_ctx.insert(Time(t));
+            } else {
+                base_ctx.remove::<Time>();
+            }
+            base_ctx.insert(ProxyScale(saved_proxy));
+            if previous_export.is_none() {
+                base_ctx.remove::<RenderForExport>();
             }
             dag.cache_mut().clear();
 
@@ -1719,7 +1756,9 @@ fn render_viewer(
         Ok(packet) if !packet.is_empty() => {
             *displayed_target = Some(target);
             let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
-            RenderOutcome::Frame(FrameNotification::frame(target, current_epoch, packet))
+            let mut frame = FrameNotification::frame(target, current_epoch, packet);
+            frame.proxy_scale = context.proxy_scale();
+            RenderOutcome::Frame(frame)
         }
         Ok(_packet) => {
             // The chain exists but produced nothing displayable: an
@@ -1763,7 +1802,8 @@ fn render_viewer(
     }
 }
 
-/// Applies a command, records it for undo, and reports the outcome.
+/// Applies a command, records it for undo, and returns whether it needs a render.
+/// `None` means the command failed.
 ///
 /// Destructive commands are enriched from the live DAG first, so the undo stack
 /// always holds a full snapshot even if the UI's mirror was stale.
@@ -1772,18 +1812,19 @@ fn apply_and_record(
     undo: &mut UndoStack,
     events: &Sender<KernelEvent>,
     command: UndoableCommand,
-) -> bool {
+) -> Option<bool> {
     let command = dag.enrich(command);
     let command_for_error = command.clone();
+    // The DAG's legacy SetKnobCurve implementation also invalidates internally.
+    // Only batches containing a curve can lose entries during rollback; keep
+    // a shallow snapshot for those, not for normal knob edits or wire splices.
+    let rollback_cache = (matches!(command, UndoableCommand::Batch(_))
+        && command.contains_curve_edit())
+    .then(|| dag.cache().clone());
     match dag.apply_command(command) {
         Ok(enriched_command) => {
-            // Topology changes alter every downstream op hash. Dropping the
-            // RAM cache guarantees the very next pull re-evaluates, so
-            // detaching a wire updates the viewer immediately instead of
-            // serving a packet cached for the old wiring.
-            if changes_topology(&enriched_command) {
-                dag.cache_mut().clear();
-            }
+            invalidate_cache_for_command(dag, &enriched_command);
+            let needs_render = !enriched_command.is_layout_only();
             undo.push(enriched_command.clone());
             let _ = events.send(KernelEvent::Applied(enriched_command));
             // Every graph edit mutates the undo stack, so the dirty flag must
@@ -1791,35 +1832,38 @@ fn apply_and_record(
             let _ = events.send(KernelEvent::DirtyStateChanged {
                 is_dirty: undo.is_dirty(),
             });
-            true
+            Some(needs_render)
         }
         Err(error) => {
+            if let Some(cache) = rollback_cache {
+                *dag.cache_mut() = cache;
+            }
             let _ = events.send(KernelEvent::CommandFailed {
                 command: command_for_error,
                 message: error.to_string(),
             });
-            false
+            None
         }
     }
 }
 
-/// `true` for commands that add, remove, rewire, or bypass nodes.
-///
-/// These invalidate every cached op hash downstream of the change, so the
-/// worker drops the packet cache before the next render.
-fn changes_topology(command: &UndoableCommand) -> bool {
+/// Invalidates a successfully applied command against the final graph.
+fn invalidate_cache_for_command(dag: &mut Dag, command: &UndoableCommand) {
     match command {
-        UndoableCommand::MoveNode { .. } => false,
-        UndoableCommand::Batch(cmds) => cmds.iter().any(changes_topology),
-        _ => matches!(
-            command,
-            UndoableCommand::AddNode { .. }
-                | UndoableCommand::RemoveNode { .. }
-                | UndoableCommand::RestoreNode { .. }
-                | UndoableCommand::ConnectEdge { .. }
-                | UndoableCommand::DisconnectEdge { .. }
-                | UndoableCommand::SetDisabled { .. }
-        ),
+        UndoableCommand::MoveNode { .. } | UndoableCommand::AddNode { .. } => {}
+        UndoableCommand::SetKnob { node, .. }
+        | UndoableCommand::SetKnobCurve { node, .. }
+        | UndoableCommand::SetDisabled { node, .. }
+        | UndoableCommand::ConnectEdge { to_node: node, .. }
+        | UndoableCommand::DisconnectEdge { to_node: node, .. } => dag.invalidate_downstream(*node),
+        UndoableCommand::Batch(commands) => {
+            for command in commands {
+                invalidate_cache_for_command(dag, command);
+            }
+        }
+        UndoableCommand::RemoveNode { .. } | UndoableCommand::RestoreNode { .. } => {
+            dag.clear_cache()
+        }
     }
 }
 
@@ -1897,11 +1941,7 @@ fn route_nuke_viewer(
     });
 
     let batch = UndoableCommand::from_vec(cmds)?;
-    if apply_and_record(dag, undo, events, batch) {
-        Some(viewer_id)
-    } else {
-        None
-    }
+    apply_and_record(dag, undo, events, batch).map(|_| viewer_id)
 }
 
 #[cfg(test)]
@@ -2053,6 +2093,175 @@ mod tests {
             default_knobs: time_probe_knobs,
             factory: time_probe_factory,
         }
+    }
+
+    #[test]
+    fn coalesce_proxy_selection_keeps_the_latest_scale_without_crossing_other_messages() {
+        let messages = coalesce_batch(vec![
+            KernelMessage::SetProxyScale(0.5),
+            KernelMessage::SetProxyScale(0.25),
+            KernelMessage::RequestRender,
+            KernelMessage::SetProxyScale(1.0),
+        ]);
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                KernelMessage::SetProxyScale(0.25),
+                KernelMessage::RequestRender,
+                KernelMessage::SetProxyScale(1.0),
+            ]
+        ));
+    }
+
+    #[test]
+    fn write_spawn_batch_preserves_upstream_cache_and_move_node_skips_render() {
+        struct CountedSource(Arc<AtomicUsize>);
+        impl crate::NodeTrait for CountedSource {
+            fn evaluate(&self, _: &EvalContext, _: &[Packet]) -> Result<Packet, NodeError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                let mut packet = Packet::new();
+                packet.insert(21_u32);
+                Ok(packet)
+            }
+
+            fn serialize_to_tcl(&self) -> String {
+                "CountedSource {}".into()
+            }
+        }
+
+        let source = NodeId(1);
+        let write = NodeId(2);
+        let viewer = NodeId(3);
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let mut dag = Dag::new();
+        dag.add_node_with_implementation(
+            source,
+            "CountedSource",
+            Arc::new(CountedSource(evaluations.clone())),
+        )
+        .unwrap();
+        dag.add_node(viewer, "Viewer").unwrap();
+        let kernel = KernelHandle::spawn().unwrap();
+        kernel
+            .send(KernelMessage::ReplaceDag {
+                dag: Box::new(dag),
+                viewer_target: Some(source),
+            })
+            .unwrap();
+        let receive_frame = || {
+            kernel
+                .frames()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        };
+        let warm = receive_frame();
+        let move_viewer = |from_x, to_x| UndoableCommand::MoveNode {
+            id: viewer,
+            from_x,
+            to_x,
+            from_y: 0.0,
+            to_y: 0.0,
+        };
+        let connect = |from_node, to_node| UndoableCommand::ConnectEdge {
+            from_node,
+            from_port: PortId(0),
+            to_node,
+            to_port: PortId(0),
+        };
+        let spawn = UndoableCommand::Batch(vec![
+            UndoableCommand::AddNode {
+                id: write,
+                kind: "Write".into(),
+                x: 0.0,
+                y: 0.0,
+            },
+            connect(source, write),
+            connect(write, viewer),
+            move_viewer(0.0, 20.0),
+        ]);
+        kernel.send(KernelMessage::Execute(spawn)).unwrap();
+        let after_spawn = receive_frame();
+        assert!(
+            Arc::ptr_eq(&warm.packet, &after_spawn.packet),
+            "the upstream cache entry must survive"
+        );
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+
+        kernel
+            .send(KernelMessage::SetViewerNode(Some(viewer)))
+            .unwrap();
+        let rendered = receive_frame();
+        assert_eq!(rendered.packet.get::<u32>(), Some(&21));
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+        let epoch = kernel.render_epoch().current();
+        let applied = || loop {
+            if let KernelEvent::Applied(command) = next_event(&kernel) {
+                return command;
+            }
+        };
+        assert!(matches!(applied(), UndoableCommand::Batch(ref cmds) if cmds.len() == 4));
+        for command in [
+            move_viewer(20.0, 30.0),
+            UndoableCommand::Batch(vec![move_viewer(30.0, 40.0), move_viewer(40.0, 50.0)]),
+        ] {
+            kernel
+                .send(KernelMessage::Execute(command.clone()))
+                .unwrap();
+            assert_eq!(applied(), command);
+            assert!(
+                matches!(
+                    kernel.frames().recv_timeout(Duration::from_millis(80)),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                ),
+                "a layout edit must not deliver a frame"
+            );
+            assert_eq!(kernel.render_epoch().current(), epoch);
+        }
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn rejected_batch_restores_cache_even_after_a_curve_edit() {
+        let source = NodeId(1);
+        let viewer = NodeId(2);
+        let mut dag = Dag::new();
+        dag.add_node(source, "Constant").unwrap();
+        dag.add_node(viewer, "Viewer").unwrap();
+        dag.connect(source, viewer, PortId(0)).unwrap();
+        let ctx = EvalContext::new();
+        let governor = MemoryGovernor::new(usize::MAX);
+        let epoch = RenderEpoch::new();
+        let frame = dag
+            .evaluate_pull(viewer, &ctx, &governor, &epoch, 0)
+            .unwrap();
+        let hash = dag.compute_op_hash(viewer, &ctx).unwrap();
+        let rejected = UndoableCommand::Batch(vec![
+            UndoableCommand::SetKnobCurve {
+                node: source,
+                name: "gain".into(),
+                curves: vec![AnimationCurve::from_constant(2.0)],
+                previous: vec![],
+            },
+            UndoableCommand::ConnectEdge {
+                from_node: viewer,
+                from_port: PortId(0),
+                to_node: source,
+                to_port: PortId(0),
+            },
+        ]);
+        let (events, rx) = unbounded();
+        let mut undo = UndoStack::new();
+        assert_eq!(
+            apply_and_record(&mut dag, &mut undo, &events, rejected),
+            None
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(KernelEvent::CommandFailed { .. })
+        ));
+        assert!(!undo.can_undo());
+        assert!(Arc::ptr_eq(&dag.cache()[&hash].packet, &frame));
+        assert_eq!(dag.compute_op_hash(viewer, &ctx).unwrap(), hash);
     }
 
     #[test]

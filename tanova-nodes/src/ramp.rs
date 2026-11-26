@@ -100,7 +100,8 @@ impl RampOp {
     }
 
     fn dimensions(&self, ctx: &EvalContext) -> (u32, u32) {
-        if (self.width, self.height) == (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        if ctx.knobs().is_none()
+            && (self.width, self.height) == (DEFAULT_WIDTH, DEFAULT_HEIGHT)
             && let Some(format) = ctx.project_format()
         {
             return (format.width, format.height);
@@ -116,11 +117,15 @@ impl NodeTrait for RampNode {
     fn evaluate(&self, ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
         let op = RampOp::from_knobs(ctx.knobs().unwrap_or(&self.knobs));
         let (width, height) = op.dimensions(ctx);
-        let mut output = Raster2D::for_format(Format::new("Ramp", width, height, 1.0));
+        let scale = ctx.proxy_scale();
+        let mut output =
+            Raster2D::for_format(Format::new("Ramp", width, height, 1.0).scaled(scale));
         let mut planes: [ChannelPlane; 4] = std::array::from_fn(|_| ChannelPlane::new());
 
-        let dx = op.p1[0] - op.p0[0];
-        let dy = op.p1[1] - op.p0[1];
+        let [x0, y0, ..] = op.p0.map(|coord| coord * scale);
+        let [x1, y1, ..] = op.p1.map(|coord| coord * scale);
+        let dx = x1 - x0;
+        let dy = y1 - y0;
         let len_sq = dx * dx + dy * dy;
         let uniform: [_; 4] = std::array::from_fn(|c| {
             (len_sq < 1e-12 || op.color0[c] == op.color1[c])
@@ -136,8 +141,7 @@ impl NodeTrait for RampNode {
                     let py = (oy + y) as f32 + 0.5;
                     for x in 0..TILE_SIZE as i32 {
                         let px = (ox + x) as f32 + 0.5;
-                        let t = (((px - op.p0[0]) * dx + (py - op.p0[1]) * dy) / len_sq)
-                            .clamp(0.0, 1.0);
+                        let t = (((px - x0) * dx + (py - y0) * dy) / len_sq).clamp(0.0, 1.0);
                         let t = op.ramp_type.apply(t);
                         for (c, values) in dense.iter_mut().enumerate() {
                             if let Some(values) = values {

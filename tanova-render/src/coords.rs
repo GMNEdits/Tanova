@@ -254,6 +254,9 @@ pub struct Format {
     pub height: u32,
     /// Pixel aspect ratio (`1.0` is square).
     pub pixel_aspect: f32,
+    // Keep the exact logical dimensions: dividing rounded proxy sizes cannot
+    // recover an odd source width or height.
+    logical_size: Option<(u32, u32)>,
 }
 
 impl Format {
@@ -264,7 +267,36 @@ impl Format {
             width,
             height,
             pixel_aspect,
+            logical_size: None,
         }
+    }
+
+    /// Builds the wire-format dimensions for a logical format at `scale`.
+    pub fn scaled(mut self, scale: f32) -> Self {
+        if scale == 1.0 {
+            return self;
+        }
+        let logical = (self.width, self.height);
+        self.width = tanova_kernel::ProxyScale::scale_dim(logical.0, scale);
+        self.height = tanova_kernel::ProxyScale::scale_dim(logical.1, scale);
+        self.with_logical_size(logical)
+    }
+
+    /// Records the logical extent of an already scaled raster.
+    pub fn with_logical_size(mut self, size: (u32, u32)) -> Self {
+        self.logical_size = Some(size);
+        self
+    }
+
+    /// Returns the exact logical extent, if recorded, or infers it from scale.
+    pub fn logical_size(&self, frame_scale: f32) -> (u32, u32) {
+        let scale = tanova_kernel::ProxyScale::sanitized(frame_scale);
+        self.logical_size.unwrap_or_else(|| {
+            (
+                tanova_kernel::ProxyScale::scale_dim(self.width, scale.recip()),
+                tanova_kernel::ProxyScale::scale_dim(self.height, scale.recip()),
+            )
+        })
     }
 
     /// 1920x1080 square-pixel HD.

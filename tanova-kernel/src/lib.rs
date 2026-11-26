@@ -17,7 +17,7 @@ pub use bus::{
     KernelMessage, NodeId, NodePerfSample, PortId, UndoStack, UndoableCommand, atomic_write_string,
 };
 pub use command::{EdgeSnapshot, NodeSnapshot};
-pub use dag::{Dag, DagNode, Edge, OpHash, RamCache, TANOVA_SCHEMA_VERSION};
+pub use dag::{Dag, DagNode, Edge, OpHash, TANOVA_SCHEMA_VERSION};
 pub use governor::{
     MemoryGovernor, MemoryPermit, RenderEpoch, evaluate_with_airbag,
     recommended_gui_memory_cap_bytes,
@@ -26,7 +26,7 @@ pub use knobs::{KnobTable, KnobValue};
 pub use registry::{NodeCartridgeDescriptor, find_cartridge, registered_cartridge_kinds};
 pub use types::{
     AnimationCurve, EvalContext, InterpMode, Keyframe, NodeError, NodeTrait, Packet, ProjectFormat,
-    Time, TypeMap, View,
+    ProxyScale, RenderForExport, Time, TypeMap, View,
 };
 
 #[cfg(test)]

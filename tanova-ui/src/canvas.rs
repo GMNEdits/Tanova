@@ -348,50 +348,8 @@ impl GraphMirror {
                     let mut knobs = find_cartridge(kind)
                         .map(|descriptor| (descriptor.default_knobs)())
                         .unwrap_or_default();
-                    // Source cartridges default to 1920x1080; when a project
-                    // format is active, stamp the real resolution so a fresh
-                    // Constant matches the viewer instead of oversizing.
                     if let Some(format) = self.project_format {
-                        if knobs.get("format_width") == Some(&KnobValue::Int(1920))
-                            && knobs.get("format_height") == Some(&KnobValue::Int(1080))
-                        {
-                            knobs.insert("format_width", KnobValue::Int(format.width as i64));
-                            knobs.insert("format_height", KnobValue::Int(format.height as i64));
-                        }
-                        // Stamp Ramp's `p1` corner onto the project format so
-                        // the ramp handle sits on the format corner instead of
-                        // the 256px cartridge default.
-                        if kind == "Ramp" {
-                            if let Some(KnobValue::Color(c)) = knobs.get("p1") {
-                                if *c == [256.0, 256.0, 0.0, 0.0]
-                                    && (format.width as f32 != 256.0
-                                        || format.height as f32 != 256.0)
-                                {
-                                    knobs.insert(
-                                        "p1",
-                                        KnobValue::Color([
-                                            format.width as f32,
-                                            format.height as f32,
-                                            0.0,
-                                            0.0,
-                                        ]),
-                                    );
-                                }
-                            }
-                        }
-                        if kind == "CornerPin2D" {
-                            let w = format.width as f32;
-                            let h = format.height as f32;
-                            for (name, default, stamped) in [
-                                ("to2", [256.0, 0.0, 0.0, 0.0], [w, 0.0, 0.0, 0.0]),
-                                ("to3", [256.0, 256.0, 0.0, 0.0], [w, h, 0.0, 0.0]),
-                                ("to4", [0.0, 256.0, 0.0, 0.0], [0.0, h, 0.0, 0.0]),
-                            ] {
-                                if knobs.get(name) == Some(&KnobValue::Color(default)) {
-                                    knobs.insert(name, KnobValue::Color(stamped));
-                                }
-                            }
-                        }
+                        tanova_kernel::Dag::stamp_project_format_defaults(kind, &mut knobs, format);
                     }
                     self.nodes.push(CanvasNode {
                         id: *id,
@@ -2388,6 +2346,48 @@ fn add_node_message(state: &NodeCanvasState, kind: &str, position: Pos2) -> Kern
     })
 }
 
+/// Infers a full-resolution format from the first size knobs on the main
+/// input chain, falling back to the project format.
+pub fn infer_upstream_format(mirror: &GraphMirror, start_node: NodeId) -> Option<(u32, u32)> {
+    let mut node_id = start_node;
+    let mut visited = HashSet::new();
+    for _ in 0..64 {
+        if !visited.insert(node_id) {
+            break;
+        }
+        let Some(node) = mirror.node(node_id) else {
+            break;
+        };
+        if let (Some(KnobValue::Int(w)), Some(KnobValue::Int(h))) = (
+            node.knobs.get("format_width"),
+            node.knobs.get("format_height"),
+        ) {
+            return Some(((*w).clamp(1, 8192) as u32, (*h).clamp(1, 8192) as u32));
+        }
+        let Some(edge) = mirror.incoming_edge(node_id, PortId(0)) else {
+            break;
+        };
+        node_id = edge.from_node;
+    }
+    mirror
+        .project_format()
+        .map(|format| (format.width, format.height))
+}
+
+pub(crate) fn corner_pin_format_knobs(
+    (width, height): (u32, u32),
+) -> [(&'static str, KnobValue); 4] {
+    let w = width as f32;
+    let h = height as f32;
+    [
+        ("to1", [0.0; 4]),
+        ("to2", [w, 0.0, 0.0, 0.0]),
+        ("to3", [w, h, 0.0, 0.0]),
+        ("to4", [0.0, h, 0.0, 0.0]),
+    ]
+    .map(|(name, coords)| (name, KnobValue::Color(coords)))
+}
+
 /// Spawns `kind` at the cursor, or auto-chains it below the active node.
 ///
 /// `BackdropNode` wraps the currently selected non-backdrop nodes in an
@@ -2615,7 +2615,7 @@ pub fn spawn_node_message(
                 state.selected_nodes.insert(new_id);
                 state.primary_selected = Some(new_id);
 
-                return KernelMessage::Execute(UndoableCommand::Batch(vec![
+                let mut commands = vec![
                     UndoableCommand::AddNode {
                         id: new_id,
                         kind: kind.to_string(),
@@ -2628,7 +2628,26 @@ pub fn spawn_node_message(
                         to_node: new_id,
                         to_port: PortId(0),
                     },
-                ]));
+                ];
+                if kind == "CornerPin2D"
+                    && let Some(size) = infer_upstream_format(mirror, up_id)
+                {
+                    let spawn_size = mirror
+                        .project_format()
+                        .map_or((256, 256), |format| (format.width, format.height));
+                    commands.extend(
+                        corner_pin_format_knobs(size)
+                            .into_iter()
+                            .zip(corner_pin_format_knobs(spawn_size))
+                            .map(|((name, value), (_, previous))| UndoableCommand::SetKnob {
+                                node: new_id,
+                                knob: name.into(),
+                                value,
+                                previous,
+                            }),
+                    );
+                }
+                return KernelMessage::Execute(UndoableCommand::Batch(commands));
             }
         }
     }
@@ -6274,7 +6293,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_seven_format_stamps_match_kernel_and_survive_echoes() {
+    fn format_stamps_match_kernel_and_survive_echoes() {
         tanova_nodes::ensure_linked();
         for (width, height) in [(256, 256), (1280, 720), (1920, 1080), (2048, 1556)] {
             let format = ProjectFormat { width, height };
@@ -6282,7 +6301,14 @@ mod tests {
             dag.set_project_format(Some(format));
             let mut graph = GraphMirror::default();
             graph.set_project_format(format);
-            for kind in ["Ramp", "CornerPin2D"] {
+            for kind in [
+                "Constant",
+                "CheckerBoard2",
+                "Reformat",
+                "Ramp",
+                "Crop",
+                "CornerPin2D",
+            ] {
                 let id = graph.next_node_id();
                 let add = UndoableCommand::AddNode {
                     id,
@@ -6295,14 +6321,26 @@ mod tests {
                 assert_eq!(graph.node(id).unwrap().knobs, dag.node(id).unwrap().knobs);
                 let w = width as f32;
                 let h = height as f32;
-                let expected = if kind == "Ramp" {
-                    vec![("p1", [w, h, 0.0, 0.0])]
-                } else {
-                    vec![
+                if matches!(kind, "Constant" | "CheckerBoard2" | "Reformat" | "Ramp") {
+                    let knobs = &graph.node(id).unwrap().knobs;
+                    assert_eq!(
+                        knobs.get("format_width"),
+                        Some(&KnobValue::Int(i64::from(width)))
+                    );
+                    assert_eq!(
+                        knobs.get("format_height"),
+                        Some(&KnobValue::Int(i64::from(height)))
+                    );
+                }
+                let expected = match kind {
+                    "Ramp" => vec![("p1", [w, h, 0.0, 0.0])],
+                    "Crop" => vec![("box_max", [w, h, 0.0, 0.0])],
+                    "CornerPin2D" => vec![
                         ("to2", [w, 0.0, 0.0, 0.0]),
                         ("to3", [w, h, 0.0, 0.0]),
                         ("to4", [0.0, h, 0.0, 0.0]),
-                    ]
+                    ],
+                    _ => continue,
                 };
                 for (name, value) in &expected {
                     assert_eq!(

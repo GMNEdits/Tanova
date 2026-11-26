@@ -5,7 +5,7 @@ All notable changes to Tanova are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - v0.6.5
+## [0.6.5] - 2026-11-26
 
 **Phase 8 — Project Format Versioning, Atomic Save & Crash Recovery (Milestone 25).**
 
@@ -56,6 +56,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MemoryGovernor`** is no longer `usize::MAX` in the GUI; the desktop app uses `recommended_gui_memory_cap_bytes()`.
 - **`Dag::evaluate_pull`** now records per-node perf samples internally, retrievable via `Dag::take_perf_samples()`.
 - **Repo hygiene & CI:** Fixed `Cargo.toml` repository URL (`tanova/tanova` → `GMNEdits/Tanova`), added root `LICENSE-MIT` and `LICENSE-APACHE`, added `deny.toml` (cargo-deny license/advisory checks), and added `.github/workflows/ci.yml` (fmt, clippy, test, headless checks).
+
+**Phase 8 — Full-Res-Safe Viewer Proxy & Remaining Cleanup (Milestone 27).**
+
+### Added
+
+- **Viewer Proxy:** `1:1`, `1:2`, and `1:4` Viewer Proxy modes from the Viewer toolbar; `Ctrl+P` toggles between full and half resolution; an amber `PROXY 1:2` / `PROXY 1:4` badge identifies proxy mode; all spatial knobs, keyframes, radii, and Viewer handles remain in full-resolution logical units while the engine scales math via `proxy_scale`; `Write` always exports at `1:1` without changing the interactive proxy mode.
+- **Proxy-aware evaluation:** Sources and spatial ops render fewer pixels without changing knobs or keyframes; `Read` retains full-resolution EXRs in the disk cache; DAG cache entries are distinct by scale (`ProxyScale` hashed into `OpHash`).
+- **Direct-slice + parallel `to_top_left_rgba8_with_view`:** display conversion borrows tile pointers once per row, uses a uniform-run fast-path, and parallelizes across scanline chunks via `std::thread::scope` for frames ≥ 512×512 pixels — byte-for-byte identical to the naive reference across all display transforms and channel soloing modes.
+- **`tanova-cli --bench-1080p`:** compares full and half-resolution CPU pulls against the same logical scene, plus a `Display RGBA8 (1920x1080)` row.
+
+### Changed
+
+- **Layout-only `MoveNode` render skip:** canvas node drags no longer trigger a Viewer render or texture upload when no frame changed; `ViewerPanel` dedupes repeated identical `Arc<Packet>` uploads.
+- **Surgical downstream cache invalidation:** `AddNode` never invalidates existing nodes; `ConnectEdge`/`DisconnectEdge` invalidate only downstream; `SetKnob`/`SetKnobCurve`/`SetDisabled` invalidate only the edited node's downstream; `Batch` applies recursively — so spawning/wiring `Write` preserves upstream cache entries.
+- **`1920×1080` knob fix:** `Constant`, `CheckerBoard2`, `Ramp`, `Reformat`, and `Crop` now honor explicitly-authored `format_width`/`format_height`/`box_max` knobs instead of hijacking them to the project format; project format only applies when callers supply it through `EvalContext` without authoring knobs.
+- **`CornerPin2D` upstream format inheritance:** auto-chaining below a node stamps `to1`–`to4` to the upstream format; new `[Set to Input]` button in Properties snaps corners to the upstream format.
+- **Top-bar `1280px` fit:** `RAM` and `Purge` restored to the right edge; variable-width project badge truncated with hover tooltip; `"Export status"` removed from the top bar; export confirmation pill (`Exported Nf`) shown on the bottom-left dock tab bar with full path on hover.
+- **Unused `RamCache` removed:** `Dag.cache` is the single canonical cache abstraction.
+- **Repo hygiene & CI:** Fixed `Cargo.toml` repository URL (`tanova/tanova` → `GMNEdits/Tanova`), added root `LICENSE-MIT` and `LICENSE-APACHE`, added `deny.toml` (cargo-deny license/advisory checks), added `.github/workflows/ci.yml` (fmt, clippy, test, headless checks).
+- **`README.md`:** Rewritten as the `v0.6.5` landing page with highlights, 28-node table, architecture summary, Windows/Linux build guides, limitations, and license/trademark notice.
+
+### Fixed
+
+- **Milestone 25:** Nuke-safe `# tanova_schema 1` header on `.tnv` exports; same-folder pure-std atomic save (`create_new` + `rename`); confirmed-only dirty state so save failures keep the project dirty; idle background auto-save (`request_repaint_after`, 0% idle CPU); Crash Recovery modal (Restore / Discard) with clean-exit snapshot removal.
+- **Milestone 26:** Real 1–2 GiB auto-scaled GUI `MemoryGovernor` cap; cooperative `Dag` cache eviction (evicts lowest-priority entry on `MemoryExceeded`, retries once); `DiskCache::clear()` releases `MemoryPermit`s; `PurgeCache` + live top-bar `RAM` meter & `Purge` button; safe `N - 2` `std::thread::scope` tile multi-threading; per-node timing heat bars + non-blocking hover tooltips (`egui::Area`, `interactable(false)`); direct-slice `extract_padded_tile` / `gather_grade_inputs` / `gather_merge_inputs`; `defocus_raster` clipped to `tile_bbox ∩ output_bbox` with prefix-sum rows restricted to the active band; `--bench-1080p` speed gate.
 
 ## [0.6.0] - 2026-11-22
 
@@ -340,9 +365,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known Limitations (v0.4.0)
 
-- **Cache Eviction:** No automatic LRU cache eviction during interactive scrubbing; long sessions may accumulate memory until the script is reloaded or a sequence render triggers a cache clear.
+- **Cache Eviction:** No automatic LRU cache eviction during interactive scrubbing; long sessions may accumulate memory until the script is reloaded or a sequence render triggers a cache clear. *(Resolved in v0.5.0/v0.6.5 with bounded GreedyDual-Size caching and governor-driven eviction.)*
 - **Color Management:** Lacks OpenColorIO (OCIO) integration. OpenEXR files are read, processed, and displayed in the Viewer as raw linear data without display transforms (e.g., sRGB/ACES).
-- **Parameter Animation:** No keyframing or Curve Editor. Node knobs (e.g., `Grade` multiply) remain static across the timeline.
+- **Parameter Animation:** No keyframing or Curve Editor. Node knobs (e.g., `Grade` multiply) remain static across the timeline. *(Resolved in v0.5.0/v0.6.0 with keyframes and the Curve Editor.)*
 - **Graph Parallelism:** Branch evaluation in `Dag::pull` is currently single-threaded.
 
 ## [v0.3.1-ux-hardening] - 2026-11-13

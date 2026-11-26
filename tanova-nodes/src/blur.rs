@@ -73,7 +73,7 @@ impl NodeTrait for BlurNode {
 
         // Clamp size to a safe range so negative or huge values never panic
         // or hang during convolution.
-        let size = size.clamp(0.0, 250.0);
+        let size = size.clamp(0.0, 250.0) * ctx.proxy_scale();
 
         // Zero-radius bypass: hand the upstream packet back untouched so the
         // cached `Arc<TileBuffer>` handles stay shared.

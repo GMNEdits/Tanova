@@ -101,6 +101,9 @@ pub struct DagNode {
     /// Bypass flag: a disabled node passes its `B` input straight through and
     /// never runs its cartridge.
     pub disabled: bool,
+    /// A registered node added before the project format was known can still
+    /// inherit its untouched extent from an evaluation context.
+    inherits_unset_extent: bool,
 }
 
 impl DagNode {
@@ -116,6 +119,7 @@ impl DagNode {
             x: 0.0,
             y: 0.0,
             disabled: false,
+            inherits_unset_extent: false,
         }
     }
 
@@ -222,101 +226,6 @@ impl fmt::Display for OpHash {
 impl From<blake3::Hash> for OpHash {
     fn from(hash: blake3::Hash) -> Self {
         Self(*hash.as_bytes())
-    }
-}
-
-/// Bounded FIFO cache of evaluated packets, keyed by [`OpHash`].
-#[derive(Debug)]
-pub struct RamCache {
-    entries: HashMap<OpHash, Arc<Packet>>,
-    order: VecDeque<OpHash>,
-    capacity: usize,
-}
-
-impl RamCache {
-    /// Entries kept by [`RamCache::default`].
-    pub const DEFAULT_CAPACITY: usize = 256;
-
-    /// Creates a cache that evicts the oldest entry past `capacity` items.
-    ///
-    /// A capacity of zero disables caching.
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-            capacity,
-        }
-    }
-
-    /// Looks up a cached packet.
-    pub fn get(&self, hash: &OpHash) -> Option<Arc<Packet>> {
-        self.entries.get(hash).cloned()
-    }
-
-    /// Stores a packet, evicting the oldest entry when over capacity.
-    pub fn insert(&mut self, hash: OpHash, packet: Arc<Packet>) -> Option<Arc<Packet>> {
-        if self.capacity == 0 {
-            return None;
-        }
-
-        let previous = self.entries.insert(hash, packet);
-        if previous.is_none() {
-            self.order.push_back(hash);
-            while self.entries.len() > self.capacity {
-                self.evict_oldest();
-            }
-        }
-        previous
-    }
-
-    /// Drops one entry by hash.
-    pub fn remove(&mut self, hash: &OpHash) -> Option<Arc<Packet>> {
-        let removed = self.entries.remove(hash);
-        if removed.is_some() {
-            self.order.retain(|queued| queued != hash);
-        }
-        removed
-    }
-
-    /// Returns `true` if the hash is cached.
-    pub fn contains(&self, hash: &OpHash) -> bool {
-        self.entries.contains_key(hash)
-    }
-
-    /// Number of cached packets.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Returns `true` if the cache is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Configured capacity in entries.
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Drops every entry.
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.order.clear();
-    }
-
-    fn evict_oldest(&mut self) -> Option<Arc<Packet>> {
-        while let Some(hash) = self.order.pop_front() {
-            if let Some(packet) = self.entries.remove(&hash) {
-                return Some(packet);
-            }
-        }
-        None
-    }
-}
-
-impl Default for RamCache {
-    fn default() -> Self {
-        Self::new(Self::DEFAULT_CAPACITY)
     }
 }
 
@@ -690,6 +599,14 @@ impl Dag {
                 node.implementation = Some(Arc::new(PassthroughNode));
             }
         }
+        if let Some(format) = self.project_format {
+            Self::stamp_project_format_defaults(&node.kind, &mut node.knobs, format);
+        } else {
+            node.inherits_unset_extent = matches!(
+                kind.as_str(),
+                "Constant" | "CheckerBoard2" | "Ramp" | "Reformat" | "Crop"
+            );
+        }
         self.insert_node(node)
     }
 
@@ -734,72 +651,60 @@ impl Dag {
         self.nodes.get(&id).map(|node| node.disabled)
     }
 
-    /// Stamps the active project format onto a freshly added source node.
+    /// Stamps default format and spatial knobs when a node is first added.
     ///
-    /// Only a node whose `format_width`/`format_height` knobs still sit at the
-    /// cartridge's static 1920x1080 default is rewritten, so user-edited values
-    /// are never clobbered. With no project format active the defaults stay put,
-    /// which keeps standalone node and kernel tests unchanged.
-    fn stamp_project_format(&mut self, id: NodeId) {
-        let Some(format) = self.project_format else {
-            return;
-        };
-        let Some(node) = self.nodes.get_mut(&id) else {
-            return;
-        };
-        let width_is_default = matches!(
-            node.knobs.get("format_width"),
-            Some(KnobValue::Int(value)) if *value == DEFAULT_FORMAT_WIDTH
-        );
-        let height_is_default = matches!(
-            node.knobs.get("format_height"),
-            Some(KnobValue::Int(value)) if *value == DEFAULT_FORMAT_HEIGHT
-        );
-        if width_is_default && height_is_default {
-            node.knobs
-                .insert("format_width", KnobValue::Int(format.width as i64));
-            node.knobs
-                .insert("format_height", KnobValue::Int(format.height as i64));
+    /// The UI calls this same helper for optimistic `AddNode` updates.
+    /// Never call it on already authored knobs, such as on restore or edit.
+    pub fn stamp_project_format_defaults(kind: &str, knobs: &mut KnobTable, format: ProjectFormat) {
+        Self::stamp_format_extent(kind, knobs, format);
+        let w = format.width as f32;
+        let h = format.height as f32;
+        if kind == "Ramp" && knobs.get("p1") == Some(&KnobValue::Color([256.0, 256.0, 0.0, 0.0])) {
+            knobs.insert("p1", KnobValue::Color([w, h, 0.0, 0.0]));
         }
-        if node.kind == "Ramp"
-            && node.knobs.get("p1") == Some(&KnobValue::Color([256.0, 256.0, 0.0, 0.0]))
+        if kind == "CornerPin2D" {
+            for (name, default, stamped) in [
+                ("to2", [256.0, 0.0, 0.0, 0.0], [w, 0.0, 0.0, 0.0]),
+                ("to3", [256.0, 256.0, 0.0, 0.0], [w, h, 0.0, 0.0]),
+                ("to4", [0.0, 256.0, 0.0, 0.0], [0.0, h, 0.0, 0.0]),
+            ] {
+                if knobs.get(name) == Some(&KnobValue::Color(default)) {
+                    knobs.insert(name, KnobValue::Color(stamped));
+                }
+            }
+        }
+    }
+
+    fn stamp_format_extent(kind: &str, knobs: &mut KnobTable, format: ProjectFormat) {
+        if matches!(kind, "Constant" | "CheckerBoard2" | "Ramp" | "Reformat")
+            && knobs.get("format_width") == Some(&KnobValue::Int(DEFAULT_FORMAT_WIDTH))
+            && knobs.get("format_height") == Some(&KnobValue::Int(DEFAULT_FORMAT_HEIGHT))
         {
-            node.knobs.insert(
-                "p1",
+            knobs.insert("format_width", KnobValue::Int(i64::from(format.width)));
+            knobs.insert("format_height", KnobValue::Int(i64::from(format.height)));
+        }
+        if kind == "Crop"
+            && knobs.get("box_min") == Some(&KnobValue::Color([0.0; 4]))
+            && knobs.get("box_max") == Some(&KnobValue::Color([1920.0, 1080.0, 0.0, 0.0]))
+        {
+            knobs.insert(
+                "box_max",
                 KnobValue::Color([format.width as f32, format.height as f32, 0.0, 0.0]),
             );
         }
+    }
 
-        // Stamp CornerPin2D destination corners onto the project format so all
-        // four handles sit squarely on the format corners when freshly spawned.
-        if node.kind == "CornerPin2D" {
-            let w = format.width as f32;
-            let h = format.height as f32;
-            // to1 defaults to [0,0,0,0] — never stamp (it's already the origin).
-            let to2_default = matches!(
-                node.knobs.get("to2"),
-                Some(KnobValue::Color(c)) if *c == [256.0, 0.0, 0.0, 0.0]
-            );
-            let to3_default = matches!(
-                node.knobs.get("to3"),
-                Some(KnobValue::Color(c)) if *c == [256.0, 256.0, 0.0, 0.0]
-            );
-            let to4_default = matches!(
-                node.knobs.get("to4"),
-                Some(KnobValue::Color(c)) if *c == [0.0, 256.0, 0.0, 0.0]
-            );
-            if to2_default {
-                node.knobs
-                    .insert("to2", KnobValue::Color([w, 0.0, 0.0, 0.0]));
-            }
-            if to3_default {
-                node.knobs.insert("to3", KnobValue::Color([w, h, 0.0, 0.0]));
-            }
-            if to4_default {
-                node.knobs
-                    .insert("to4", KnobValue::Color([0.0, h, 0.0, 0.0]));
-            }
+    fn resolved_render_knobs(node: &DagNode, ctx: &EvalContext) -> KnobTable {
+        let mut knobs = node.evaluated_knobs_at(ctx.time().unwrap_or(1.0));
+        // Support callers that supply ProjectFormat only in EvalContext.
+        // Explicitly authored extents must never enter this fallback.
+        if node.inherits_unset_extent
+            && !node.curves.keys().any(|name| is_format_extent_knob(name))
+            && let Some(format) = ctx.project_format()
+        {
+            Self::stamp_format_extent(&node.kind, &mut knobs, format);
         }
+        knobs
     }
 
     /// Adds a node with its cartridge attached.
@@ -1031,6 +936,10 @@ impl Dag {
             .nodes
             .get_mut(&id)
             .ok_or(NodeError::UnknownNode(id.0))?;
+        let name = name.into();
+        if is_format_extent_knob(&name) {
+            node.inherits_unset_extent = false;
+        }
         node.knobs.insert(name, value);
         Ok(())
     }
@@ -1048,7 +957,6 @@ impl Dag {
         match command {
             UndoableCommand::AddNode { id, kind, x, y } => {
                 self.add_node_at(id, kind.clone(), x, y)?;
-                self.stamp_project_format(id);
                 Ok(UndoableCommand::AddNode { id, kind, x, y })
             }
             UndoableCommand::RemoveNode { id, .. } => {
@@ -1300,7 +1208,7 @@ impl Dag {
         // frame time for the port it requests.
         let mut node_ctx = ctx.clone();
         if let Some(node) = self.nodes.get(&id) {
-            node_ctx.insert(node.evaluated_knobs_at(ctx.time().unwrap_or(1.0)));
+            node_ctx.insert(Self::resolved_render_knobs(node, ctx));
         }
         node_ctx.insert(governor.clone());
 
@@ -1465,10 +1373,12 @@ impl Dag {
         // A node can be reached more than once under different render states
         // once a cartridge rewrites time per port (e.g. two `TimeOffset`
         // branches feeding one merge), so memoize on the state as well as id.
+        let scale = ctx.proxy_scale();
         let memo_key = (
             id,
             ctx.time().map(|time| canonical_f64(time).to_bits()),
             ctx.view().map(str::to_string),
+            scale.to_bits(),
         );
         if let Some(hash) = memo.get(&memo_key) {
             return Ok(*hash);
@@ -1490,12 +1400,19 @@ impl Dag {
         // input through instead of evaluating, so it must never share a cache
         // entry with the enabled node it replaced.
         hasher.update(&[u8::from(node.disabled)]);
+        // Proxy scale is part of the operation: a node evaluated at 1:2 must
+        // never reuse a packet hashed at 1:1. When scale == 1.0 (the default)
+        // no tag is written, so OpHash bytes stay identical to before.
+        if (scale - 1.0).abs() > 1e-6 {
+            hasher.update(b"proxy");
+            hasher.update(&scale.to_bits().to_le_bytes());
+        }
 
         // Cartridges choose their inputs from the node's own context (live
         // knobs plus the requested frame), so build it exactly like `pull`.
         // Animated knobs are resolved at the requested frame, which makes the
         // frame-accurate value part of the operation hash.
-        let resolved_knobs = node.evaluated_knobs_at(ctx.time().unwrap_or(1.0));
+        let resolved_knobs = Self::resolved_render_knobs(node, ctx);
         let mut node_ctx = ctx.clone();
         node_ctx.insert(resolved_knobs.clone());
         if let Some(time) = node_ctx.time() {
@@ -1564,7 +1481,14 @@ impl Dag {
 
 /// Memoization key for [`Dag::hash_node`]: a node plus the render state that
 /// affects its upstream selection.
-type HashKey = (NodeId, Option<u64>, Option<String>);
+type HashKey = (NodeId, Option<u64>, Option<String>, u32);
+
+fn is_format_extent_knob(name: &str) -> bool {
+    matches!(
+        name,
+        "format_width" | "format_height" | "box_min" | "box_max"
+    )
+}
 
 impl Default for Dag {
     fn default() -> Self {
@@ -1991,22 +1915,41 @@ mod tests {
     }
 
     #[test]
-    fn ram_cache_evicts_the_oldest_entry() {
-        let mut cache = RamCache::new(2);
-        let hashes = [OpHash([1; 32]), OpHash([2; 32]), OpHash([3; 32])];
+    fn proxy_op_hash_does_not_collide_between_full_and_half_scale() {
+        use crate::ProxyScale;
 
-        cache.insert(hashes[0], Arc::new(Packet::new()));
-        cache.insert(hashes[1], Arc::new(Packet::new()));
-        assert_eq!(cache.len(), 2);
+        struct ProxyProbe;
+        impl NodeTrait for ProxyProbe {
+            fn evaluate(&self, ctx: &EvalContext, _: &[Packet]) -> Result<Packet, NodeError> {
+                let mut packet = Packet::new();
+                packet.insert(ProxyScale::scale_dim(256, ctx.proxy_scale()));
+                Ok(packet)
+            }
 
-        cache.insert(hashes[2], Arc::new(Packet::new()));
-        assert_eq!(cache.len(), 2);
-        assert!(!cache.contains(&hashes[0]), "oldest entry should be gone");
-        assert!(cache.contains(&hashes[1]));
-        assert!(cache.contains(&hashes[2]));
+            fn serialize_to_tcl(&self) -> String {
+                "ProxyProbe {}".into()
+            }
+        }
 
-        cache.remove(&hashes[2]);
-        assert_eq!(cache.len(), 1);
+        let mut dag = Dag::new();
+        let node = NodeId(1);
+        dag.add_node_with_implementation(node, "ProxyProbe", Arc::new(ProxyProbe))
+            .unwrap();
+        let mut ctx = EvalContext::new();
+        let legacy_hash = dag.compute_op_hash(node, &ctx).unwrap();
+        ctx.insert(ProxyScale(1.0));
+        assert_eq!(dag.compute_op_hash(node, &ctx).unwrap(), legacy_hash);
+        let governor = MemoryGovernor::new(1024);
+        let epoch = RenderEpoch::new();
+        let full = dag.evaluate_pull(node, &ctx, &governor, &epoch, 0).unwrap();
+        ctx.insert(ProxyScale(0.5));
+        let half_hash = dag.compute_op_hash(node, &ctx).unwrap();
+        let half = dag.evaluate_pull(node, &ctx, &governor, &epoch, 0).unwrap();
+        assert_ne!(legacy_hash, half_hash);
+        assert!(Arc::ptr_eq(&dag.cache()[&legacy_hash].packet, &full));
+        assert!(Arc::ptr_eq(&dag.cache()[&half_hash].packet, &half));
+        assert_eq!(full.get::<u32>(), Some(&256));
+        assert_eq!(half.get::<u32>(), Some(&128));
     }
 
     #[test]

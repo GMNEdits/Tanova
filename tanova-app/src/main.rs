@@ -56,6 +56,40 @@ const STARTER_COLOR: [f32; 4] = [0.18, 0.35, 0.65, 1.0];
 /// Small resolution keeps startup and the headless check fast.
 const STARTER_SIZE: i64 = 256;
 
+fn project_badge_text(name: &str, dirty: bool) -> String {
+    let suffix = if dirty { " *" } else { "" };
+    let available = 20 - suffix.len();
+    let truncated = name.chars().nth(available).is_some();
+    let limit = if truncated { available - 3 } else { available };
+    let mut label: String = name
+        .chars()
+        .take(limit)
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if truncated {
+        label.push_str("...");
+    }
+    label.push_str(suffix);
+    label
+}
+
+fn export_badge_text(status: &str) -> String {
+    if status.starts_with("Rendered frame ") {
+        return "Exporting".into();
+    }
+    let count = status
+        .strip_prefix("Rendered ")
+        .and_then(|text| text.split_once(" frame(s)"))
+        .and_then(|(count, _)| count.parse::<usize>().ok());
+    count.map_or_else(|| "Exported".into(), |count| format!("Exported {count}f"))
+}
+
 /// Pending action blocked by unsaved changes, resolved by the confirmation
 /// modal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -584,13 +618,17 @@ impl TanovaApp {
 
     /// Non-blocking drain of kernel events and frame notifications.
     fn pump(&mut self) {
-        let mut graph_updated = false;
+        let mut command_acknowledged = false;
         while let Ok(event) = self.kernel.events().try_recv() {
             if matches!(
                 event,
-                KernelEvent::Applied(_) | KernelEvent::Undone(_) | KernelEvent::Redone(_)
+                KernelEvent::Applied(_)
+                    | KernelEvent::Undone(_)
+                    | KernelEvent::Redone(_)
+                    | KernelEvent::CommandFailed { .. }
+                    | KernelEvent::WriteCompleted { .. }
             ) {
-                graph_updated = true;
+                command_acknowledged = true;
             }
             self.fold_event(event);
         }
@@ -600,7 +638,7 @@ impl TanovaApp {
             self.last_frame = Some(frame);
             frame_received = true;
         }
-        if frame_received || graph_updated {
+        if frame_received || command_acknowledged {
             self.awaiting_kernel = false;
         }
         // The worker drains every queued message before rendering, so a
@@ -781,6 +819,7 @@ impl TanovaApp {
             || self.canvas.is_search_open()
             || self.file_modal.is_some()
             || self.pending_unsaved.is_some()
+            || self.pending_recovery.is_some()
         {
             return;
         }
@@ -789,6 +828,24 @@ impl TanovaApp {
         let mut do_copy = false;
         let mut do_paste = false;
         let mut do_duplicate = false;
+
+        let toggle_proxy = ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                !matches!(event, egui::Event::Key {
+                    key: egui::Key::P, pressed: true, repeat: true, modifiers, ..
+                } if modifiers.command || modifiers.ctrl)
+            });
+            input.consume_key(egui::Modifiers::COMMAND, egui::Key::P)
+                || input.consume_key(egui::Modifiers::CTRL, egui::Key::P)
+        });
+        if toggle_proxy {
+            let scale = if self.viewer.proxy_scale == 0.5 {
+                1.0
+            } else {
+                0.5
+            };
+            messages.push(KernelMessage::SetProxyScale(scale));
+        }
 
         // Consume undo/redo key events first.
         ctx.input(|input| {
@@ -935,9 +992,6 @@ impl TanovaApp {
     /// Sets `awaiting_kernel` so egui keeps repainting until the new frame
     /// arrives, eliminating visual lag on undo/redo and drag release.
     fn dispatch(&mut self, messages: Vec<KernelMessage>) {
-        if !messages.is_empty() {
-            self.awaiting_kernel = true;
-        }
         for message in messages {
             if let KernelMessage::Execute(_) = &message {
                 self.is_dirty = true;
@@ -956,6 +1010,9 @@ impl TanovaApp {
             }
             if let KernelMessage::SetViewerNode(node) = &message {
                 self.viewer.bind(*node);
+            }
+            if let KernelMessage::SetProxyScale(scale) = &message {
+                self.viewer.proxy_scale = tanova_kernel::ProxyScale::sanitized(*scale);
             }
             // Scrub/playback traffic can repeat the same frame at UI frame
             // rate. Sending it again would queue a redundant render behind the
@@ -981,8 +1038,12 @@ impl TanovaApp {
                 let optimistic = command.clone();
                 self.apply_optimistic_mirror_update(&optimistic);
             }
+            let waits_for_kernel =
+                !matches!(&message, KernelMessage::Execute(command) if command.is_layout_only());
             if let Err(error) = self.kernel.send(message) {
                 self.failure = Some(format!("kernel send failed: {error}"));
+            } else if waits_for_kernel {
+                self.awaiting_kernel = true;
             }
         }
     }
@@ -1047,13 +1108,20 @@ impl TanovaApp {
     /// Starts a fresh empty script: clears the kernel DAG, mirror, canvas, and
     /// viewer, and resets the dirty state.
     pub fn execute_new_script(&mut self) {
-        let _ = self.kernel.send(KernelMessage::NewScript);
+        let mut dag = Dag::new();
+        dag.set_project_format(self.graph.project_format());
+        let _ = self.kernel.send(KernelMessage::ReplaceDag {
+            dag: Box::new(dag),
+            viewer_target: None,
+        });
         self.graph.clear();
         self.canvas.reset_for_script(&self.graph);
-        self.viewer.clear_frame();
+        self.viewer.bind(None);
+        self.last_frame = None;
         self.script_path = None;
         self.is_dirty = false;
         self.last_script_error = None;
+        self.last_render_status = None;
         self.last_auto_save = None;
         self.autosave_dirty = false;
         self.clear_recovery_snapshot();
@@ -1067,6 +1135,7 @@ impl TanovaApp {
             std::fs::read_to_string(&path).map_err(|e| format!("failed to read {path:?}: {e}"))?;
 
         let mut dag = Dag::new();
+        dag.set_project_format(self.graph.project_format());
         load_nk_into_dag(&content, &mut dag)
             .map_err(|e| format!("failed to parse {path:?}: {e}"))?;
 
@@ -1095,6 +1164,7 @@ impl TanovaApp {
             })
             .map_err(|e| format!("kernel send failed: {e}"))?;
 
+        self.last_render_status = None;
         Ok(())
     }
 
@@ -1182,18 +1252,17 @@ impl TanovaApp {
         // stats, viewer mode.
         egui::Panel::top("tanova_status").show(ui, |ui| {
             ui.horizontal(|ui| {
+                // Keep the bar on one row at 1280px, even when the project
+                // badge uses all 20 characters. Leave vertical spacing alone.
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().button_padding.x = 5.0;
                 ui.strong("Tanova");
                 ui.separator();
                 self.draw_file_menu(ui);
                 ui.separator();
 
                 // High-contrast project pill badge.
-                let script_name = self.script_display_name();
-                let badge_text = if self.is_dirty {
-                    format!("{} *", script_name)
-                } else {
-                    script_name
-                };
+                let badge_text = project_badge_text(&self.script_display_name(), self.is_dirty);
                 let (text_color, bg_color) = if self.is_dirty {
                     (
                         egui::Color32::from_rgb(255, 200, 70),
@@ -1225,33 +1294,12 @@ impl TanovaApp {
                 ui.separator();
                 ui.label(format!("{} node(s)", self.graph.node_count()));
                 ui.label(format!("{} wire(s)", self.graph.edge_count()));
-                if self.viewer.has_frame() {
-                    if let Some(raster) = self
-                        .last_frame
-                        .as_ref()
-                        .and_then(|frame| frame.packet.get::<Raster2D>())
-                    {
-                        ui.separator();
-                        ui.label(format!(
-                            "frame {}x{}",
-                            raster.format.width, raster.format.height
-                        ));
-                    }
+                if let Some((width, height)) = self.viewer.logical_frame_size() {
+                    ui.separator();
+                    ui.label(format!("frame {width}x{height}"));
                 } else {
                     ui.separator();
                     ui.label("frame --");
-                }
-                if let Some(failure) = &self.failure {
-                    ui.separator();
-                    ui.colored_label(egui::Color32::from_rgb(235, 90, 90), failure);
-                }
-                if let Some(error) = &self.last_script_error {
-                    ui.separator();
-                    ui.colored_label(egui::Color32::from_rgb(235, 90, 90), error);
-                }
-                if let Some(status) = &self.last_render_status {
-                    ui.separator();
-                    ui.label(status);
                 }
                 ui.separator();
                 ui.label("Viewer Mode:");
@@ -1297,28 +1345,11 @@ impl TanovaApp {
                     self.dispatch(vec![message]);
                 }
                 ui.separator();
-                // Compact pure-ASCII RAM meter + [Purge] button (right side of top bar).
-                let alloc_mb = self.allocated_bytes as f64 / (1024.0 * 1024.0);
-                let max_mb = self.max_bytes as f64 / (1024.0 * 1024.0);
-                let pct = if self.max_bytes > 0 {
-                    (self.allocated_bytes as f64 / self.max_bytes as f64 * 100.0) as u32
-                } else {
-                    0
-                };
-                let ram_response = ui.label(format!(
-                    "RAM {:.0}/{:.0}M ({}%)",
-                    alloc_mb, max_mb, pct
-                ));
-                ram_response.on_hover_text(format!(
-                    "MemoryGovernor: {:.1} MiB / {:.1} MiB allocated ({}%)\nManaged by MemoryGovernor",
-                    alloc_mb, max_mb, pct
-                ));
-                if ui.button("Purge").clicked() {
-                    let _ = self.kernel.send(KernelMessage::PurgeCache);
-                    // Every cached packet is gone, so no node can honestly
-                    // claim a cached timing until the next render reports one.
-                    self.graph.node_perf.clear();
-                }
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| self.draw_ram_controls(ui),
+                );
             });
         });
 
@@ -1383,6 +1414,25 @@ impl TanovaApp {
                     ui.selectable_value(&mut show_curve, false, "Node Graph");
                     ui.selectable_value(&mut show_curve, true, "Curve Editor");
                     self.curve_editor_view = show_curve;
+                    if let Some(status) = &self.last_render_status {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(export_badge_text(status))
+                                .strong()
+                                .color(egui::Color32::from_rgb(176, 245, 212))
+                                .background_color(egui::Color32::from_rgb(16, 76, 54)),
+                        )
+                        .on_hover_text(status);
+                    }
+                    for (label, detail) in [
+                        ("App error", &self.failure),
+                        ("Script error", &self.last_script_error),
+                    ] {
+                        if let Some(detail) = detail {
+                            ui.colored_label(egui::Color32::from_rgb(235, 90, 90), label)
+                                .on_hover_text(detail);
+                        }
+                    }
                 });
                 ui.separator();
 
@@ -1466,6 +1516,26 @@ impl TanovaApp {
             ui.ctx().request_repaint();
         }
         ui.ctx().request_repaint_after(Duration::from_millis(16));
+    }
+
+    fn draw_ram_controls(&mut self, ui: &mut egui::Ui) {
+        let alloc_mb = self.allocated_bytes as f64 / (1024.0 * 1024.0);
+        let max_mb = self.max_bytes as f64 / (1024.0 * 1024.0);
+        let pct = if max_mb > 0.0 {
+            alloc_mb / max_mb * 100.0
+        } else {
+            0.0
+        };
+        // This section is laid out right-to-left so Purge hugs the window edge.
+        if ui.button("Purge").clicked() {
+            let _ = self.kernel.send(KernelMessage::PurgeCache);
+            // Wait for the next render before showing per-node cache timings.
+            self.graph.node_perf.clear();
+        }
+        ui.label(format!("RAM {alloc_mb:.0}M"))
+            .on_hover_text(format!(
+                "RAM: {alloc_mb:.1} / {max_mb:.0} MiB ({pct:.1}%) - Managed by MemoryGovernor"
+            ));
     }
 
     /// Handles `ConfirmReadExr`: applies `"file"` (and optionally `"first"` /
@@ -2464,6 +2534,7 @@ impl TanovaApp {
             return;
         };
         let mut dag = Dag::new();
+        dag.set_project_format(self.graph.project_format());
         if let Ok(parsed) = load_nk_into_dag(&content, &mut dag) {
             let recovery_source = parsed.recovery_source.clone();
             let viewer_target = match self.workflow {
@@ -4646,6 +4717,266 @@ mod tests {
         let _ = std::fs::remove_file(&f3);
 
         app.kernel.shutdown();
+    }
+
+    #[test]
+    fn checkerboard_and_constant_honor_explicit_1920x1080_knobs_under_256_project_format() {
+        use tanova_kernel::{ProxyScale, RenderEpoch};
+
+        tanova_nodes::ensure_linked();
+        let format = ProjectFormat::new(256, 256);
+        let governor = MemoryGovernor::new(128 * 1024 * 1024);
+        let epoch = RenderEpoch::new();
+        let mut ctx = EvalContext::new();
+        ctx.insert(format);
+        // Cover both the live graph and callers that provide only a render context.
+        for graph_format in [Some(format), None] {
+            let mut dag = Dag::new();
+            dag.set_project_format(graph_format);
+            for (id, kind) in [(NodeId(1), "CheckerBoard2"), (NodeId(2), "Constant")] {
+                dag.add_node(id, kind).unwrap();
+                if graph_format.is_some() {
+                    let knobs = &dag.node(id).unwrap().knobs;
+                    assert_eq!(knobs.get("format_width"), Some(&KnobValue::Int(256)));
+                    assert_eq!(knobs.get("format_height"), Some(&KnobValue::Int(256)));
+                }
+                dag.set_knob(id, "format_width", KnobValue::Int(1920))
+                    .unwrap();
+                dag.set_knob(id, "format_height", KnobValue::Int(1080))
+                    .unwrap();
+                for (scale, expected) in [(1.0, (1920, 1080)), (0.5, (960, 540))] {
+                    ctx.insert(ProxyScale(scale));
+                    let packet = dag.evaluate_pull(id, &ctx, &governor, &epoch, 0).unwrap();
+                    let raster = packet.get::<Raster2D>().unwrap();
+                    assert_eq!(
+                        (raster.format.width, raster.format.height),
+                        expected,
+                        "{kind}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_export_path_keeps_ram_and_purge_visible_at_1280x720() {
+        let (_gpu_lock, gpu) = test_gpu();
+        let mut app = TanovaApp::new(KernelHandle::spawn().unwrap(), gpu);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1280.0, 720.0));
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+        let canvas_top = app.canvas.last_canvas_rect.unwrap().top();
+        app.script_path = Some(PathBuf::from(format!("{}.tnv", "W".repeat(100))));
+        app.dispatch(vec![KernelMessage::Execute(UndoableCommand::MoveNode {
+            id: CONSTANT,
+            from_x: 40.0,
+            from_y: 40.0,
+            to_x: 45.0,
+            to_y: 40.0,
+        })]);
+        assert!(
+            !app.awaiting_kernel,
+            "layout edits must not queue render repainting"
+        );
+        let path = PathBuf::from(format!("/exports/{}.0001.exr", "long_folder/".repeat(40)));
+        app.fold_event(KernelEvent::WriteCompleted {
+            node: NodeId(4),
+            frames_written: 1,
+            last_path: Some(path.clone()),
+        });
+        assert_eq!(
+            app.last_render_status.as_deref(),
+            Some(format!("Rendered 1 frame(s) -> {}", path.display()).as_str())
+        );
+        let output = ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| app.draw(ui));
+            },
+        );
+        fn collect_text(shape: &egui::Shape, labels: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => labels.push((
+                    text.galley.text().to_owned(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                )),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, labels);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut labels = Vec::new();
+        for shape in &output.shapes {
+            collect_text(&shape.shape, &mut labels);
+        }
+        output.drop_without_applying_deltas();
+        let locate = |label: &str| {
+            let (_, rect) = labels
+                .iter()
+                .find(|(text, _)| text.starts_with(label))
+                .unwrap_or_else(|| panic!("{label} must be visible: {labels:?}"));
+            assert!(screen.contains_rect(*rect), "{label} must fit");
+            *rect
+        };
+        let add = locate("+ Add Node");
+        let ram = locate("RAM ");
+        let purge = locate("Purge");
+        let dock = locate("Node Graph");
+        let exported = locate("Exported 1f");
+        assert!(
+            add.right() < ram.left() && ram.right() < purge.left(),
+            "top-bar order: add={add:?}, ram={ram:?}, purge={purge:?}",
+        );
+        assert!(purge.right() > screen.right() - 50.0);
+        assert!((exported.center().y - dock.center().y).abs() < 4.0);
+        assert!(exported.top() > purge.bottom());
+        assert!(labels.iter().all(|(text, _)| !text.contains("long_folder")));
+        assert_eq!(app.canvas.last_canvas_rect.unwrap().top(), canvas_top);
+        assert_eq!(
+            project_badge_text(&"W".repeat(100), true),
+            "WWWWWWWWWWWWWWW... *"
+        );
+        assert_eq!(project_badge_text("d\u{00e9}mo.tnv", false), "d?mo.tnv");
+    }
+
+    #[test]
+    fn write_node_always_exports_full_resolution_even_in_proxy_mode() {
+        tanova_nodes::ensure_linked();
+        let dir = std::env::temp_dir().join(format!(
+            "tanova-proxy-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TempDir(dir);
+        let template = dir.0.join("proxy.%04d.exr");
+        let mut dag = Dag::new();
+        let format = ProjectFormat::new(256, 256);
+        dag.set_project_format(Some(format));
+        let checker = NodeId(1);
+        dag.add_node(checker, "CheckerBoard2").unwrap();
+        dag.set_knob(checker, "format_width", KnobValue::Int(1920))
+            .unwrap();
+        dag.set_knob(checker, "format_height", KnobValue::Int(1080))
+            .unwrap();
+        let mirror = GraphMirror::from_dag(&dag, None, Some(format));
+        let mut canvas = NodeCanvasState::default();
+        canvas.primary_selected = Some(checker);
+        let KernelMessage::Execute(spawn) =
+            spawn_node_message(&mirror, &mut canvas, "CornerPin2D", egui::Pos2::ZERO)
+        else {
+            panic!("expected a CornerPin2D spawn batch");
+        };
+        dag.apply_command(spawn).unwrap();
+        let corner_pin = canvas.primary_selected.unwrap();
+        let write = NodeId(4);
+        dag.add_node(write, "Write").unwrap();
+        dag.add_node(VIEWER, "Viewer").unwrap();
+        dag.connect(corner_pin, write, PortId(0)).unwrap();
+        dag.connect(write, VIEWER, PortId(0)).unwrap();
+        dag.set_knob(
+            write,
+            "file",
+            KnobValue::Text(template.to_str().unwrap().into()),
+        )
+        .unwrap();
+        dag.set_knob(write, "first", KnobValue::Int(1)).unwrap();
+        dag.set_knob(write, "last", KnobValue::Int(1)).unwrap();
+        let mut context = EvalContext::new();
+        context.insert(format);
+        context.insert(tanova_kernel::FrameExporter(Arc::new(
+            tanova_nodes::export_packet_with_write_knobs,
+        )));
+        let kernel = KernelHandle::spawn().unwrap();
+        kernel.send(KernelMessage::SetBaseContext(context)).unwrap();
+        kernel.send(KernelMessage::SetProxyScale(0.5)).unwrap();
+        kernel
+            .send(KernelMessage::ReplaceDag {
+                dag: Box::new(dag),
+                viewer_target: Some(VIEWER),
+            })
+            .unwrap();
+        let receive_proxy_frame = || {
+            let frame = kernel
+                .frames()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert_eq!(frame.proxy_scale, 0.5);
+            let raster = frame.packet.get::<Raster2D>().unwrap();
+            assert_eq!((raster.format.width, raster.format.height), (960, 540));
+            assert_eq!(
+                raster.bbox,
+                raster.format.to_bbox(),
+                "corner pin must be identity"
+            );
+            assert_eq!(raster.sample_rgba(944, 20), [0.5, 0.5, 0.5, 1.0]);
+        };
+        receive_proxy_frame();
+        kernel
+            .send(KernelMessage::ExecuteWriteNode { node: write })
+            .unwrap();
+        loop {
+            match kernel
+                .events()
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap()
+            {
+                KernelEvent::WriteCompleted { frames_written, .. } => {
+                    assert_eq!(frames_written, 1);
+                    break;
+                }
+                KernelEvent::ScriptError { message } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        let path = dir.0.join("proxy.0001.exr");
+        let raster = tanova_io::load_exr(path.to_str().unwrap(), None).unwrap();
+        assert_eq!((raster.format.width, raster.format.height), (1920, 1080));
+        assert_eq!(raster.sample_rgba(1888, 40), [0.5, 0.5, 0.5, 1.0]);
+        kernel.send(KernelMessage::RequestRender).unwrap();
+        receive_proxy_frame();
+
+        // Also check restoration when the exporter errors after a full-res pull.
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: write,
+                knob: "file".into(),
+                value: KnobValue::Text(String::new()),
+                previous: KnobValue::Text(template.to_str().unwrap().into()),
+            }))
+            .unwrap();
+        receive_proxy_frame();
+        kernel
+            .send(KernelMessage::ExecuteWriteNode { node: write })
+            .unwrap();
+        loop {
+            if let KernelEvent::WriteCompleted { frames_written, .. } = kernel
+                .events()
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap()
+            {
+                assert_eq!(frames_written, 0);
+                break;
+            }
+        }
+        kernel.send(KernelMessage::RequestRender).unwrap();
+        receive_proxy_frame();
+        kernel.shutdown();
     }
 
     /// `detect_exr_sequence_in_dir` preserves the version prefix and finds

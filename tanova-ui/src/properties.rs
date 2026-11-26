@@ -9,7 +9,7 @@ use tanova_kernel::{
     AnimationCurve, InterpMode, KernelMessage, KnobValue, NodeId, UndoableCommand,
 };
 
-use crate::canvas::{CanvasNode, GraphMirror};
+use crate::canvas::{CanvasNode, GraphMirror, corner_pin_format_knobs, infer_upstream_format};
 use crate::theme::{StudioTheme, node_category, palette};
 
 /// A request from the properties panel to open the EXR file browse modal
@@ -440,7 +440,6 @@ impl PropertiesPanel {
                                 }
                                 KnobValue::Text(text) => {
                                     let mut edited = text.clone();
-                                    let mut combo_changed = false;
                                     let presets = match name {
                                         "operation" => Some(OPERATIONS),
                                         "bbox" => Some(BBOX_MODES),
@@ -482,30 +481,31 @@ impl PropertiesPanel {
                                                         )
                                                         .changed()
                                                     {
-                                                        combo_changed = true;
+                                                        changed = true;
                                                     }
                                                 }
                                             });
                                         note(&combo.response);
+                                    } else {
+                                        let edit = ui.add(
+                                            TextEdit::singleline(&mut edited).desired_width(150.0),
+                                        );
+                                        note(&edit);
+                                        changed = edit.changed();
+                                        // Browse... button for the `file` knob on Read/Write nodes.
+                                        if name == "file"
+                                            && (node.kind == "Read" || node.kind == "Write")
+                                            && ui.button("Browse...").clicked()
+                                        {
+                                            self.pending_file_browse = Some(FileBrowseRequest {
+                                                node_id,
+                                                node_kind: node.kind.clone(),
+                                                current_path: edited.clone(),
+                                            });
+                                        }
                                     }
-                                    let edit = ui.add(
-                                        TextEdit::singleline(&mut edited).desired_width(150.0),
-                                    );
-                                    note(&edit);
-                                    // Browse... button for the `file` knob on Read/Write nodes.
-                                    if name == "file"
-                                        && (node.kind == "Read" || node.kind == "Write")
-                                        && ui.button("Browse...").clicked()
-                                    {
-                                        self.pending_file_browse = Some(FileBrowseRequest {
-                                            node_id,
-                                            node_kind: node.kind.clone(),
-                                            current_path: edited.clone(),
-                                        });
-                                    }
-                                    if combo_changed || edit.changed() {
+                                    if changed {
                                         next = KnobValue::Text(edited);
-                                        changed = true;
                                     }
                                 }
                                 KnobValue::Color(channels)
@@ -696,6 +696,50 @@ impl PropertiesPanel {
                             }
                         }
                     });
+                if node.kind == "CornerPin2D" {
+                    let response = ui
+                        .button("[Set to Input]")
+                        .on_hover_text("Snap to1..to4 corners to upstream input format");
+                    #[cfg(test)]
+                    KNOB_WIDGET_RECTS.with(|rects| {
+                        rects
+                            .borrow_mut()
+                            .insert((node_id, "[Set to Input]".into()), response.rect);
+                    });
+                    if response.clicked() {
+                        let size = infer_upstream_format(graph, node_id).unwrap_or((256, 256));
+                        let mut commands = Vec::with_capacity(4);
+                        for (name, value) in corner_pin_format_knobs(size) {
+                            commands.push(UndoableCommand::SetKnob {
+                                node: node_id,
+                                knob: name.into(),
+                                value: value.clone(),
+                                previous: node
+                                    .knobs
+                                    .get(name)
+                                    .cloned()
+                                    .unwrap_or_else(|| value.clone()),
+                            });
+                            if let Some(previous) = node
+                                .curves
+                                .get(name)
+                                .filter(|curves| curves.iter().any(|curve| !curve.is_empty()))
+                            {
+                                commands.push(UndoableCommand::SetKnobCurve {
+                                    node: node_id,
+                                    name: name.into(),
+                                    curves: set_curve_values(
+                                        previous.clone(),
+                                        &value,
+                                        self.current_frame,
+                                    ),
+                                    previous: previous.clone(),
+                                });
+                            }
+                        }
+                        messages.push(KernelMessage::Execute(UndoableCommand::Batch(commands)));
+                    }
+                }
             });
 
         messages
@@ -893,6 +937,137 @@ mod tests {
                 .copied()
                 .unwrap_or_else(|| panic!("no widget rect captured for {name}"))
         })
+    }
+
+    #[test]
+    fn corner_pin_auto_chain_and_set_to_input_match_1920x1080_upstream() {
+        use crate::canvas::{NodeCanvasState, spawn_node_message};
+        use tanova_kernel::ProjectFormat;
+
+        tanova_nodes::ensure_linked();
+        let checker = NodeId(1);
+        let format = ProjectFormat::new(256, 256);
+        let mut dag = Dag::new();
+        dag.set_project_format(Some(format));
+        dag.add_node(checker, "CheckerBoard2").unwrap();
+        dag.set_knob(checker, "format_width", KnobValue::Int(1920))
+            .unwrap();
+        dag.set_knob(checker, "format_height", KnobValue::Int(1080))
+            .unwrap();
+        let mut mirror = GraphMirror::from_dag(&dag, None, Some(format));
+        let mut canvas = NodeCanvasState::default();
+        canvas.primary_selected = Some(checker);
+        let spawn = spawn_node_message(&mirror, &mut canvas, "CornerPin2D", Pos2::ZERO);
+        assert_eq!(canvas.primary_selected, Some(NODE));
+        let KernelMessage::Execute(UndoableCommand::Batch(commands)) = &spawn else {
+            panic!("expected atomic spawn");
+        };
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                UndoableCommand::AddNode { .. },
+                UndoableCommand::ConnectEdge {
+                    from_node: NodeId(1),
+                    to_node: NODE,
+                    to_port: tanova_kernel::PortId(0),
+                    ..
+                },
+                UndoableCommand::SetKnob { .. },
+                UndoableCommand::SetKnob { .. },
+                UndoableCommand::SetKnob { .. },
+                UndoableCommand::SetKnob { .. },
+            ]
+        ));
+        let expected = [
+            ("to1", [0.0; 4]),
+            ("to2", [1920.0, 0.0, 0.0, 0.0]),
+            ("to3", [1920.0, 1080.0, 0.0, 0.0]),
+            ("to4", [0.0, 1080.0, 0.0, 0.0]),
+        ];
+        let assert_corners = |mirror: &GraphMirror| {
+            for (name, value) in expected {
+                assert_eq!(
+                    mirror.node(NODE).unwrap().knobs.get(name),
+                    Some(&KnobValue::Color(value))
+                );
+            }
+        };
+        let mut undo = UndoStack::new();
+        feed(vec![spawn], &mut mirror, &mut dag, &mut undo);
+        assert_corners(&mirror);
+
+        let stale = KnobValue::Color([256.0, 256.0, 0.0, 0.0]);
+        let edit = UndoableCommand::SetKnob {
+            node: NODE,
+            knob: "to3".into(),
+            value: stale.clone(),
+            previous: KnobValue::Color(expected[2].1),
+        };
+        dag.apply_command(edit.clone()).unwrap();
+        mirror.apply_command(&edit);
+        let ctx = egui::Context::default();
+        run_panel(&ctx, &mirror, vec![]);
+        let pos = knob_rect("[Set to Input]").center();
+        run_panel(&ctx, &mirror, vec![Event::PointerMoved(pos)]);
+        let click = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        run_panel(&ctx, &mirror, vec![click(true)]);
+        let messages = run_panel(&ctx, &mirror, vec![click(false)]);
+        assert!(
+            matches!(messages.as_slice(),
+                [KernelMessage::Execute(UndoableCommand::Batch(commands))] if commands.len() == 4
+            ),
+            "{messages:?}"
+        );
+        feed(messages, &mut mirror, &mut dag, &mut undo);
+        assert_corners(&mirror);
+        undo_once(&mut undo, &mut dag, &mut mirror);
+        assert_eq!(mirror.node(NODE).unwrap().knobs.get("to3"), Some(&stale));
+    }
+
+    #[test]
+    fn write_channels_paints_only_one_value_widget() {
+        tanova_nodes::ensure_linked();
+        let mut dag = Dag::new();
+        dag.add_node(NODE, "Write").unwrap();
+        let mirror = GraphMirror::from_dag(&dag, None, None);
+        let output = egui::Context::default().run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen()),
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        assert!(
+                            PropertiesPanel::default()
+                                .show(ui, &mirror, Some(NODE), None)
+                                .is_empty()
+                        );
+                    });
+                })
+            },
+        );
+        fn count_rgba(shape: &egui::Shape) -> usize {
+            match shape {
+                egui::Shape::Text(text) => usize::from(text.galley.text() == "rgba"),
+                egui::Shape::Vec(shapes) => shapes.iter().map(count_rgba).sum(),
+                _ => 0,
+            }
+        }
+        assert_eq!(
+            output
+                .shapes
+                .iter()
+                .map(|shape| count_rgba(&shape.shape))
+                .sum::<usize>(),
+            1
+        );
+        output.drop_without_applying_deltas();
     }
 
     /// Mirrors the kernel: apply each emitted `SetKnob` to the DAG, record the

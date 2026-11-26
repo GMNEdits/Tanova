@@ -257,7 +257,7 @@ impl NodeTrait for GlowNode {
         };
 
         let mask = raster_input(inputs, 1);
-        let size = op.size.clamp(0.0, 250.0);
+        let size = op.size.clamp(0.0, 250.0) * ctx.proxy_scale();
         let radius = size.ceil() as u32;
         let sigma = (size / 3.0).max(1e-5);
         let bbox = input.bbox.pad(radius as i32);

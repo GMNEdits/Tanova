@@ -61,7 +61,7 @@ impl CropOp {
         }
     }
 
-    fn crop_bbox(&self, project_format: Option<ProjectFormat>) -> BBox {
+    fn crop_bbox(&self, project_format: Option<ProjectFormat>, scale: f32) -> BBox {
         let [min_x, min_y, ..] = self.box_min;
         let [mut max_x, mut max_y, ..] = self.box_max;
         if self.box_min == DEFAULT_MIN
@@ -71,13 +71,14 @@ impl CropOp {
             max_x = format.width as f32;
             max_y = format.height as f32;
         }
-        let min_x = min_x.round() as i32;
-        let min_y = min_y.round() as i32;
+        let pixel = |coord: f32| (coord * scale).round() as i32;
+        let min_x = pixel(min_x);
+        let min_y = pixel(min_y);
         BBox::new(
             min_x,
             min_y,
-            (max_x.round() as i32).max(min_x),
-            (max_y.round() as i32).max(min_y),
+            pixel(max_x).max(min_x),
+            pixel(max_y).max(min_y),
         )
     }
 }
@@ -86,19 +87,43 @@ impl NodeTrait for CropNode {
     fn evaluate(&self, ctx: &EvalContext, inputs: &[Packet]) -> Result<Packet, NodeError> {
         let input = raster_input(inputs, 0).ok_or(NodeError::MissingInput("main"))?;
         let op = CropOp::from_knobs(ctx.knobs().unwrap_or(&self.knobs));
-        let crop_bbox = op.crop_bbox(ctx.project_format());
+        let scale = ctx.proxy_scale();
+        let fallback_format = ctx.project_format().filter(|_| ctx.knobs().is_none());
+        let crop_bbox = op.crop_bbox(fallback_format, scale);
         let bbox = if op.intersect {
             input.bbox.intersection(&crop_bbox)
         } else {
             crop_bbox
         };
         let format = if op.reformat && !bbox.is_empty() {
-            Format::new(
+            let format = Format::new(
                 "Crop",
                 bbox.width() as u32,
                 bbox.height() as u32,
                 input.format.pixel_aspect,
-            )
+            );
+            if scale == 1.0 {
+                format
+            } else {
+                let logical_crop = op.crop_bbox(fallback_format, 1.0);
+                let logical = if !op.intersect {
+                    logical_crop
+                } else {
+                    let (w, h) = input.format.logical_size(scale);
+                    let logical_input = if input.bbox == input.format.to_bbox() {
+                        BBox::new(0, 0, w as i32, h as i32)
+                    } else {
+                        input
+                            .bbox
+                            .transform(&tanova_render::Mat3x3::scale(scale.recip(), scale.recip()))
+                    };
+                    logical_crop.intersection(&logical_input)
+                };
+                format.with_logical_size((
+                    logical.width().max(1) as u32,
+                    logical.height().max(1) as u32,
+                ))
+            }
         } else {
             input.format.clone()
         };
@@ -186,12 +211,12 @@ mod tests {
         let mut knobs = default_knobs();
         let project = Some(ProjectFormat::new(640, 480));
         assert_eq!(
-            CropOp::from_knobs(&knobs).crop_bbox(project),
+            CropOp::from_knobs(&knobs).crop_bbox(project, 1.0),
             BBox::new(0, 0, 640, 480)
         );
         knobs.insert("box_min", KnobValue::Color([-1.6, 1081.0, 0.0, 0.0]));
         assert_eq!(
-            CropOp::from_knobs(&knobs).crop_bbox(project),
+            CropOp::from_knobs(&knobs).crop_bbox(project, 1.0),
             BBox::new(-2, 1081, 1920, 1081)
         );
     }

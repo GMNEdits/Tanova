@@ -82,7 +82,7 @@ All budgets are measured on our daily reference laptop with the OS and browser t
 
 \---
 
-\## 4. Next Candidate Slice — \`v0.6.5\` (Safety, Speed \& Diagnostics)
+\## 4. Next Candidate Slice — \`v0.6.5\` (Safety, Speed \& Diagnostics) — SHIPPED (v0.6.5)
 
 \*Goal: Make Tanova safe for real projects and fast on 1080p footage before adding heavier tools.\*
 
@@ -110,11 +110,11 @@ All budgets are measured on our daily reference laptop with the OS and browser t
 
 \### Milestone 27 — Full-Res-Safe Viewer Proxy (\`1:1\` / \`1:2\` / \`1:4\`) \& Repo Hygiene
 
-\- \[ \] \*\*Viewer Proxy Mode (\`1:1\` / \`1:2\` / \`1:4\`):\*\* Top-bar selector + clear \`PROXY 1:2\` / \`PROXY 1:4\` badge; \`Write\` stays full-res by default; all spatial knobs, keyframes, radii, and Viewer handles (\`CornerPin2D\`, \`Transform\`, \`Crop\`, \`Ramp\`, \`Blur\`, \`Defocus\`, \`Glow\`, \`Mirror\`, generators) remain in \*\*full-resolution logical units\*\* while the engine scales math via \`proxy\_scale\`.
+\- \[x\] \*\*Viewer Proxy Mode (\`1:1\` / \`1:2\` / \`1:4\`):\*\* Viewer toolbar selector + clear \`PROXY 1:2\` / \`PROXY 1:4\` badge; \`Write\` always exports full-res; all spatial knobs, keyframes, radii, and Viewer handles remain in \*\*full-resolution logical units\*\* while the engine scales math via \`proxy\_scale\`. Implemented and live-GUI verified on `v0.6.5-testing`.
 
 \- \[x\] \*\*Repo Hygiene:\*\* Fix \`Cargo.toml\` repository URL (\`tanova/tanova\` -\> \`GMNEdits/Tanova\`) and add root \`LICENSE-MIT\` / \`LICENSE-APACHE\` files (merged from `codex-nodes` on `v0.6.5-testing`).
 
-\- \[ \] \*\*Remaining Cleanup:\*\* Remove the unused duplicate \`RamCache\` struct in \`tanova-kernel/src/dag.rs\` and sync stale \`README.md\` / \`CHANGELOG.md\` Known Limitations blocks.
+\- \[x\] \*\*Remaining Cleanup:\*\* Removed the unused duplicate \`RamCache\` and synced the \`README.md\` / \`CHANGELOG.md\` limitations.
 
 \---
 
@@ -220,7 +220,7 @@ All budgets are measured on our daily reference laptop with the OS and browser t
 
 \- \*(2026-11-22)\* Set up \`.github/workflows/\` CI (fmt, clippy, test, headless checks) + \`deny.toml\` (currently absent from repo).
 
-\- \*(2026-11-22)\* Annotate stale \`v0.4.0\` Known Limitations in \`CHANGELOG.md\` (cache eviction and parameter animation are now resolved) and align \`README.md\` limitations with \`CHANGELOG.md\`.
+\- \*(2026-11-22; resolved in Milestone 27)\* Annotate stale \`v0.4.0\` Known Limitations in \`CHANGELOG.md\` and align \`README.md\` limitations.
 
 \- \*(2026-11-22)\* Watch disk space across the 3 git worktrees (\`tanova\`, \`tanova-codex\`, \`tanova-kilo\`); purge unused \`target/\` caches if disk gets tight.
 

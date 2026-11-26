@@ -64,7 +64,8 @@ impl CheckerBoardOp {
     }
 
     fn dimensions(&self, ctx: &EvalContext) -> (u32, u32) {
-        if (self.width, self.height) == (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        if ctx.knobs().is_none()
+            && (self.width, self.height) == (DEFAULT_WIDTH, DEFAULT_HEIGHT)
             && let Some(format) = ctx.project_format()
         {
             return (format.width, format.height);
@@ -80,13 +81,19 @@ impl NodeTrait for CheckerBoardNode {
     fn evaluate(&self, ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
         let op = CheckerBoardOp::from_knobs(ctx.knobs().unwrap_or(&self.knobs));
         let (width, height) = op.dimensions(ctx);
-        let mut output = Raster2D::for_format(Format::new("CheckerBoard2", width, height, 1.0));
+        let scale = ctx.proxy_scale();
+        let format = Format::new("CheckerBoard2", width, height, 1.0).scaled(scale);
+        let mut output = Raster2D::for_format(format);
         let mut planes: [ChannelPlane; 4] = std::array::from_fn(|_| ChannelPlane::new());
         let uniform: [_; 4] = std::array::from_fn(|c| {
             (op.colors[0][c].to_bits() == op.colors[1][c].to_bits())
                 .then(|| Arc::new(TileBuffer::new_uniform(op.colors[0][c])))
         });
-        let boxsize = op.boxsize.max(1);
+        let boxsize = if scale == 1.0 {
+            op.boxsize.max(1)
+        } else {
+            ((op.boxsize as f32 * scale).round() as i64).max(1)
+        };
         for tile in output.bbox.tile_coords() {
             let mut samples: [Vec<f32>; 4] = std::array::from_fn(|c| {
                 if uniform[c].is_some() {

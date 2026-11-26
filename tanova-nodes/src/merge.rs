@@ -76,7 +76,15 @@ impl NodeTrait for Merge2Node {
         // composited at the same resolution. Out-of-bounds source pixels read
         // as transparent black.
         let output_bbox = match ctx.project_format() {
-            Some(fmt) => BBox::new(0, 0, fmt.width as i32, fmt.height as i32),
+            Some(fmt) => {
+                let scale = ctx.proxy_scale();
+                BBox::new(
+                    0,
+                    0,
+                    tanova_kernel::ProxyScale::scale_dim(fmt.width, scale) as i32,
+                    tanova_kernel::ProxyScale::scale_dim(fmt.height, scale) as i32,
+                )
+            }
             None => background.bbox.union(&foreground.bbox),
         };
         let mix = float_knob(knobs, "mix", DEFAULT_MIX);

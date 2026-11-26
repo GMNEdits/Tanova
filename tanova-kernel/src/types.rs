@@ -31,6 +31,11 @@ pub struct Time(pub f64);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct View(pub String);
 
+/// Marks a sequence export, where sources must return final data rather than
+/// an interactive loading placeholder.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderForExport;
+
 /// The active project format, carried top-down so every source cartridge
 /// (e.g. `Constant`) produces rasters at the project resolution instead of
 /// its own default format.
@@ -43,6 +48,36 @@ pub struct ProjectFormat {
 impl ProjectFormat {
     pub fn new(width: u32, height: u32) -> Self {
         Self { width, height }
+    }
+}
+
+/// Logical-to-proxy resolution multiplier (`1.0` = full 1:1, `0.5` = 1:2,
+/// `0.25` = 1:4). Stored in [`EvalContext`] so every cartridge reads the same
+/// requested scale and hashes it into its `OpHash`, keeping full-res and
+/// proxy-res cache entries distinct.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProxyScale(pub f32);
+
+impl ProxyScale {
+    /// Clamps finite scales to `0.1..=1.0`; non-finite scales fall back to
+    /// `1.0`. Callers always pass user input through here before storing.
+    pub fn sanitized(scale: f32) -> f32 {
+        if scale.is_finite() {
+            scale.clamp(0.1, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Rounds `dim * scale` to a whole pixel, floored to at least `1`.
+    pub fn scale_dim(dim: u32, scale: f32) -> u32 {
+        ((dim as f32 * scale).round() as u32).max(1)
+    }
+}
+
+impl Default for ProxyScale {
+    fn default() -> Self {
+        Self(1.0)
     }
 }
 
@@ -379,6 +414,19 @@ impl EvalContext {
     pub fn project_format(&self) -> Option<ProjectFormat> {
         self.get::<ProjectFormat>().copied()
     }
+
+    /// The requested proxy scale, defaulting to `1.0` (full resolution) when
+    /// absent so every existing pull defaults to `1:1`.
+    pub fn proxy_scale(&self) -> f32 {
+        let scale = ProxyScale::sanitized(self.get::<ProxyScale>().map_or(1.0, |s| s.0));
+        // Treat values in the legacy hash's full-resolution tolerance as 1:1
+        // in evaluation too, so different pixels cannot share that hash.
+        if (scale - 1.0).abs() <= 1e-6 {
+            1.0
+        } else {
+            scale
+        }
+    }
 }
 
 /// Errors a cartridge can report without tearing down the kernel.
@@ -509,5 +557,23 @@ mod tests {
 
         assert_eq!(ctx.time(), Some(1.5));
         assert_eq!(ctx.view(), Some("main"));
+    }
+
+    #[test]
+    fn proxy_scale_defaults_to_full_and_sanitizes_context_values() {
+        let mut ctx = EvalContext::new();
+        assert_eq!(ctx.proxy_scale(), 1.0);
+        for (value, expected) in [
+            (f32::NAN, 1.0),
+            (f32::INFINITY, 1.0),
+            (1.5, 1.0),
+            (0.0, 0.1),
+            (0.25, 0.25),
+        ] {
+            ctx.insert(ProxyScale(value));
+            assert_eq!(ctx.proxy_scale(), expected);
+        }
+        assert_eq!(ProxyScale::scale_dim(65, 0.5), 33);
+        assert_eq!(ProxyScale::scale_dim(1, 0.25), 1);
     }
 }
