@@ -13,12 +13,15 @@ pub mod registry;
 pub mod types;
 
 pub use bus::{
-    FrameExporter, FrameNotification, KernelEvent, KernelHandle, KernelMessage, NodeId, PortId,
-    UndoStack, UndoableCommand, atomic_write_string,
+    ExternalCachePurger, FrameExporter, FrameNotification, KernelEvent, KernelHandle,
+    KernelMessage, NodeId, NodePerfSample, PortId, UndoStack, UndoableCommand, atomic_write_string,
 };
 pub use command::{EdgeSnapshot, NodeSnapshot};
 pub use dag::{Dag, DagNode, Edge, OpHash, RamCache, TANOVA_SCHEMA_VERSION};
-pub use governor::{MemoryGovernor, MemoryPermit, RenderEpoch, evaluate_with_airbag};
+pub use governor::{
+    MemoryGovernor, MemoryPermit, RenderEpoch, evaluate_with_airbag,
+    recommended_gui_memory_cap_bytes,
+};
 pub use knobs::{KnobTable, KnobValue};
 pub use registry::{NodeCartridgeDescriptor, find_cartridge, registered_cartridge_kinds};
 pub use types::{
@@ -53,7 +56,9 @@ mod tests {
             match &event {
                 KernelEvent::DirtyStateChanged { .. }
                 | KernelEvent::ScriptSaved { .. }
-                | KernelEvent::ScriptError { .. } => continue,
+                | KernelEvent::ScriptError { .. }
+                | KernelEvent::MemoryStats { .. }
+                | KernelEvent::PerfSnapshot(_) => continue,
                 _ => return event,
             }
         }

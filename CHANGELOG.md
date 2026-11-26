@@ -34,6 +34,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `export_to_tcl` line 1 kept as `version 15.0 v5\n`; schema marker inserted on line 2.
 
+**Phase 8 — Real GUI RAM Budget, Cooperative Eviction & 1080p Speed Gate (Milestone 26).**
+
+### Added
+
+- **Real GUI `MemoryGovernor` cap:** `recommended_gui_memory_cap_bytes()` auto-scales to `1.0 GiB` on systems with ≤8.5 GiB RAM (parsed from `/proc/meminfo` on Linux) and `2.0 GiB` otherwise; desktop `KernelHandle` boots with this cap instead of `usize::MAX`.
+- **Cooperative cache eviction:** `Dag::pull` evicts the lowest-priority cached entry when a `MemoryExceeded` error occurs, retrying evaluation; the cache also pre-evicts above 75% of the governor cap so heavy nodes can allocate tiles.
+- **`DiskCache::clear()`** drops cached `Arc<Raster2D>`s and releases their `MemoryPermit`s cleanly.
+- **`KernelMessage::PurgeCache`** purges the DAG cache and any injected external cache, emitting `KernelEvent::MemoryStats`.
+- **`KernelEvent::MemoryStats`** (`allocated_bytes`, `max_bytes`) emitted after renders, `NewScript`, `ReplaceDag`, `ExecuteWriteNode`, and `PurgeCache`.
+- **`KernelEvent::PerfSnapshot(Vec<NodePerfSample>)`** emitted after each `render_viewer()` frame with per-node `(node, eval_us, from_cache)` timings.
+- **`ExternalCachePurger`** lets `tanova-app` inject a disk-cache purge closure without `tanova-kernel` knowing about `tanova-io`.
+- **`tanova-render/src/pool.rs`:** `worker_thread_count()` (`N - 2`, clamped `1..=6`) and `parallel_map_ordered()` using pure `std::thread::scope`, zero `unsafe`.
+- **Parallel tile ops:** `defocus_raster`, `perspective_warp_raster`, `grade_raster`, `merge_raster` (CPU path), and `blur_padded_rgba` (heavy blurs) parallelize across tiles/rows with pixel-identical output.
+- **Top-bar RAM meter:** compact pure-ASCII `RAM {:.0}/{:.0}M ({}%)` readout with hover tooltip and a `[Purge]` button sending `KernelMessage::PurgeCache`.
+- **Per-node timing heat bar:** 2.5 px performance heat bar on node cards (green/amber/coral) plus tiny `1.2ms`/`C` text when zoomed ≥ 0.75; exposed via `GraphMirror::node_perf`.
+- **`tanova-cli --bench-1080p`:** 1920×1080 speed benchmark gate for Grade, Blur, Defocus, CornerPin2D, Glow on a 40-tile CheckerBoard2 source under the 2.0 GiB cap.
+
+### Changed
+
+- **`MemoryGovernor`** is no longer `usize::MAX` in the GUI; the desktop app uses `recommended_gui_memory_cap_bytes()`.
+- **`Dag::evaluate_pull`** now records per-node perf samples internally, retrievable via `Dag::take_perf_samples()`.
+- **Repo hygiene & CI:** Fixed `Cargo.toml` repository URL (`tanova/tanova` → `GMNEdits/Tanova`), added root `LICENSE-MIT` and `LICENSE-APACHE`, added `deny.toml` (cargo-deny license/advisory checks), and added `.github/workflows/ci.yml` (fmt, clippy, test, headless checks).
+
 ## [0.6.0] - 2026-11-22
 
 **Phase 7 — Studio Compositing, Spatial Warping & Curve Editor (Milestones 23–24).** Ships an Interactive Curve Editor tab, Node Graph Minimap, projective 4-point homography `CornerPin2D`, optical circular/anamorphic disk `Defocus`, `Mirror`/`Ramp`/`Glow` cartridges (**29 total**), and live-GUI responsiveness fixes for continuous knob/handle dragging.

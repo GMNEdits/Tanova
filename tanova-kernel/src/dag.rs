@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use indexmap::IndexMap;
 
-use crate::bus::{NodeId, PortId, UndoableCommand};
+use crate::bus::{NodeId, NodePerfSample, PortId, UndoableCommand};
 use crate::command::{EdgeSnapshot, NodeSnapshot};
 use crate::governor::{MemoryGovernor, RenderEpoch, evaluate_with_airbag};
 use crate::knobs::{KnobTable, KnobValue, canonical_f64};
@@ -357,6 +357,8 @@ pub struct Dag {
     pub max_cache_entries: usize,
     /// Monotonic recency clock, advanced to evicted priorities on eviction.
     pub global_clock: f64,
+    /// Per-node timing samples from the last `evaluate_pull` traversal.
+    perf_samples: Vec<NodePerfSample>,
     /// Frame requested by the most recent pull (defaults to frame 1.0).
     ///
     /// Used to keep a knob's static fallback synced with its animation when a
@@ -386,6 +388,7 @@ impl Dag {
             project_format: None,
             max_cache_entries: capacity,
             global_clock: 0.0,
+            perf_samples: Vec::new(),
             current_frame: 1.0,
         }
     }
@@ -474,10 +477,36 @@ impl Dag {
         self.cache.len()
     }
 
+    /// Drains and returns per-node timing samples from the last `evaluate_pull`
+    /// traversal. Called by the kernel after each `render_viewer()` frame to
+    /// emit a single `KernelEvent::PerfSnapshot`.
+    pub fn take_perf_samples(&mut self) -> Vec<NodePerfSample> {
+        std::mem::take(&mut self.perf_samples)
+    }
+
     /// Clears the cache and resets the recency clock.
     pub fn clear_cache(&mut self) {
         self.cache.clear();
         self.global_clock = 0.0;
+    }
+
+    /// Evicts the single lowest-priority cache entry (GreedyDual-Size victim),
+    /// advancing `global_clock` to its priority and dropping its `Arc<Packet>`
+    /// so any unshared `MemoryPermit`s are released back to the governor.
+    ///
+    /// Returns `true` if an entry was evicted, `false` if the cache is empty.
+    pub fn evict_one_lowest_priority(&mut self) -> bool {
+        if self.cache.is_empty() {
+            return false;
+        }
+        let (victim_hash, victim_priority) = self
+            .cache
+            .iter()
+            .min_by(|(_, a), (_, b)| a.priority.total_cmp(&b.priority))
+            .map(|(hash, entry)| (*hash, entry.priority))
+            .expect("cache is non-empty");
+        self.global_clock = victim_priority;
+        self.cache.remove(&victim_hash).is_some()
     }
 
     /// Removes cached packets for `node_id` and every node downstream of it
@@ -1175,6 +1204,9 @@ impl Dag {
     /// The cache is consulted before any cartridge runs. Input packets are
     /// pulled in input-port order; a stale epoch aborts with
     /// [`NodeError::Preempted`] at every step.
+    ///
+    /// Per-node timing samples are recorded internally; retrieve them with
+    /// [`Dag::take_perf_samples`] after the pull completes.
     pub fn evaluate_pull(
         &mut self,
         target: NodeId,
@@ -1183,6 +1215,7 @@ impl Dag {
         epoch: &RenderEpoch,
         target_epoch: u64,
     ) -> Result<Arc<Packet>, NodeError> {
+        self.perf_samples.clear();
         self.pull(
             target,
             ctx,
@@ -1225,6 +1258,11 @@ impl Dag {
         // Cache hit: refresh priority so actively scrubbed nodes stay hot.
         if let Some(entry) = self.cache.get_mut(&hash) {
             entry.priority = self.global_clock + (entry.cost_us as f64);
+            self.perf_samples.push(NodePerfSample {
+                node: id,
+                eval_us: entry.cost_us,
+                from_cache: true,
+            });
             visiting.remove(&id);
             return Ok(entry.packet.clone());
         }
@@ -1316,17 +1354,43 @@ impl Dag {
         // entries alive longer than cheap ones (GreedyDual-Size: evict the
         // least valuable entry, where value ~ cost * recency).
         let start = Instant::now();
-        let evaluated = if disabled {
-            Ok(inputs.first().cloned().unwrap_or_default())
-        } else {
-            match implementation {
-                Some(implementation) => {
-                    evaluate_with_airbag(implementation.as_ref(), &node_ctx, &inputs)
+        let evaluated = loop {
+            let result = if disabled {
+                Ok(inputs.first().cloned().unwrap_or_default())
+            } else {
+                match &implementation {
+                    Some(implementation) => {
+                        evaluate_with_airbag(implementation.as_ref(), &node_ctx, &inputs)
+                    }
+                    None => Err(NodeError::NoImplementation(id.0)),
                 }
-                None => Err(NodeError::NoImplementation(id.0)),
+            };
+            // Cooperative eviction: if the governor rejected a permit, evict
+            // the lowest-priority cached entry to free its MemoryPermit(s),
+            // then retry once. If memory is still over cap after evicting
+            // everything (e.g. in-flight inputs pin RAM), return the Err.
+            match &result {
+                Err(NodeError::MemoryExceeded { .. })
+                    if governor.max_bytes() < usize::MAX && !self.cache.is_empty() =>
+                {
+                    let before = governor.allocated_bytes();
+                    while governor.allocated_bytes() >= before && !self.cache.is_empty() {
+                        self.evict_one_lowest_priority();
+                    }
+                    if governor.allocated_bytes() < before {
+                        continue; // freed RAM — retry evaluation
+                    }
+                    break result; // still over cap — report the error
+                }
+                _ => break result,
             }
         };
         let cost_us = start.elapsed().as_micros().max(1) as u64;
+        self.perf_samples.push(NodePerfSample {
+            node: id,
+            eval_us: cost_us,
+            from_cache: false,
+        });
 
         if !epoch.is_current(target_epoch) {
             visiting.remove(&id);
@@ -1357,6 +1421,14 @@ impl Dag {
         // hit; hits only refresh priority. A capacity of zero disables
         // caching entirely.
         if self.max_cache_entries > 0 {
+            // Keep the cache comfortably below 75% of the RAM ceiling by
+            // evicting lowest-priority entries under governor pressure.
+            while governor.max_bytes() < usize::MAX
+                && governor.allocated_bytes() > (governor.max_bytes() * 3) / 4
+                && !self.cache.is_empty()
+            {
+                self.evict_one_lowest_priority();
+            }
             if self.cache.len() >= self.max_cache_entries && !self.cache.contains_key(&hash) {
                 let victim = self
                     .cache
@@ -2798,5 +2870,73 @@ mod tests {
             None,
             "the unselected branch must not be evaluated"
         );
+    }
+
+    /// A cartridge that reserves `bytes` from the governor and keeps the
+    /// permit alive inside the returned packet (so a cached entry holds RAM).
+    struct PermitNode {
+        bytes: usize,
+    }
+
+    impl NodeTrait for PermitNode {
+        fn evaluate(&self, ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
+            let governor = ctx
+                .governor()
+                .ok_or_else(|| NodeError::Other("governor was not injected".to_string()))?;
+            let permit = governor.request_permit(self.bytes)?;
+            let mut packet = Packet::new();
+            packet.insert(Arc::new(permit));
+            // Dropping `permit` here does NOT release the bytes: the cloned
+            // `Arc` stored in the packet keeps the `MemoryPermit` alive until
+            // the cache entry is dropped.
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            "PermitNode {}".to_string()
+        }
+    }
+
+    #[test]
+    fn cooperative_eviction_frees_cached_permits_under_tight_cap() {
+        // Tight cap: fits two 700-byte permits (1400 bytes) with room to spare
+        // under the 75% pre-eviction threshold (1536 of 2048), but not three.
+        let governor = MemoryGovernor::new(2048);
+        let mut ctx = EvalContext::new();
+        ctx.insert(governor.clone());
+        let epoch = RenderEpoch::new();
+        let target_epoch = epoch.bump();
+
+        let mut dag = Dag::new();
+        dag.add_node_with_implementation(NodeId(1), "PermitA", Arc::new(PermitNode { bytes: 700 }))
+            .unwrap();
+        dag.set_knob(NodeId(1), "seed", KnobValue::Float(1.0))
+            .unwrap();
+        dag.add_node_with_implementation(NodeId(2), "PermitB", Arc::new(PermitNode { bytes: 700 }))
+            .unwrap();
+        dag.set_knob(NodeId(2), "seed", KnobValue::Float(2.0))
+            .unwrap();
+        dag.add_node_with_implementation(NodeId(3), "PermitC", Arc::new(PermitNode { bytes: 700 }))
+            .unwrap();
+        dag.set_knob(NodeId(3), "seed", KnobValue::Float(3.0))
+            .unwrap();
+
+        // Cache A and B: both permits held (1400 bytes), under the eviction
+        // threshold so both stay cached.
+        dag.evaluate_pull(NodeId(1), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+        dag.evaluate_pull(NodeId(2), &ctx, &governor, &epoch, target_epoch)
+            .unwrap();
+        assert_eq!(dag.cache_len(), 2);
+
+        // Pulling C needs a 700-byte permit but only 648 are available. Without
+        // cooperative eviction this would be a hard MemoryExceeded error.
+        let result = dag.evaluate_pull(NodeId(3), &ctx, &governor, &epoch, target_epoch);
+        assert!(
+            result.is_ok(),
+            "cooperative eviction must free a cached permit so C can allocate, got {result:?}"
+        );
+        // A was evicted to make room for C: cache holds B and C.
+        assert_eq!(dag.cache_len(), 2);
     }
 }

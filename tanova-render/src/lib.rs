@@ -10,6 +10,7 @@
 pub mod coords;
 pub mod matrix;
 pub mod ops;
+pub mod pool;
 pub mod shader;
 pub mod tile;
 

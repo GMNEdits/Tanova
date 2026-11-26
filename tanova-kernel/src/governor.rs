@@ -140,6 +140,38 @@ impl Drop for MemoryPermit {
     }
 }
 
+/// Recommended GUI RAM ceiling for the desktop app.
+///
+/// Pure `std` — zero `unsafe`, zero new crates. On Linux reads `/proc/meminfo`
+/// (`MemTotal:` kB) and auto-scales down on small-RAM machines so an 8 GiB
+/// laptop never swaps; defaults to `2.0 GiB` elsewhere.
+pub fn recommended_gui_memory_cap_bytes() -> usize {
+    const DEFAULT_CAP: usize = 2 * 1024 * 1024 * 1024; // 2.0 GiB
+    const SMALL_RAM_CAP: usize = 1024 * 1024 * 1024; // 1.0 GiB
+    const SMALL_RAM_THRESHOLD_KB: u64 = 8 * 1024 * 1024 + 512 * 1024; // 8.5 GiB in kB
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+            for line in contents.lines() {
+                if line.starts_with("MemTotal:") {
+                    let kb: u64 = line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if kb > 0 && kb <= SMALL_RAM_THRESHOLD_KB {
+                        return SMALL_RAM_CAP;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    DEFAULT_CAP
+}
+
 /// Evaluates a cartridge with the kernel's panic airbag engaged.
 ///
 /// A panicking node yields [`NodeError::Panic`] instead of unwinding into the

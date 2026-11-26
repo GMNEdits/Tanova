@@ -386,6 +386,13 @@ impl UndoableCommand {
     }
 }
 
+/// Injected by `tanova-app` so the kernel can purge an external cache
+/// (e.g. `DiskCache` in `tanova-io`) without `tanova-kernel` knowing about
+/// `tanova-io`. The closure is `Arc<dyn Fn() + Send + Sync>` so it can be
+/// called from the kernel thread.
+#[derive(Clone)]
+pub struct ExternalCachePurger(pub std::sync::Arc<dyn Fn() + Send + Sync>);
+
 /// Work sent from the UI thread to the kernel thread.
 #[derive(Debug)]
 pub enum KernelMessage {
@@ -446,6 +453,9 @@ pub enum KernelMessage {
     ExecuteWriteNode { node: NodeId },
     /// Ask the kernel thread to exit.
     Shutdown,
+    /// Purge the DAG cache and any injected external cache (e.g. disk cache),
+    /// then report memory stats. Does not touch the viewer frame or dirty flag.
+    PurgeCache,
 }
 
 /// Notifications sent from the kernel thread back to the UI.
@@ -504,6 +514,29 @@ pub enum KernelEvent {
         /// Path of the last written frame, if any.
         last_path: Option<std::path::PathBuf>,
     },
+    /// Memory usage reported after renders, NewScript, ReplaceDag,
+    /// ExecuteWriteNode, and PurgeCache so the UI meter stays accurate.
+    MemoryStats {
+        /// Bytes currently reserved by live `MemoryPermit`s.
+        allocated_bytes: usize,
+        /// The governor's configured cap.
+        max_bytes: usize,
+    },
+    /// Per-node evaluation timing samples from the last completed frame.
+    PerfSnapshot(Vec<NodePerfSample>),
+}
+
+/// One per-node evaluation timing sample from a single `evaluate_pull`
+/// traversal. `from_cache` is `true` when the node was served from the
+/// DAG cache (no cartridge ran).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodePerfSample {
+    /// The node that was evaluated (or served from cache).
+    pub node: NodeId,
+    /// Evaluation time in microseconds (floored at 1).
+    pub eval_us: u64,
+    /// `true` when the result came from the DAG cache.
+    pub from_cache: bool,
 }
 
 /// Metadata for a rendered frame delivered off-screen to the UI.
@@ -1242,11 +1275,19 @@ fn kernel_loop(
                     let _ = frames.send(notification);
                     consecutive_preemptions = 0;
                     render_time = render_start.elapsed();
+                    let _ = events.send(KernelEvent::MemoryStats {
+                        allocated_bytes: governor.allocated_bytes(),
+                        max_bytes: governor.max_bytes(),
+                    });
                     break;
                 }
                 RenderOutcome::Unchanged => {
                     consecutive_preemptions = 0;
                     render_time = render_start.elapsed();
+                    let _ = events.send(KernelEvent::MemoryStats {
+                        allocated_bytes: governor.allocated_bytes(),
+                        max_bytes: governor.max_bytes(),
+                    });
                     break;
                 }
                 RenderOutcome::Preempted => {
@@ -1444,6 +1485,10 @@ fn apply_kernel_message(
             let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
             let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
             let _ = frames.send(FrameNotification::cleared(None, epoch.current()));
+            let _ = events.send(KernelEvent::MemoryStats {
+                allocated_bytes: governor.allocated_bytes(),
+                max_bytes: governor.max_bytes(),
+            });
             *render_dirty = true;
         }
         KernelMessage::ReplaceDag {
@@ -1455,6 +1500,10 @@ fn apply_kernel_message(
             *viewer_node = viewer_target;
             let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
             let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
+            let _ = events.send(KernelEvent::MemoryStats {
+                allocated_bytes: governor.allocated_bytes(),
+                max_bytes: governor.max_bytes(),
+            });
             *render_dirty = true;
         }
         KernelMessage::SaveScript { path } => {
@@ -1583,9 +1632,26 @@ fn apply_kernel_message(
                 frames_written,
                 last_path,
             });
+            let _ = events.send(KernelEvent::MemoryStats {
+                allocated_bytes: governor.allocated_bytes(),
+                max_bytes: governor.max_bytes(),
+            });
         }
         KernelMessage::Shutdown => {
             *shutdown = true;
+        }
+        KernelMessage::PurgeCache => {
+            // Drop all cached DAG packets, releasing their MemoryPermits.
+            dag.clear_cache();
+            // Invoke the injected external cache purger (e.g. DiskCache::clear)
+            // if one was registered in the base context.
+            if let Some(purger) = base_ctx.get::<ExternalCachePurger>() {
+                (purger.0)();
+            }
+            let _ = events.send(KernelEvent::MemoryStats {
+                allocated_bytes: governor.allocated_bytes(),
+                max_bytes: governor.max_bytes(),
+            });
         }
     }
 }
@@ -1652,32 +1718,46 @@ fn render_viewer(
     match dag.evaluate_pull(target, context, governor, epoch, current_epoch) {
         Ok(packet) if !packet.is_empty() => {
             *displayed_target = Some(target);
+            let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
             RenderOutcome::Frame(FrameNotification::frame(target, current_epoch, packet))
         }
-        Ok(_) => {
+        Ok(_packet) => {
             // The chain exists but produced nothing displayable: an
             // unconnected `Viewer`, a detached upstream wire, or a
             // metadata-only packet.
             *displayed_target = None;
+            let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
             RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
         // Preemption is not a failure: the artist moved the timeline or a knob
         // while this render ran. Keep the last good image on screen and let
         // the caller retry with the newest state -- clearing here would blank
         // the viewer on every mid-drag preemption.
-        Err(NodeError::Preempted) => RenderOutcome::Preempted,
+        Err(NodeError::Preempted) => {
+            // A mid-drag preemption can happen many times per second; drain the
+            // partial samples so the buffer cannot grow without bound. The
+            // mirror merges them, so no earlier bar is lost.
+            let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
+            RenderOutcome::Preempted
+        }
         Err(NodeError::Panic(message)) => {
             *displayed_target = None;
             let _ = events.send(KernelEvent::NodeCrashed {
                 node: target,
                 message,
             });
+            // Keep the timings of every node that did evaluate before the
+            // crash so the canvas still shows honest bars.
+            let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
             RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
         Err(_) => {
             // Missing inputs and memory pressure are normal during interactive
-            // editing. Clear the image; the next change retries.
+            // editing. Clear the image; the next change retries. Emit the
+            // partial timings so startup bars appear even when the very first
+            // render cannot complete.
             *displayed_target = None;
+            let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
             RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
     }
@@ -1916,6 +1996,38 @@ mod tests {
         }
     }
 
+    /// A cartridge that reserves a fixed number of bytes from the governor so
+    // its cached packet holds a `MemoryPermit` until the cache is purged.
+    struct PermitPurgerNode;
+
+    impl crate::types::NodeTrait for PermitPurgerNode {
+        fn evaluate(&self, ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
+            let governor = ctx
+                .governor()
+                .ok_or_else(|| NodeError::Other("governor was not injected".to_string()))?;
+            let _permit = governor.request_permit(1024)?;
+            let mut packet = Packet::new();
+            packet.insert(42u32);
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            "PermitPurgerNode {}".to_string()
+        }
+    }
+
+    fn permit_purger_factory() -> Arc<dyn crate::types::NodeTrait> {
+        Arc::new(PermitPurgerNode)
+    }
+
+    inventory::submit! {
+        NodeCartridgeDescriptor {
+            kind: "PermitPurger",
+            default_knobs: constant_knobs,
+            factory: permit_purger_factory,
+        }
+    }
+
     fn next_event(kernel: &KernelHandle) -> KernelEvent {
         loop {
             let event = kernel
@@ -1927,7 +2039,9 @@ mod tests {
             match &event {
                 KernelEvent::DirtyStateChanged { .. }
                 | KernelEvent::ScriptSaved { .. }
-                | KernelEvent::ScriptError { .. } => continue,
+                | KernelEvent::ScriptError { .. }
+                | KernelEvent::MemoryStats { .. }
+                | KernelEvent::PerfSnapshot(_) => continue,
                 _ => return event,
             }
         }
@@ -2785,11 +2899,14 @@ mod tests {
         assert_eq!(frame.packet.get::<u32>(), Some(&15));
 
         // Undo must restore the original pre-drag value (0). Drain any stale
-        // EpochChanged events left over from the BumpEpoch messages above.
+        // events left over from the drag burst (EpochChanged, MemoryStats,
+        // PerfSnapshot, DirtyStateChanged), then wait for Undone.
         kernel.send(KernelMessage::Undo).expect("send undo");
+        // Drain the event channel of any stale events first.
+        while kernel.events().try_recv().is_ok() {}
         let mut seen_undone = false;
-        for _ in 0..50 {
-            match kernel.events().recv_timeout(Duration::from_millis(100)) {
+        for _ in 0..100 {
+            match kernel.events().recv_timeout(Duration::from_millis(50)) {
                 Ok(KernelEvent::Undone(UndoableCommand::SetKnob { .. })) => {
                     seen_undone = true;
                     break;
@@ -2997,5 +3114,102 @@ mod tests {
         // Drop the kernel handle: shutdown must complete without hanging.
         // The epoch bump in `KernelHandle::drop` aborts any in-flight render.
         drop(kernel);
+    }
+
+    #[test]
+    fn purge_cache_clears_dag_and_external_cache_and_emits_memory_stats() {
+        let purger_called = Arc::new(AtomicUsize::new(0));
+        let purger_flag = Arc::clone(&purger_called);
+
+        let kernel = KernelHandle::spawn_with_governor(MemoryGovernor::new(usize::MAX))
+            .expect("kernel thread should spawn");
+
+        // Inject the external cache purger so PurgeCache can reach it without
+        // tanova-kernel knowing about tanova-io.
+        let mut ctx = EvalContext::new();
+        ctx.insert(ExternalCachePurger(Arc::new(move || {
+            purger_flag.fetch_add(1, Ordering::SeqCst);
+        })));
+        kernel
+            .send(KernelMessage::SetBaseContext(ctx))
+            .expect("set base context should reach the kernel");
+
+        // Add a permit-allocating node and route a Viewer at it, then render
+        // so the DAG cache holds a packet with a MemoryPermit.
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(1),
+                kind: "PermitPurger".to_string(),
+                x: 10.0,
+                y: 10.0,
+            }))
+            .expect("send AddNode");
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(2),
+                kind: "Viewer".to_string(),
+                x: 60.0,
+                y: 10.0,
+            }))
+            .expect("send AddNode viewer");
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::ConnectEdge {
+                from_node: NodeId(1),
+                from_port: PortId(0),
+                to_node: NodeId(2),
+                to_port: PortId(0),
+            }))
+            .expect("send ConnectEdge");
+        kernel
+            .send(KernelMessage::SetViewerNode(Some(NodeId(2))))
+            .expect("send SetViewerNode");
+        kernel
+            .send(KernelMessage::BumpEpoch)
+            .expect("send BumpEpoch");
+
+        // Wait for the render to complete (MemoryStats is emitted after each render).
+        let mut saw_memory_stats = false;
+        for _ in 0..400 {
+            match kernel.events().recv_timeout(Duration::from_millis(25)) {
+                Ok(KernelEvent::MemoryStats { .. }) => {
+                    saw_memory_stats = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_memory_stats,
+            "kernel must emit MemoryStats after rendering the Viewer"
+        );
+
+        // Purge: clears the DAG cache, invokes the external purger, emits MemoryStats.
+        kernel
+            .send(KernelMessage::PurgeCache)
+            .expect("send PurgeCache");
+
+        let mut purger_was_called = false;
+        for _ in 0..100 {
+            match kernel.events().recv_timeout(Duration::from_millis(50)) {
+                Ok(KernelEvent::MemoryStats { .. }) => {
+                    purger_was_called = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            purger_was_called,
+            "ExternalCachePurger callback must run on PurgeCache"
+        );
+        assert_eq!(
+            purger_called.load(Ordering::SeqCst),
+            1,
+            "external cache purger must be invoked exactly once"
+        );
+
+        kernel.shutdown();
     }
 }

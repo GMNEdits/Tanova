@@ -123,6 +123,8 @@ pub struct GraphMirror {
     edges: Vec<CanvasEdge>,
     /// Active project format, used to stamp source cartridges on spawn.
     project_format: Option<ProjectFormat>,
+    /// Per-node evaluation timing from `KernelEvent::PerfSnapshot`.
+    pub node_perf: std::collections::HashMap<NodeId, (u64, bool)>,
 }
 
 impl GraphMirror {
@@ -136,6 +138,7 @@ impl GraphMirror {
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.edges.clear();
+        self.node_perf.clear();
     }
 
     /// Rebuilds the mirror directly from a kernel `Dag`, populating nodes with
@@ -172,6 +175,7 @@ impl GraphMirror {
             nodes,
             edges,
             project_format,
+            node_perf: std::collections::HashMap::new(),
         }
     }
 
@@ -313,7 +317,18 @@ impl GraphMirror {
             | KernelEvent::ScriptSaved { .. }
             | KernelEvent::ScriptError { .. }
             | KernelEvent::WriteFrameRendered { .. }
-            | KernelEvent::WriteCompleted { .. } => {}
+            | KernelEvent::WriteCompleted { .. }
+            | KernelEvent::MemoryStats { .. } => {}
+            KernelEvent::PerfSnapshot(samples) => {
+                // Merge, never wipe: a cached upstream node returns early and
+                // is not sampled, so a later snapshot only covers the branches
+                // it actually touched. Clearing here would erase the startup
+                // bars for every untouched node.
+                for sample in samples {
+                    self.node_perf
+                        .insert(sample.node, (sample.eval_us, sample.from_cache));
+                }
+            }
         }
     }
 
@@ -394,6 +409,7 @@ impl GraphMirror {
                 self.nodes.retain(|node| node.id != *id);
                 self.edges
                     .retain(|edge| edge.from_node != *id && edge.to_node != *id);
+                self.node_perf.remove(id);
             }
             UndoableCommand::RestoreNode {
                 id,
@@ -1995,6 +2011,7 @@ impl NodeCanvas {
                 state.zoom,
                 &pal,
                 active_port,
+                graph.node_perf.get(&node.id).copied(),
             );
         }
 
@@ -2134,6 +2151,35 @@ impl NodeCanvas {
                     painter.circle_filled(edge_point, 4.0, marker_color);
                 }
             }
+        }
+
+        // Non-blocking per-node timing tooltip. Drawn as an `interactable(false)`
+        // area so it can never steal a click, drag, or context menu from the
+        // canvas hit-test chain above.
+        let hover_quiet = !spawn_ui_open
+            && !minimap_active
+            && state.active_wire_drag.is_none()
+            && !state.dragging_nodes
+            && state.box_selection.is_none()
+            && state.resizing_backdrop.is_none();
+        if hover_quiet
+            && let Some(pointer) = ui.ctx().input(|input| input.pointer.hover_pos())
+            && rect.contains(pointer)
+            && hit_input_port(state, graph, pointer, rect).is_none()
+            && hit_output_port(state, graph, pointer, rect).is_none()
+            && let Some(node) = graph.nodes().iter().rev().find(|node| {
+                !is_backdrop_node(&node.kind)
+                    && node_screen_rect(state, node.id, rect, graph).contains(pointer)
+            })
+            && let Some(&(eval_us, from_cache)) = graph.node_perf.get(&node.id)
+        {
+            let ms = eval_us as f64 / 1000.0;
+            let state_str = if from_cache { "cached" } else { "computed" };
+            let text = format!(
+                "{} #{} | {:.2} ms ({})",
+                node.kind, node.id.0, ms, state_str
+            );
+            draw_node_perf_tooltip(ui, pointer, &text);
         }
 
         if let Some(message) = draw_tab_search(ui, state, graph, workflow) {
@@ -3592,6 +3638,7 @@ fn draw_node(
     zoom: f32,
     pal: &ThemePalette,
     active_port: Option<PortId>,
+    perf: Option<(u64, bool)>,
 ) {
     let crashed = node.crashed.is_some();
     let disabled = node.disabled;
@@ -3736,6 +3783,42 @@ fn draw_node(
         },
     );
 
+    // Per-node evaluation heat bar: 2.5 px along the bottom interior edge, plus
+    // a compact timing label beside `#id` when zoomed in (>= 0.75). The label
+    // stays on the left so it never sits under the `VIEWER 1/2` pill in the
+    // bottom-right corner.
+    if let Some((eval_us, from_cache)) = perf {
+        let eval_ms = eval_us as f64 / 1000.0;
+        let heat_color = if from_cache || eval_ms < 5.0 {
+            Color32::from_rgb(70, 195, 115) // emerald green: cached or fast
+        } else if eval_ms <= 25.0 {
+            Color32::from_rgb(240, 180, 60) // amber
+        } else {
+            Color32::from_rgb(235, 85, 75) // coral red: slow
+        };
+        let bar_h = 2.5 * zoom;
+        let bar_rect = Rect::from_min_max(
+            Pos2::new(rect.left() + 2.0 * zoom, rect.bottom() - 2.0 * zoom - bar_h),
+            Pos2::new(rect.right() - 2.0 * zoom, rect.bottom() - 2.0 * zoom),
+        );
+        painter.rect_filled(bar_rect, 0, heat_color);
+
+        if zoom >= 0.75 {
+            let text = if from_cache {
+                "C".to_string()
+            } else {
+                format!("{:.1}ms", eval_ms)
+            };
+            painter.text(
+                rect.left_bottom() + Vec2::new(48.0 * zoom, -6.0 * zoom),
+                Align2::LEFT_BOTTOM,
+                text,
+                FontId::proportional((8.0 * zoom).clamp(7.0, 10.0)),
+                heat_color,
+            );
+        }
+    }
+
     if crashed {
         painter.text(
             rect.right_top() + Vec2::new(-7.0 * zoom, 5.0 * zoom),
@@ -3798,6 +3881,31 @@ fn draw_node(
             Color32::from_rgb(30, 24, 8),
         );
     }
+}
+
+/// Renders the pure-ASCII per-node timing tooltip near the pointer.
+///
+/// `interactable(false)` keeps the tooltip completely out of egui's input
+/// chain, so hovering a node never blocks clicks, drags, or context menus.
+fn draw_node_perf_tooltip(ui: &Ui, pointer: Pos2, text: &str) {
+    egui::Area::new(egui::Id::unique("tanova_node_perf_tooltip"))
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .fixed_pos(pointer + Vec2::new(14.0, 14.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(18, 20, 26, 245))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(70, 78, 92)))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(7, 4))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(text)
+                            .font(FontId::proportional(11.0))
+                            .color(Color32::from_gray(220)),
+                    );
+                });
+        });
 }
 
 fn draw_wire(
@@ -6214,5 +6322,76 @@ mod tests {
                 assert_eq!(graph.node(id).unwrap().knobs, dag.node(id).unwrap().knobs);
             }
         }
+    }
+
+    /// A `PerfSnapshot` only covers the branches it evaluated (a cached
+    /// upstream node returns early), so folding must merge — never wipe — the
+    /// timings already on the mirror. Deleting a node prunes only its entry.
+    #[test]
+    fn perf_snapshot_merges_across_renders_and_remove_prunes_the_entry() {
+        use tanova_kernel::NodePerfSample;
+
+        let mut graph = GraphMirror::default();
+        for id in [1u64, 2, 3] {
+            graph.apply_command(&UndoableCommand::AddNode {
+                id: NodeId(id),
+                kind: "Constant".to_string(),
+                x: 0.0,
+                y: id as f32 * 100.0,
+            });
+        }
+
+        // First startup render evaluates the whole chain.
+        graph.apply_event(&KernelEvent::PerfSnapshot(vec![
+            NodePerfSample {
+                node: NodeId(1),
+                eval_us: 200,
+                from_cache: false,
+            },
+            NodePerfSample {
+                node: NodeId(2),
+                eval_us: 44_000,
+                from_cache: false,
+            },
+            NodePerfSample {
+                node: NodeId(3),
+                eval_us: 100,
+                from_cache: false,
+            },
+        ]));
+        assert_eq!(graph.node_perf.len(), 3);
+
+        // A later render finds an upstream packet cached and only samples the
+        // top node; the earlier bars must survive.
+        graph.apply_event(&KernelEvent::PerfSnapshot(vec![NodePerfSample {
+            node: NodeId(3),
+            eval_us: 50,
+            from_cache: true,
+        }]));
+        assert_eq!(
+            graph.node_perf.get(&NodeId(1)),
+            Some(&(200, false)),
+            "Constant #1 timing must survive a partial snapshot"
+        );
+        assert_eq!(
+            graph.node_perf.get(&NodeId(2)),
+            Some(&(44_000, false)),
+            "Grade #2 timing must survive a partial snapshot"
+        );
+        assert_eq!(graph.node_perf.get(&NodeId(3)), Some(&(50, true)));
+
+        // Removing a node prunes only its own timing.
+        graph.apply_command(&UndoableCommand::RemoveNode {
+            id: NodeId(2),
+            kind: "Constant".to_string(),
+            x: 0.0,
+            y: 200.0,
+            disabled: false,
+            knobs: Box::default(),
+            edges: Vec::new(),
+        });
+        assert!(!graph.node_perf.contains_key(&NodeId(2)));
+        assert!(graph.node_perf.contains_key(&NodeId(1)));
+        assert!(graph.node_perf.contains_key(&NodeId(3)));
     }
 }

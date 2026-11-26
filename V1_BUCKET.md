@@ -90,29 +90,31 @@ All budgets are measured on our daily reference laptop with the OS and browser t
 
 \### Milestone 25 — Bulletproof Save, \`.tnv\` Versioning \& Crash Recovery
 
-\- \[ \] \*\*Nuke-Safe \`.tnv\` Schema Version:\*\* Emit a version comment header (e.g., \`# tanova\_schema 1\`) alongside TCL output so Nuke still opens \`.nk\`/\`.tnv\` files cleanly while Tanova validates and migrates its own schema version.
+\- \[x\] \*\*Nuke-Safe \`.tnv\` Schema Version:\*\* Emit a version comment header (e.g., \`# tanova\_schema 1\`) alongside TCL output so Nuke still opens \`.nk\`/\`.tnv\` files cleanly while Tanova validates and migrates its own schema version.
 
-\- \[ \] \*\*Fix Optimistic Clean Save Bug:\*\* Keep \`is\_dirty = true\` until the kernel emits a confirmed \`ScriptSaved\` event; if saving fails, stay dirty and surface the error clearly.
+\- \[x\] \*\*Fix Optimistic Clean Save Bug:\*\* Keep \`is\_dirty = true\` until the kernel emits a confirmed \`ScriptSaved\` event; if saving fails, stay dirty and surface the error clearly.
 
-\- \[ \] \*\*Same-Folder Atomic Save:\*\* Write to a hidden \`.tmp\` file in the \*\*same directory\*\* as the target \`.tnv\` and atomically rename it (avoids cross-filesystem rename errors and prevents 0-byte corruption on power loss).
+\- \[x\] \*\*Same-Folder Atomic Save:\*\* Write to a hidden \`.tmp\` file in the \*\*same directory\*\* as the target \`.tnv\` and atomically rename it (avoids cross-filesystem rename errors and prevents 0-byte corruption on power loss).
 
-\- \[ \] \*\*Idle Background Auto-Save \& Crash Recovery:\*\* Save snapshots into a dedicated OS app-data recovery folder (\`$XDG\_DATA\_HOME/tanova/recovery\` or \`\~/.local/share/tanova/recovery\`) only when idle + dirty (never mid-drag, never overwriting the user's real saved \`.tnv\`); delete recovery snapshots cleanly on normal exit; prompt \*\*"Restore Session / Discard"\*\* after an unclean exit.
+\- \[x\] \*\*Idle Background Auto-Save \& Crash Recovery:\*\* Save snapshots into a dedicated OS app-data recovery folder (\`$XDG\_DATA\_HOME/tanova/recovery\` or \`\~/.local/share/tanova/recovery\`) only when idle + dirty (never mid-drag, never overwriting the user's real saved \`.tnv\`); delete recovery snapshots cleanly on normal exit; prompt \*\*"Restore Session / Discard"\*\* after an unclean exit.
 
 \### Milestone 26 — Real RAM Budget, Purge Button, Safe Multi-Threading \& 1080p Speed Gate
 
-\- \[ \] \*\*Real GUI \`MemoryGovernor\` Cap + Cooperative Eviction:\*\* Replace \`usize::MAX\` in the GUI with a safe \`2.0 GiB\` default cap (auto-scaled lower on machines with less RAM) and wire \`MemoryGovernor\` pressure to automatic \`Dag\` cache eviction so cached entries drop cleanly instead of failing allocations.
+\- \[x\] \*\*Real GUI \`MemoryGovernor\` Cap + Cooperative Eviction:\*\* Replace \`usize::MAX\` in the GUI with a safe \`2.0 GiB\` default cap (auto-scaled lower on machines with less RAM) and wire \`MemoryGovernor\` pressure to automatic \`Dag\` cache eviction so cached entries drop cleanly instead of failing allocations.
 
-\- \[ \] \*\*Live RAM Indicator \& \`Purge RAM\` Button:\*\* Expose \`allocated\_bytes / max\_bytes\` from the kernel to the UI top bar with a one-click \*\*\`Purge RAM\`\*\* button that calls \`Dag::clear\_cache()\`.
+\- \[x\] \*\*Live RAM Indicator \& \`Purge RAM\` Button:\*\* Expose \`allocated\_bytes / max\_bytes\` from the kernel to the UI top bar with a one-click \*\*\`Purge RAM\`\*\* button that calls \`Dag::clear\_cache()\`.
 
-\- \[ \] \*\*Safe Tile Multi-Threading (\`N - 2\` Threads):\*\* Parallelize heavy ops (\`Blur\`, \`Defocus\`, \`Glow\`, \`CornerPin2D\`) using a thread pool capped to leave \*\*2 threads free\*\* for OS/browser while staying deterministic and \`MemoryGovernor\`-safe.
+\- \[x\] \*\*Safe Tile Multi-Threading (\`N - 2\` Threads):\*\* Parallelize heavy ops (\`Blur\`, \`Defocus\`, \`Glow\`, \`CornerPin2D\`) using a thread pool capped to leave \*\*2 threads free\*\* for OS/browser while staying deterministic and \`MemoryGovernor\`-safe.
 
-\- \[ \] \*\*Per-Node Render Timings + 1080p Benchmark Gate:\*\* Record last evaluation ms per node (optional slow-node indicator/tooltip) and add automated \`1920×1080\` speed benchmarks.
+\- \[x\] \*\*Per-Node Render Timings + 1080p Benchmark Gate:\*\* Record last evaluation ms per node (optional slow-node indicator/tooltip) and add automated \`1920×1080\` speed benchmarks.
 
 \### Milestone 27 — Full-Res-Safe Viewer Proxy (\`1:1\` / \`1:2\` / \`1:4\`) \& Repo Hygiene
 
 \- \[ \] \*\*Viewer Proxy Mode (\`1:1\` / \`1:2\` / \`1:4\`):\*\* Top-bar selector + clear \`PROXY 1:2\` / \`PROXY 1:4\` badge; \`Write\` stays full-res by default; all spatial knobs, keyframes, radii, and Viewer handles (\`CornerPin2D\`, \`Transform\`, \`Crop\`, \`Ramp\`, \`Blur\`, \`Defocus\`, \`Glow\`, \`Mirror\`, generators) remain in \*\*full-resolution logical units\*\* while the engine scales math via \`proxy\_scale\`.
 
-\- \[ \] \*\*Repo \& Codebase Cleanup:\*\* Fix \`Cargo.toml\` repository URL (\`tanova/tanova\` -\> \`GMNEdits/Tanova\`), add root \`LICENSE-MIT\` and \`LICENSE-APACHE\` files, remove the unused duplicate \`RamCache\` struct in \`tanova-kernel/src/dag.rs\`, and sync stale \`README.md\` / \`CHANGELOG.md\` Known Limitations blocks.
+\- \[x\] \*\*Repo Hygiene:\*\* Fix \`Cargo.toml\` repository URL (\`tanova/tanova\` -\> \`GMNEdits/Tanova\`) and add root \`LICENSE-MIT\` / \`LICENSE-APACHE\` files (merged from `codex-nodes` on `v0.6.5-testing`).
+
+\- \[ \] \*\*Remaining Cleanup:\*\* Remove the unused duplicate \`RamCache\` struct in \`tanova-kernel/src/dag.rs\` and sync stale \`README.md\` / \`CHANGELOG.md\` Known Limitations blocks.
 
 \---
 
@@ -221,3 +223,5 @@ All budgets are measured on our daily reference laptop with the OS and browser t
 \- \*(2026-11-22)\* Annotate stale \`v0.4.0\` Known Limitations in \`CHANGELOG.md\` (cache eviction and parameter animation are now resolved) and align \`README.md\` limitations with \`CHANGELOG.md\`.
 
 \- \*(2026-11-22)\* Watch disk space across the 3 git worktrees (\`tanova\`, \`tanova-codex\`, \`tanova-kilo\`); purge unused \`target/\` caches if disk gets tight.
+
+\- \*(2026-11-26)* Optimize small-format Defocus/Blur border-tile spill (expanding 0..256 to -4..260 currently allocates 9 tiles / ~9.75 MiB instead of clipping or sparse-skipping empty border regions).

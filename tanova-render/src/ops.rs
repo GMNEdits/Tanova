@@ -10,6 +10,7 @@ use tanova_kernel::{MemoryGovernor, NodeError};
 
 use crate::coords::{BBox, EdgeMode, TILE_PIXELS, TILE_SIZE, TileCoord, world_to_tile};
 use crate::matrix::Mat3x3;
+use crate::pool::{parallel_map_ordered, worker_thread_count};
 use crate::shader::{BlurParams, GpuComputeEngine, GradeParams, MergeParams, TransformParams};
 use crate::tile::{Channel, ChannelPlane, Raster2D, TileBuffer, extract_padded_tile};
 
@@ -376,29 +377,54 @@ pub fn blur_padded_rgba(
     // Pass 1 output: one row per padded row, but only the inner TILE_SIZE columns.
     let mut intermediate = vec![[0.0f32; 4]; padded_height * tsize];
 
-    // Pass 1: horizontal 1D convolution.
-    for in_y in 0..padded_height as u32 {
-        let row = in_y as usize * stride;
-        let out_row = in_y as usize * tsize;
+    // Compute one Pass-1 (horizontal) row of the intermediate buffer.
+    let compute_pass1_row = |in_y: usize| -> Vec<[f32; 4]> {
+        let mut row = Vec::with_capacity(tsize);
+        let row_offset = in_y * stride;
         for out_x in 0..TILE_SIZE {
             let center_x = out_x as i32 + radius_i;
-            let center = padded[row + center_x as usize];
+            let center = padded[row_offset + center_x as usize];
             let mut rgb = [0.0f32; 3];
             for dx in -radius_i..=radius_i {
                 let weight = weights[(dx + radius_i) as usize] * inv_weight_sum;
-                let sample = padded[row + (center_x + dx) as usize];
+                let sample = padded[row_offset + (center_x + dx) as usize];
                 rgb[0] += sample[0] * weight;
                 rgb[1] += sample[1] * weight;
                 rgb[2] += sample[2] * weight;
             }
-            intermediate[out_row + out_x as usize] = [rgb[0], rgb[1], rgb[2], center[3]];
+            row.push([rgb[0], rgb[1], rgb[2], center[3]]);
+        }
+        row
+    };
+
+    let use_parallel = radius >= 4 && worker_thread_count() > 1;
+    if use_parallel {
+        let row_indices: Vec<usize> = (0..padded_height).collect();
+        let rows: Vec<Vec<[f32; 4]>> =
+            parallel_map_ordered(&row_indices, |&in_y| -> Result<Vec<[f32; 4]>, NodeError> {
+                Ok(compute_pass1_row(in_y))
+            })
+            .expect("pass-1 row closure never errors");
+        for (in_y, row_data) in row_indices.iter().zip(rows.iter()) {
+            let out_row = *in_y * tsize;
+            intermediate[out_row..out_row + tsize].copy_from_slice(row_data);
+        }
+    } else {
+        for in_y in 0..padded_height {
+            let row_data = compute_pass1_row(in_y);
+            let out_row = in_y * tsize;
+            intermediate[out_row..out_row + tsize].copy_from_slice(&row_data);
         }
     }
 
     // Pass 2: vertical 1D convolution, preserving the center pixel's alpha.
     let mut out = Vec::with_capacity(TILE_PIXELS);
-    for out_y in 0..TILE_SIZE {
+    out.resize(TILE_PIXELS, [0.0f32; 4]);
+
+    // Compute one Pass-2 (vertical) output row.
+    let compute_pass2_row = |out_y: usize| -> Vec<[f32; 4]> {
         let center_y = out_y as i32 + radius_i;
+        let mut row = Vec::with_capacity(tsize);
         for out_x in 0..TILE_SIZE {
             let mut rgb = [0.0f32; 3];
             for dy in -radius_i..=radius_i {
@@ -409,7 +435,27 @@ pub fn blur_padded_rgba(
                 rgb[2] += sample[2] * weight;
             }
             let center_alpha = intermediate[center_y as usize * tsize + out_x as usize][3];
-            out.push([rgb[0], rgb[1], rgb[2], center_alpha]);
+            row.push([rgb[0], rgb[1], rgb[2], center_alpha]);
+        }
+        row
+    };
+
+    if use_parallel {
+        let row_indices: Vec<usize> = (0..TILE_SIZE as usize).collect();
+        let rows: Vec<Vec<[f32; 4]>> =
+            parallel_map_ordered(&row_indices, |&out_y| -> Result<Vec<[f32; 4]>, NodeError> {
+                Ok(compute_pass2_row(out_y))
+            })
+            .expect("pass-2 row closure never errors");
+        for (out_y, row_data) in row_indices.iter().zip(rows.iter()) {
+            let out_row = *out_y * tsize;
+            out[out_row..out_row + tsize].copy_from_slice(row_data);
+        }
+    } else {
+        for out_y in 0..TILE_SIZE as usize {
+            let row_data = compute_pass2_row(out_y);
+            let out_row = out_y * tsize;
+            out[out_row..out_row + tsize].copy_from_slice(&row_data);
         }
     }
     out
@@ -515,17 +561,23 @@ pub fn grade_raster(
     let mut blue = ChannelPlane::new();
     let mut alpha = ChannelPlane::new();
 
-    for tile in input.bbox.tile_coords() {
-        let region = tile.to_bbox().intersection(&input.bbox);
+    let tiles: Vec<TileCoord> = input.bbox.tile_coords();
+    let use_parallel = gpu.is_none() && tiles.len() >= 2 && worker_thread_count() > 1;
 
+    enum TileResult {
+        Uniform([f32; 4]),
+        Dense(Vec<f32>),
+    }
+
+    let compute_grade_tile = |tile: TileCoord| -> Result<(TileCoord, TileResult), NodeError> {
+        let region = tile.to_bbox().intersection(&input.bbox);
         let uniform = uniform_rgba(input, tile, region).zip(uniform_mask_value(mask, tile, region));
         if let Some((rgba, mask_value)) = uniform {
             let pixel = op.apply_pixel(rgba, mask_value);
-            insert_uniform(&mut red, tile, pixel[0]);
-            insert_uniform(&mut green, tile, pixel[1]);
-            insert_uniform(&mut blue, tile, pixel[2]);
-            insert_uniform(&mut alpha, tile, pixel[3]);
-            continue;
+            return Ok((
+                tile,
+                TileResult::Uniform([pixel[0], pixel[1], pixel[2], pixel[3]]),
+            ));
         }
 
         let (input_pixels, mask_values) = gather_grade_inputs(input, mask, tile);
@@ -541,13 +593,37 @@ pub fn grade_raster(
                 })
                 .collect(),
         };
+        Ok((tile, TileResult::Dense(output_pixels)))
+    };
 
-        insert_dense(
-            [&mut red, &mut green, &mut blue, &mut alpha],
-            tile,
-            &output_pixels,
-            governor,
-        )?;
+    let tile_results: Result<Vec<(TileCoord, TileResult)>, NodeError> = if use_parallel {
+        parallel_map_ordered(&tiles, |tile| compute_grade_tile(*tile))
+    } else {
+        let mut results = Vec::with_capacity(tiles.len());
+        for tile in tiles {
+            results.push(compute_grade_tile(tile)?);
+        }
+        Ok(results)
+    };
+    let tile_results = tile_results?;
+
+    for (tile, result) in tile_results {
+        match result {
+            TileResult::Uniform(pixel) => {
+                insert_uniform(&mut red, tile, pixel[0]);
+                insert_uniform(&mut green, tile, pixel[1]);
+                insert_uniform(&mut blue, tile, pixel[2]);
+                insert_uniform(&mut alpha, tile, pixel[3]);
+            }
+            TileResult::Dense(output_pixels) => {
+                insert_dense(
+                    [&mut red, &mut green, &mut blue, &mut alpha],
+                    tile,
+                    &output_pixels,
+                    governor,
+                )?;
+            }
+        }
     }
 
     output.insert_channel(Channel::RgbaRed, red);
@@ -557,25 +633,185 @@ pub fn grade_raster(
     Ok(output)
 }
 
+/// Walks one `256x256` tile in Bottom-Left order, resolving every column and
+/// row through `bbox`/`edge_mode` exactly once, and yields contiguous runs that
+/// stay inside a single source tile.
+///
+/// Edge resolution is separable per axis, so resolving `x` with an in-bounds
+/// `y` (and vice versa) reproduces [`ChannelPlane::sample`] exactly while
+/// avoiding a `HashMap` lookup per pixel.
+fn for_each_resolved_span(
+    bbox: BBox,
+    edge_mode: EdgeMode,
+    tile: TileCoord,
+    mut visit: impl FnMut(usize, usize, usize, TileCoord, usize, usize),
+) {
+    let stride = TILE_SIZE as usize;
+    let (origin_x, origin_y) = tile.origin_world();
+
+    let inside_x = bbox.min_x <= origin_x && origin_x + stride as i32 <= bbox.max_x;
+    let inside_y = bbox.min_y <= origin_y && origin_y + stride as i32 <= bbox.max_y;
+
+    let xs: Vec<Option<i32>> = if inside_x {
+        (0..stride).map(|col| Some(origin_x + col as i32)).collect()
+    } else {
+        (0..stride)
+            .map(|col| {
+                edge_mode
+                    .resolve_coord(origin_x + col as i32, bbox.min_y, bbox)
+                    .map(|(resolved, _)| resolved)
+            })
+            .collect()
+    };
+    let ys: Vec<Option<i32>> = if inside_y {
+        (0..stride).map(|row| Some(origin_y + row as i32)).collect()
+    } else {
+        (0..stride)
+            .map(|row| {
+                edge_mode
+                    .resolve_coord(bbox.min_x, origin_y + row as i32, bbox)
+                    .map(|(_, resolved)| resolved)
+            })
+            .collect()
+    };
+
+    for (row, resolved_y) in ys.iter().enumerate() {
+        let Some(resolved_y) = *resolved_y else {
+            continue;
+        };
+        let mut col = 0;
+        while col < stride {
+            let Some(resolved_x) = xs[col] else {
+                col += 1;
+                continue;
+            };
+            let (source_tile, lx, ly) = world_to_tile(resolved_x, resolved_y);
+            let mut run = 1usize;
+            while col + run < stride && lx as usize + run < stride {
+                match xs[col + run] {
+                    Some(next_x) if next_x == resolved_x + run as i32 => run += 1,
+                    _ => break,
+                }
+            }
+            visit(col, row, run, source_tile, lx as usize, ly as usize);
+            col += run;
+        }
+    }
+}
+
+/// Gathers one tile's four RGBA planes directly from their dense slices.
+///
+/// Every plane lookup happens once per run instead of once per pixel, which
+/// removes the `IndexMap`/`HashMap` traffic that dominated CPU tile gathering.
+/// Output is interleaved `R,G,B,A` in Bottom-Left row-major order and matches
+/// [`rgba_at`] pixel for pixel.
+fn gather_rgba_tile(raster: &Raster2D, tile: TileCoord) -> Vec<f32> {
+    let planes: [Option<&ChannelPlane>; 4] = [
+        raster.channel(&Channel::RgbaRed),
+        raster.channel(&Channel::RgbaGreen),
+        raster.channel(&Channel::RgbaBlue),
+        raster.channel(&Channel::RgbaAlpha),
+    ];
+    let stride = TILE_SIZE as usize;
+    let mut out = vec![0.0f32; TILE_PIXELS * 4];
+
+    for_each_resolved_span(
+        raster.bbox,
+        raster.edge_mode,
+        tile,
+        |col, row, run, source_tile, lx, ly| {
+            let base = (row * stride + col) * 4;
+            for (index, plane) in planes.iter().enumerate() {
+                let Some(buffer) = plane.and_then(|plane| plane.get(&source_tile)) else {
+                    continue;
+                };
+                match buffer.is_uniform() {
+                    Some(value) => {
+                        for k in 0..run {
+                            out[base + k * 4 + index] = value;
+                        }
+                    }
+                    None => {
+                        let src = buffer.as_dense_slice().expect("dense tile slice");
+                        let src_off = ly * stride + lx;
+                        for k in 0..run {
+                            out[base + k * 4 + index] = src[src_off + k];
+                        }
+                    }
+                }
+            }
+        },
+    );
+
+    out
+}
+
+/// Gathers one tile of mask values, matching [`mask_value`] exactly.
+///
+/// A missing mask is fully opaque (`1.0`). Pixels outside the mask's `bbox` are
+/// always `0.0`, while pixels inside read the alpha plane when present, then
+/// the red plane, then fall back to `1.0`.
+fn gather_mask_tile(mask: Option<&Raster2D>, tile: TileCoord) -> Vec<f32> {
+    let Some(mask) = mask else {
+        return vec![1.0f32; TILE_PIXELS];
+    };
+    let plane = mask
+        .channel(&Channel::RgbaAlpha)
+        .or_else(|| mask.channel(&Channel::RgbaRed));
+    let stride = TILE_SIZE as usize;
+    let mut out = vec![0.0f32; TILE_PIXELS];
+    let (origin_x, origin_y) = tile.origin_world();
+
+    let x_start = origin_x.max(mask.bbox.min_x);
+    let x_end = (origin_x + TILE_SIZE as i32).min(mask.bbox.max_x);
+    let y_start = origin_y.max(mask.bbox.min_y);
+    let y_end = (origin_y + TILE_SIZE as i32).min(mask.bbox.max_y);
+    if x_start >= x_end || y_start >= y_end {
+        return out;
+    }
+
+    let col_start = (x_start - origin_x) as usize;
+    let col_end = (x_end - origin_x) as usize;
+
+    for y in y_start..y_end {
+        let row = (y - origin_y) as usize;
+        let row_offset = row * stride;
+        let mut col = col_start;
+        while col < col_end {
+            let Some(plane) = plane else {
+                out[row_offset + col..row_offset + col_end].fill(1.0);
+                break;
+            };
+            let x = origin_x + col as i32;
+            let (source_tile, lx, ly) = world_to_tile(x, y);
+            let mut run = 1usize;
+            while col + run < col_end && lx as usize + run < stride {
+                run += 1;
+            }
+            if let Some(buffer) = plane.get(&source_tile) {
+                let base = row_offset + col;
+                match buffer.is_uniform() {
+                    Some(value) => out[base..base + run].fill(value),
+                    None => {
+                        let src = buffer.as_dense_slice().expect("dense tile slice");
+                        let src_off = ly as usize * stride + lx as usize;
+                        out[base..base + run].copy_from_slice(&src[src_off..src_off + run]);
+                    }
+                }
+            }
+            col += run;
+        }
+    }
+
+    out
+}
+
 fn gather_grade_inputs(
     input: &Raster2D,
     mask: Option<&Raster2D>,
     tile: TileCoord,
 ) -> (Vec<f32>, Vec<f32>) {
-    let (origin_x, origin_y) = tile.origin_world();
-    let mut pixels = Vec::with_capacity(TILE_PIXELS * 4);
-    let mut masks = Vec::with_capacity(TILE_PIXELS);
-
-    for ly in 0..TILE_SIZE {
-        let y = origin_y + ly as i32;
-        for lx in 0..TILE_SIZE {
-            let x = origin_x + lx as i32;
-            pixels.extend_from_slice(&rgba_at(input, x, y));
-            masks.push(mask_value(mask, x, y));
-        }
-    }
-
-    (pixels, masks)
+    (gather_rgba_tile(input, tile), gather_mask_tile(mask, tile))
 }
 
 /// One `Merge2` evaluation request.
@@ -620,9 +856,16 @@ pub fn merge_raster(
     let mut blue = ChannelPlane::new();
     let mut alpha = ChannelPlane::new();
 
-    for tile in output_bbox.tile_coords() {
-        let region = tile.to_bbox().intersection(&output_bbox);
+    let tiles: Vec<TileCoord> = output_bbox.tile_coords();
+    let use_parallel = gpu.is_none() && tiles.len() >= 2 && worker_thread_count() > 1;
 
+    enum MergeTileResult {
+        Uniform([f32; 4]),
+        Dense(Vec<f32>),
+    }
+
+    let compute_merge_tile = |tile: TileCoord| -> Result<(TileCoord, MergeTileResult), NodeError> {
+        let region = tile.to_bbox().intersection(&output_bbox);
         let uniform = uniform_rgba(background, tile, region)
             .zip(uniform_rgba(foreground, tile, region))
             .zip(uniform_mask_value(mask, tile, region))
@@ -636,11 +879,10 @@ pub fn merge_raster(
                 mask_value,
                 mix,
             );
-            insert_uniform(&mut red, tile, pixel[0]);
-            insert_uniform(&mut green, tile, pixel[1]);
-            insert_uniform(&mut blue, tile, pixel[2]);
-            insert_uniform(&mut alpha, tile, pixel[3]);
-            continue;
+            return Ok((
+                tile,
+                MergeTileResult::Uniform([pixel[0], pixel[1], pixel[2], pixel[3]]),
+            ));
         }
 
         let (background_pixels, foreground_pixels, mask_values) =
@@ -667,13 +909,37 @@ pub fn merge_raster(
                 })
                 .collect(),
         };
+        Ok((tile, MergeTileResult::Dense(output_pixels)))
+    };
 
-        insert_dense(
-            [&mut red, &mut green, &mut blue, &mut alpha],
-            tile,
-            &output_pixels,
-            governor,
-        )?;
+    let tile_results: Result<Vec<(TileCoord, MergeTileResult)>, NodeError> = if use_parallel {
+        parallel_map_ordered(&tiles, |tile| compute_merge_tile(*tile))
+    } else {
+        let mut results = Vec::with_capacity(tiles.len());
+        for tile in tiles {
+            results.push(compute_merge_tile(tile)?);
+        }
+        Ok(results)
+    };
+    let tile_results = tile_results?;
+
+    for (tile, result) in tile_results {
+        match result {
+            MergeTileResult::Uniform(pixel) => {
+                insert_uniform(&mut red, tile, pixel[0]);
+                insert_uniform(&mut green, tile, pixel[1]);
+                insert_uniform(&mut blue, tile, pixel[2]);
+                insert_uniform(&mut alpha, tile, pixel[3]);
+            }
+            MergeTileResult::Dense(output_pixels) => {
+                insert_dense(
+                    [&mut red, &mut green, &mut blue, &mut alpha],
+                    tile,
+                    &output_pixels,
+                    governor,
+                )?;
+            }
+        }
     }
 
     output.insert_channel(Channel::RgbaRed, red);
@@ -858,7 +1124,10 @@ pub fn perspective_warp_raster(
     let mut blue = ChannelPlane::new();
     let mut alpha = ChannelPlane::new();
 
-    for tile in output_bbox.tile_coords() {
+    let tiles: Vec<TileCoord> = output_bbox.tile_coords();
+    let use_parallel = tiles.len() >= 2 && worker_thread_count() > 1;
+
+    let compute_warp_tile = |tile: TileCoord| -> Result<(TileCoord, Vec<[f32; 4]>), NodeError> {
         let mut pixels = Vec::with_capacity(TILE_PIXELS);
         let (origin_x, origin_y) = tile.origin_world();
         for ly in 0..TILE_SIZE {
@@ -883,7 +1152,21 @@ pub fn perspective_warp_raster(
                 pixels.push(rgba);
             }
         }
+        Ok((tile, pixels))
+    };
 
+    let tile_pixel_results = if use_parallel {
+        parallel_map_ordered(&tiles, |tile| compute_warp_tile(*tile))
+    } else {
+        let mut results = Vec::with_capacity(tiles.len());
+        for tile in tiles {
+            results.push(compute_warp_tile(tile)?);
+        }
+        Ok(results)
+    };
+    let tile_pixel_results = tile_pixel_results?;
+
+    for (tile, pixels) in tile_pixel_results {
         let mut firsts = [0.0f32; 4];
         let mut uniform = [true; 4];
         for channel in 0..4 {
@@ -923,22 +1206,11 @@ fn gather_merge_inputs(
     mask: Option<&Raster2D>,
     tile: TileCoord,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let (origin_x, origin_y) = tile.origin_world();
-    let mut background_pixels = Vec::with_capacity(TILE_PIXELS * 4);
-    let mut foreground_pixels = Vec::with_capacity(TILE_PIXELS * 4);
-    let mut mask_values = Vec::with_capacity(TILE_PIXELS);
-
-    for ly in 0..TILE_SIZE {
-        let y = origin_y + ly as i32;
-        for lx in 0..TILE_SIZE {
-            let x = origin_x + lx as i32;
-            background_pixels.extend_from_slice(&rgba_at(background, x, y));
-            foreground_pixels.extend_from_slice(&rgba_at(foreground, x, y));
-            mask_values.push(mask_value(mask, x, y));
-        }
-    }
-
-    (background_pixels, foreground_pixels, mask_values)
+    (
+        gather_rgba_tile(background, tile),
+        gather_rgba_tile(foreground, tile),
+        gather_mask_tile(mask, tile),
+    )
 }
 
 fn insert_uniform(plane: &mut ChannelPlane, tile: TileCoord, value: f32) {
@@ -1146,217 +1418,272 @@ pub fn defocus_raster(
     }
     let inv_weight_sum = 1.0 / weight_sum;
 
-    for tile in output_bbox.tile_coords() {
-        let tile_bbox = tile.to_bbox();
-        let padded_region = BBox::new(
-            tile_bbox.min_x.saturating_sub(r_x),
-            tile_bbox.min_y.saturating_sub(r_y),
-            tile_bbox.max_x.saturating_add(r_x),
-            tile_bbox.max_y.saturating_add(r_y),
-        );
+    enum DefocusTileResult {
+        Uniform([f32; 4]),
+        Dense(Vec<f32>),
+    }
 
-        // Uniform fast path: when the whole padded region (and the mask)
-        // collapses to one value, the convolved tile is that same value and
-        // costs the governor nothing.
-        let channels = [
-            Channel::RgbaRed,
-            Channel::RgbaGreen,
-            Channel::RgbaBlue,
-            Channel::RgbaAlpha,
-        ];
-        let mut channel_values: [Option<f32>; 4] = [None; 4];
-        let mut all_uniform = true;
-        for (channel, channel_id) in channels.iter().enumerate() {
-            match region_uniform_value(input, channel_id, padded_region) {
-                Some(value) => channel_values[channel] = Some(value),
-                None => {
-                    all_uniform = false;
-                    break;
+    let compute_defocus_tile =
+        |tile: TileCoord| -> Result<(TileCoord, DefocusTileResult), NodeError> {
+            let tile_bbox = tile.to_bbox();
+            let padded_region = BBox::new(
+                tile_bbox.min_x.saturating_sub(r_x),
+                tile_bbox.min_y.saturating_sub(r_y),
+                tile_bbox.max_x.saturating_add(r_x),
+                tile_bbox.max_y.saturating_add(r_y),
+            );
+
+            // Uniform fast path: when the whole padded region (and the mask)
+            // collapses to one value, the convolved tile is that same value.
+            let channels = [
+                Channel::RgbaRed,
+                Channel::RgbaGreen,
+                Channel::RgbaBlue,
+                Channel::RgbaAlpha,
+            ];
+            let mut channel_values: [Option<f32>; 4] = [None; 4];
+            let mut all_uniform = true;
+            for (channel, channel_id) in channels.iter().enumerate() {
+                match region_uniform_value(input, channel_id, padded_region) {
+                    Some(value) => channel_values[channel] = Some(value),
+                    None => {
+                        all_uniform = false;
+                        break;
+                    }
                 }
             }
-        }
 
-        if all_uniform {
-            if let Some(mask_value) = region_mask_uniform(mask, padded_region) {
-                let _ = (op.mix * mask_value).clamp(0.0, 1.0);
-                // A uniform region convolves to itself, and blending a value
-                // with itself leaves it unchanged.
-                let mut planes = [&mut red, &mut green, &mut blue, &mut alpha];
-                for (channel, plane) in planes.iter_mut().enumerate() {
-                    insert_uniform(plane, tile, channel_values[channel].unwrap());
+            if all_uniform {
+                if let Some(mask_value) = region_mask_uniform(mask, padded_region) {
+                    let _ = (op.mix * mask_value).clamp(0.0, 1.0);
+                    // A uniform region convolves to itself; blending with itself is a no-op.
+                    let rgba = [
+                        channel_values[0].unwrap(),
+                        channel_values[1].unwrap(),
+                        channel_values[2].unwrap(),
+                        channel_values[3].unwrap(),
+                    ];
+                    return Ok((tile, DefocusTileResult::Uniform(rgba)));
                 }
-                continue;
             }
-        }
 
-        // Dense path: extract padded tiles per channel, then convolve using
-        // precomputed flat offsets. Skip the Alpha convolution entirely when
-        // the padded Alpha tile is uniform — emit a uniform tile instead.
-        let red_padded = extract_padded_tile(
-            input.channel(&Channel::RgbaRed).unwrap_or(&empty_plane),
-            tile,
-            apron as u32,
-            input.bbox,
-            input.edge_mode,
-        );
-        let green_padded = extract_padded_tile(
-            input.channel(&Channel::RgbaGreen).unwrap_or(&empty_plane),
-            tile,
-            apron as u32,
-            input.bbox,
-            input.edge_mode,
-        );
-        let blue_padded = extract_padded_tile(
-            input.channel(&Channel::RgbaBlue).unwrap_or(&empty_plane),
-            tile,
-            apron as u32,
-            input.bbox,
-            input.edge_mode,
-        );
-
-        // Alpha uniform value for this tile's padded region, if any.
-        let alpha_uniform = region_uniform_value(input, &Channel::RgbaAlpha, padded_region);
-
-        // Pre-extract the alpha padded tile once per tile (never per pixel)
-        // when the alpha channel is not uniform. This avoids an O(TILE_PIXELS)
-        // allocation inside the inner loop that would hang the kernel.
-        let alpha_padded = if alpha_uniform.is_none() {
-            Some(extract_padded_tile(
-                input.channel(&Channel::RgbaAlpha).unwrap_or(&empty_plane),
+            // Dense path.
+            let red_padded = extract_padded_tile(
+                input.channel(&Channel::RgbaRed).unwrap_or(&empty_plane),
                 tile,
                 apron as u32,
                 input.bbox,
                 input.edge_mode,
-            ))
-        } else {
-            None
-        };
+            );
+            let green_padded = extract_padded_tile(
+                input.channel(&Channel::RgbaGreen).unwrap_or(&empty_plane),
+                tile,
+                apron as u32,
+                input.bbox,
+                input.edge_mode,
+            );
+            let blue_padded = extract_padded_tile(
+                input.channel(&Channel::RgbaBlue).unwrap_or(&empty_plane),
+                tile,
+                apron as u32,
+                input.bbox,
+                input.edge_mode,
+            );
 
-        // Build f64 prefix sums per row for each RGB channel.
-        // prefix[py * prefix_stride + x] = sum of channel[py * pw + 0..x].
-        // The padded tile is stride x stride.
-        let pw = stride;
-        let ph = stride;
-        let prefix_stride = pw + 1;
+            let alpha_uniform = region_uniform_value(input, &Channel::RgbaAlpha, padded_region);
 
-        let mut red_prefixes = vec![0.0f64; ph * prefix_stride];
-        let mut green_prefixes = vec![0.0f64; ph * prefix_stride];
-        let mut blue_prefixes = vec![0.0f64; ph * prefix_stride];
-        for py in 0..ph {
-            let row_offset = py * prefix_stride;
-            let data_offset = py * pw;
-            let mut acc_r = 0.0f64;
-            let mut acc_g = 0.0f64;
-            let mut acc_b = 0.0f64;
-            for x in 0..pw {
-                acc_r += red_padded[data_offset + x] as f64;
-                acc_g += green_padded[data_offset + x] as f64;
-                acc_b += blue_padded[data_offset + x] as f64;
-                red_prefixes[row_offset + x + 1] = acc_r;
-                green_prefixes[row_offset + x + 1] = acc_g;
-                blue_prefixes[row_offset + x + 1] = acc_b;
+            let alpha_padded = if alpha_uniform.is_none() {
+                Some(extract_padded_tile(
+                    input.channel(&Channel::RgbaAlpha).unwrap_or(&empty_plane),
+                    tile,
+                    apron as u32,
+                    input.bbox,
+                    input.edge_mode,
+                ))
+            } else {
+                None
+            };
+
+            // Only pixels inside `output_bbox` are reachable downstream, so
+            // clip the convolution to this tile's active intersection. On a
+            // 256x256 frame the eight border tiles only own a 4px strip, and
+            // this skips the other 99% of their 256x256 work.
+            let active = tile_bbox.intersection(&output_bbox);
+            if active.is_empty() {
+                return Ok((
+                    tile,
+                    DefocusTileResult::Dense(vec![0.0f32; TILE_PIXELS * 4]),
+                ));
             }
-        }
+            let lx_start = (active.min_x - tile_bbox.min_x) as usize;
+            let lx_end = (active.max_x - tile_bbox.min_x) as usize;
+            let ly_start = (active.min_y - tile_bbox.min_y) as usize;
+            let ly_end = (active.max_y - tile_bbox.min_y) as usize;
 
-        // Build prefix sums for Alpha only when not uniform.
-        let alpha_prefixes = alpha_padded.as_ref().map(|_| {
-            let mut prefixes = vec![0.0f64; ph * prefix_stride];
-            for py in 0..ph {
-                let row_offset = py * prefix_stride;
+            let pw = stride;
+            let ph = stride;
+            let prefix_stride = pw + 1;
+
+            // Prefix rows the active band needs: `cy = ly + apron` plus the
+            // kernel's `dy` range. Building only these rows is exact because
+            // each row's prefix still accumulates from x = 0, so every
+            // subtraction is bit-for-bit identical to the unclipped pass.
+            let py_start = (ly_start + apron).saturating_sub(r_y as usize).min(ph);
+            let py_end = (ly_end.saturating_sub(1) + apron + r_y as usize + 1).min(ph);
+            let py_end = py_end.max(py_start);
+            let prefix_rows = py_end - py_start;
+
+            let mut red_prefixes = vec![0.0f64; prefix_rows * prefix_stride];
+            let mut green_prefixes = vec![0.0f64; prefix_rows * prefix_stride];
+            let mut blue_prefixes = vec![0.0f64; prefix_rows * prefix_stride];
+            for py in py_start..py_end {
+                let row_offset = (py - py_start) * prefix_stride;
                 let data_offset = py * pw;
-                let mut acc = 0.0f64;
-                for x in 0..pw {
-                    acc += alpha_padded.as_ref().unwrap()[data_offset + x] as f64;
-                    prefixes[row_offset + x + 1] = acc;
-                }
-            }
-            prefixes
-        });
-
-        let mut out = Vec::with_capacity(TILE_PIXELS * 4);
-        let (origin_x, origin_y) = tile.origin_world();
-        for ly in 0..TILE_SIZE {
-            for lx in 0..TILE_SIZE {
-                let ly = ly as usize;
-                let lx = lx as usize;
-                let base = (ly + apron) * stride + lx + apron;
-                let cx = (lx + apron) as isize;
-                let cy = (ly + apron) as isize;
-
                 let mut acc_r = 0.0f64;
                 let mut acc_g = 0.0f64;
                 let mut acc_b = 0.0f64;
+                for x in 0..pw {
+                    acc_r += red_padded[data_offset + x] as f64;
+                    acc_g += green_padded[data_offset + x] as f64;
+                    acc_b += blue_padded[data_offset + x] as f64;
+                    red_prefixes[row_offset + x + 1] = acc_r;
+                    green_prefixes[row_offset + x + 1] = acc_g;
+                    blue_prefixes[row_offset + x + 1] = acc_b;
+                }
+            }
 
-                for span in &spans {
-                    let py = (cy + span.dy) as usize;
-                    let row_offset = py * prefix_stride;
-
-                    if let Some((dx0, dx1)) = span.inner {
-                        let x0 = (cx + dx0) as usize;
-                        let x1 = (cx + dx1 + 1) as usize;
-                        acc_r += red_prefixes[row_offset + x1] - red_prefixes[row_offset + x0];
-                        acc_g += green_prefixes[row_offset + x1] - green_prefixes[row_offset + x0];
-                        acc_b += blue_prefixes[row_offset + x1] - blue_prefixes[row_offset + x0];
-                    }
-                    for &(dx, w) in &span.edges {
-                        let x = (cx + dx) as usize;
-                        let idx = py * pw + x;
-                        acc_r += red_padded[idx] as f64 * w;
-                        acc_g += green_padded[idx] as f64 * w;
-                        acc_b += blue_padded[idx] as f64 * w;
+            let alpha_prefixes = alpha_padded.as_ref().map(|_| {
+                let mut prefixes = vec![0.0f64; prefix_rows * prefix_stride];
+                for py in py_start..py_end {
+                    let row_offset = (py - py_start) * prefix_stride;
+                    let data_offset = py * pw;
+                    let mut acc = 0.0f64;
+                    for x in 0..pw {
+                        acc += alpha_padded.as_ref().unwrap()[data_offset + x] as f64;
+                        prefixes[row_offset + x + 1] = acc;
                     }
                 }
+                prefixes
+            });
 
-                let orig_r = red_padded[base] as f64;
-                let orig_g = green_padded[base] as f64;
-                let orig_b = blue_padded[base] as f64;
+            let (origin_x, origin_y) = tile.origin_world();
+            let mut out = vec![0.0f32; TILE_PIXELS * 4];
+            for ly in ly_start..ly_end {
+                for lx in lx_start..lx_end {
+                    let base = (ly + apron) * stride + lx + apron;
+                    let cx = (lx + apron) as isize;
+                    let cy = (ly + apron) as isize;
 
-                let world_x = origin_x + lx as i32;
-                let world_y = origin_y + ly as i32;
-                let effective_mix = (op.mix * mask_value(mask, world_x, world_y)).clamp(0.0, 1.0);
+                    let mut acc_r = 0.0f64;
+                    let mut acc_g = 0.0f64;
+                    let mut acc_b = 0.0f64;
 
-                // Alpha: skip convolution when the padded Alpha tile is uniform,
-                // emitting the uniform value directly.
-                let effective_mix_f64 = effective_mix as f64;
-                let alpha_val = match alpha_uniform {
-                    Some(a) => a as f64,
-                    None => {
-                        let ap = alpha_padded.as_ref().unwrap();
-                        let apfx = alpha_prefixes.as_ref().unwrap();
-                        let mut alpha_acc = 0.0f64;
-                        for span in &spans {
-                            let py = (cy + span.dy) as usize;
-                            let row_offset = py * prefix_stride;
+                    for span in &spans {
+                        let py = (cy + span.dy) as usize;
+                        let row_offset = (py - py_start) * prefix_stride;
 
-                            if let Some((dx0, dx1)) = span.inner {
-                                let x0 = (cx + dx0) as usize;
-                                let x1 = (cx + dx1 + 1) as usize;
-                                alpha_acc += apfx[row_offset + x1] - apfx[row_offset + x0];
-                            }
-                            for &(dx, w) in &span.edges {
-                                let x = (cx + dx) as usize;
-                                let idx = py * pw + x;
-                                alpha_acc += ap[idx] as f64 * w;
-                            }
+                        if let Some((dx0, dx1)) = span.inner {
+                            let x0 = (cx + dx0) as usize;
+                            let x1 = (cx + dx1 + 1) as usize;
+                            acc_r += red_prefixes[row_offset + x1] - red_prefixes[row_offset + x0];
+                            acc_g +=
+                                green_prefixes[row_offset + x1] - green_prefixes[row_offset + x0];
+                            acc_b +=
+                                blue_prefixes[row_offset + x1] - blue_prefixes[row_offset + x0];
                         }
-                        let orig_a = ap[base] as f64;
-                        orig_a + (alpha_acc * inv_weight_sum - orig_a) * effective_mix_f64
+                        for &(dx, w) in &span.edges {
+                            let x = (cx + dx) as usize;
+                            let idx = py * pw + x;
+                            acc_r += red_padded[idx] as f64 * w;
+                            acc_g += green_padded[idx] as f64 * w;
+                            acc_b += blue_padded[idx] as f64 * w;
+                        }
                     }
-                };
 
-                out.push((orig_r + (acc_r * inv_weight_sum - orig_r) * effective_mix_f64) as f32);
-                out.push((orig_g + (acc_g * inv_weight_sum - orig_g) * effective_mix_f64) as f32);
-                out.push((orig_b + (acc_b * inv_weight_sum - orig_b) * effective_mix_f64) as f32);
-                out.push(alpha_val as f32);
+                    let orig_r = red_padded[base] as f64;
+                    let orig_g = green_padded[base] as f64;
+                    let orig_b = blue_padded[base] as f64;
+
+                    let world_x = origin_x + lx as i32;
+                    let world_y = origin_y + ly as i32;
+                    let effective_mix =
+                        (op.mix * mask_value(mask, world_x, world_y)).clamp(0.0, 1.0);
+
+                    let effective_mix_f64 = effective_mix as f64;
+                    let alpha_val = match alpha_uniform {
+                        Some(a) => a as f64,
+                        None => {
+                            let ap = alpha_padded.as_ref().unwrap();
+                            let apfx = alpha_prefixes.as_ref().unwrap();
+                            let mut alpha_acc = 0.0f64;
+                            for span in &spans {
+                                let py = (cy + span.dy) as usize;
+                                let row_offset = (py - py_start) * prefix_stride;
+
+                                if let Some((dx0, dx1)) = span.inner {
+                                    let x0 = (cx + dx0) as usize;
+                                    let x1 = (cx + dx1 + 1) as usize;
+                                    alpha_acc += apfx[row_offset + x1] - apfx[row_offset + x0];
+                                }
+                                for &(dx, w) in &span.edges {
+                                    let x = (cx + dx) as usize;
+                                    let idx = py * pw + x;
+                                    alpha_acc += ap[idx] as f64 * w;
+                                }
+                            }
+                            let orig_a = ap[base] as f64;
+                            orig_a + (alpha_acc * inv_weight_sum - orig_a) * effective_mix_f64
+                        }
+                    };
+
+                    let pixel = (ly * TILE_SIZE as usize + lx) * 4;
+                    out[pixel] =
+                        (orig_r + (acc_r * inv_weight_sum - orig_r) * effective_mix_f64) as f32;
+                    out[pixel + 1] =
+                        (orig_g + (acc_g * inv_weight_sum - orig_g) * effective_mix_f64) as f32;
+                    out[pixel + 2] =
+                        (orig_b + (acc_b * inv_weight_sum - orig_b) * effective_mix_f64) as f32;
+                    out[pixel + 3] = alpha_val as f32;
+                }
+            }
+
+            Ok((tile, DefocusTileResult::Dense(out)))
+        };
+
+    let tiles: Vec<TileCoord> = output_bbox.tile_coords();
+    let use_parallel_tiles = tiles.len() >= 2 && worker_thread_count() > 1;
+
+    // Parallelize across tiles when there are enough tiles and worker
+    // threads. Single-tile / single-worker falls back to sequential.
+    let tile_results: Result<Vec<(TileCoord, DefocusTileResult)>, NodeError> = if use_parallel_tiles
+    {
+        parallel_map_ordered(&tiles, |tile| compute_defocus_tile(*tile))
+    } else {
+        let mut results = Vec::with_capacity(tiles.len());
+        for tile in tiles {
+            results.push(compute_defocus_tile(tile)?);
+        }
+        Ok(results)
+    };
+    let tile_results = tile_results?;
+
+    for (tile, result) in tile_results {
+        match result {
+            DefocusTileResult::Uniform(pixel) => {
+                insert_uniform(&mut red, tile, pixel[0]);
+                insert_uniform(&mut green, tile, pixel[1]);
+                insert_uniform(&mut blue, tile, pixel[2]);
+                insert_uniform(&mut alpha, tile, pixel[3]);
+            }
+            DefocusTileResult::Dense(out) => {
+                insert_dense(
+                    [&mut red, &mut green, &mut blue, &mut alpha],
+                    tile,
+                    &out,
+                    governor,
+                )?;
             }
         }
-
-        insert_dense(
-            [&mut red, &mut green, &mut blue, &mut alpha],
-            tile,
-            &out,
-            governor,
-        )?;
     }
 
     output.insert_channel(Channel::RgbaRed, red);
@@ -1924,6 +2251,189 @@ mod tests {
             assert!(
                 max_diff < 1e-5,
                 "prefix-sum defocus (radius={radius}, aspect={aspect}) differs from naive by {max_diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_ops_match_sequential_pixels_on_multi_tile_frame() {
+        use crate::Format;
+        // 512x512 = 4 tiles (2x2), non-uniform so every tile takes the dense path.
+        let width = 512;
+        let height = 512;
+        let format = Format::new("test", width as u32, height as u32, 1.0);
+        let bbox = format.to_bbox();
+        let mut input = Raster2D::for_format(format.clone());
+        for y in 0..height {
+            for x in 0..width {
+                let v = ((x as f32) / width as f32 * 2.0 - 1.0).clamp(0.0, 1.0);
+                input.set_pixel(Channel::RgbaRed, x, y, v, None).unwrap();
+                input
+                    .set_pixel(Channel::RgbaGreen, x, y, v * 0.5, None)
+                    .unwrap();
+                input
+                    .set_pixel(Channel::RgbaBlue, x, y, 1.0 - v, None)
+                    .unwrap();
+                input
+                    .set_pixel(Channel::RgbaAlpha, x, y, 1.0, None)
+                    .unwrap();
+            }
+        }
+
+        let governor = MemoryGovernor::new(2 * 1024 * 1024 * 1024);
+
+        // --- Defocus: parallel output is deterministic and releases permits ---
+        let op = DefocusOp {
+            radius: 8.0,
+            aspect: 1.0,
+            mix: 1.0,
+        };
+        let parallel = defocus_raster(&input, None, &op, Some(&governor)).expect("defocus");
+        let parallel2 = defocus_raster(&input, None, &op, Some(&governor)).expect("defocus 2");
+        assert_eq!(parallel.format, format);
+        // Determinism: two parallel runs produce identical pixels.
+        for y in 0..height {
+            for x in 0..width {
+                assert_eq!(
+                    parallel.sample_rgba(x, y),
+                    parallel2.sample_rgba(x, y),
+                    "defocus must be deterministic across runs at ({x}, {y})"
+                );
+            }
+        }
+        drop(parallel);
+        drop(parallel2);
+        assert_eq!(
+            governor.allocated_bytes(),
+            0,
+            "defocus permits must be released"
+        );
+
+        // --- Grade: parallel CPU path, permit cleanup ---
+        let grade_op = GradeOp::default();
+        let graded = grade_raster(&input, None, &grade_op, Some(&governor), None).expect("grade");
+        assert_eq!(graded.format, format);
+        assert!(
+            !graded.channels.is_empty(),
+            "grade must produce RGBA channels"
+        );
+        drop(graded);
+        assert_eq!(
+            governor.allocated_bytes(),
+            0,
+            "grade permits must be released"
+        );
+
+        // --- Merge: parallel CPU path (self-over) ---
+        let merge_req = MergeRequest {
+            background: &input,
+            foreground: &input,
+            mask: None,
+            operation: MergeOp::Over,
+            output_bbox: bbox,
+            mix: 1.0,
+        };
+        let merged = merge_raster(merge_req, Some(&governor), None).expect("merge");
+        assert_eq!(merged.format, format);
+        drop(merged);
+        assert_eq!(
+            governor.allocated_bytes(),
+            0,
+            "merge permits must be released"
+        );
+
+        // --- Perspective warp: parallel tiles ---
+        let forward = Mat3x3::identity();
+        let warped =
+            perspective_warp_raster(&input, &forward, bbox, Some(&governor)).expect("warp");
+        assert_eq!(warped.format, format);
+        drop(warped);
+        assert_eq!(
+            governor.allocated_bytes(),
+            0,
+            "warp permits must be released"
+        );
+    }
+
+    /// The direct-slice tile gatherers must match `rgba_at`/`mask_value`
+    /// pixel-for-pixel, including partial 1080p edge tiles and a mask whose
+    /// bbox is smaller than the frame.
+    #[test]
+    fn gather_inputs_match_reference_sampling_on_partial_and_masked_tiles() {
+        use crate::{BBox, Channel, ChannelPlane, EdgeMode, Format, TileBuffer, TileCoord};
+
+        let format = Format::hd_1080();
+        let bbox = format.to_bbox();
+
+        let coords = [(0, 0), (3, 2), (6, 3), (7, 3), (7, 4), (8, 4), (-1, -1)];
+        let filled_plane = |seed: i32| {
+            let mut plane = ChannelPlane::new();
+            for &(tx, ty) in &coords {
+                let mut data = vec![0.0f32; TILE_PIXELS];
+                for (index, value) in data.iter_mut().enumerate() {
+                    *value = ((tx * 97 + ty * 53 + seed * 29 + index as i32).rem_euclid(211))
+                        as f32
+                        / 211.0;
+                }
+                plane.insert(
+                    TileCoord::new(tx, ty),
+                    Arc::new(TileBuffer::from_vec(data, None).unwrap()),
+                );
+            }
+            plane
+        };
+
+        let mut input = Raster2D::new(format.clone(), bbox, EdgeMode::ClampToEdge);
+        input.insert_channel(Channel::RgbaRed, filled_plane(1));
+        input.insert_channel(Channel::RgbaGreen, filled_plane(2));
+        input.insert_channel(Channel::RgbaBlue, filled_plane(3));
+        input.insert_channel(Channel::RgbaAlpha, filled_plane(4));
+
+        let mut mask = Raster2D::new(
+            format.clone(),
+            BBox::new(100, 100, 1800, 1000),
+            EdgeMode::ClampToEdge,
+        );
+        mask.insert_channel(Channel::RgbaAlpha, filled_plane(5));
+
+        for &(tx, ty) in &coords {
+            let tile = TileCoord::new(tx, ty);
+            let (origin_x, origin_y) = tile.origin_world();
+
+            let mut reference_pixels = Vec::with_capacity(TILE_PIXELS * 4);
+            let mut reference_masks = Vec::with_capacity(TILE_PIXELS);
+            for ly in 0..TILE_SIZE {
+                for lx in 0..TILE_SIZE {
+                    let x = origin_x + lx as i32;
+                    let y = origin_y + ly as i32;
+                    reference_pixels.extend_from_slice(&rgba_at(&input, x, y));
+                    reference_masks.push(mask_value(Some(&mask), x, y));
+                }
+            }
+
+            let (grade_pixels, grade_masks) = gather_grade_inputs(&input, Some(&mask), tile);
+            assert_eq!(
+                grade_pixels, reference_pixels,
+                "grade gather mismatch at ({tx}, {ty})"
+            );
+            assert_eq!(
+                grade_masks, reference_masks,
+                "grade mask mismatch at ({tx}, {ty})"
+            );
+
+            let (background, foreground, merge_masks) =
+                gather_merge_inputs(&input, &input, Some(&mask), tile);
+            assert_eq!(
+                background, reference_pixels,
+                "merge background mismatch at ({tx}, {ty})"
+            );
+            assert_eq!(
+                foreground, reference_pixels,
+                "merge foreground mismatch at ({tx}, {ty})"
+            );
+            assert_eq!(
+                merge_masks, reference_masks,
+                "merge mask mismatch at ({tx}, {ty})"
             );
         }
     }

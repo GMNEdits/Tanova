@@ -15,7 +15,8 @@ use eframe::egui;
 use tanova_io::DiskCache;
 use tanova_kernel::{
     Dag, Edge, EvalContext, FrameNotification, KernelEvent, KernelHandle, KernelMessage, KnobValue,
-    NodeId, Packet, PortId, ProjectFormat, UndoableCommand, find_cartridge,
+    MemoryGovernor, NodeId, Packet, PortId, ProjectFormat, UndoableCommand, find_cartridge,
+    recommended_gui_memory_cap_bytes,
 };
 use tanova_parse::load_nk_into_dag;
 use tanova_render::{GpuComputeEngine, Raster2D};
@@ -233,7 +234,10 @@ fn run_desktop() -> Result<(), AppError> {
         options,
         Box::new(|cc| {
             let gpu = gpu_from_render_state(cc)?;
-            let kernel = KernelHandle::spawn().map_err(kernel_error)?;
+            let kernel = KernelHandle::spawn_with_governor(MemoryGovernor::new(
+                recommended_gui_memory_cap_bytes(),
+            ))
+            .map_err(kernel_error)?;
             let mut app = TanovaApp::new(kernel, gpu);
             app.recovery_dir = TanovaApp::default_recovery_dir();
             app.check_for_recovery_snapshot();
@@ -427,6 +431,10 @@ struct TanovaApp {
     /// True when there are unsaved changes since the last auto-save.
     /// Prevents repeated auto-saves of the same state.
     pub autosave_dirty: bool,
+    /// Bytes currently reserved by live `MemoryPermit`s (from `MemoryStats`).
+    pub allocated_bytes: usize,
+    /// The governor's configured cap (from `MemoryStats`).
+    pub max_bytes: usize,
     /// Path of the pending recovery snapshot, removed on clean exit.
     pub recovery_snapshot_path: Option<PathBuf>,
     /// Snapshot awaiting a crash-restore decision, if any.
@@ -469,6 +477,8 @@ impl TanovaApp {
             last_user_action: None,
             last_auto_save: None,
             autosave_dirty: false,
+            allocated_bytes: 0,
+            max_bytes: 0,
             recovery_snapshot_path: None,
             pending_recovery: None,
         };
@@ -489,7 +499,13 @@ impl TanovaApp {
         ));
         // One shared loader for every Read cartridge; the worker wakes the
         // kernel with TriggerRender when a frame becomes available.
-        context.insert(DiskCache::new(self.kernel.sender()));
+        let disk_cache = DiskCache::new(self.kernel.sender());
+        context.insert(disk_cache.clone());
+        // Let the kernel purge the disk cache on `PurgeCache` without knowing
+        // about tanova-io (ExternalCachePurger is an injected closure).
+        context.insert(tanova_kernel::ExternalCachePurger(std::sync::Arc::new(
+            move || disk_cache.clear(),
+        )));
         // Project format: all source cartridges (Constant, Read, ...) produce
         // rasters at this resolution so downstream Transform/Merge2 stay
         // aligned with the viewer frame.
@@ -650,6 +666,17 @@ impl TanovaApp {
                 } else {
                     self.last_render_status = Some(format!("Rendered {frames_written} frame(s)"));
                 }
+            }
+            KernelEvent::MemoryStats {
+                allocated_bytes,
+                max_bytes,
+            } => {
+                self.allocated_bytes = *allocated_bytes;
+                self.max_bytes = *max_bytes;
+            }
+            KernelEvent::PerfSnapshot(_samples) => {
+                // Per-node timings live on GraphMirror; the canvas applies them
+                // via GraphMirror::apply_event. Kept here for symmetry.
             }
             // The kernel owns the viewer binding: it may clear it when the
             // target is deleted, or bind it when it creates a physical Viewer.
@@ -1268,6 +1295,29 @@ impl TanovaApp {
                     let message =
                         spawn_node_message(&self.graph, &mut self.canvas, kind, world_pos);
                     self.dispatch(vec![message]);
+                }
+                ui.separator();
+                // Compact pure-ASCII RAM meter + [Purge] button (right side of top bar).
+                let alloc_mb = self.allocated_bytes as f64 / (1024.0 * 1024.0);
+                let max_mb = self.max_bytes as f64 / (1024.0 * 1024.0);
+                let pct = if self.max_bytes > 0 {
+                    (self.allocated_bytes as f64 / self.max_bytes as f64 * 100.0) as u32
+                } else {
+                    0
+                };
+                let ram_response = ui.label(format!(
+                    "RAM {:.0}/{:.0}M ({}%)",
+                    alloc_mb, max_mb, pct
+                ));
+                ram_response.on_hover_text(format!(
+                    "MemoryGovernor: {:.1} MiB / {:.1} MiB allocated ({}%)\nManaged by MemoryGovernor",
+                    alloc_mb, max_mb, pct
+                ));
+                if ui.button("Purge").clicked() {
+                    let _ = self.kernel.send(KernelMessage::PurgeCache);
+                    // Every cached packet is gone, so no node can honestly
+                    // claim a cached timing until the next render reports one.
+                    self.graph.node_perf.clear();
                 }
             });
         });
@@ -7110,6 +7160,50 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&recovery_dir);
+        app.kernel.shutdown();
+    }
+
+    /// Fresh boot must already show timing bars for the starter comp, before
+    /// the artist spawns or edits anything.
+    #[test]
+    fn startup_seed_graph_populates_node_perf_for_starter_nodes() {
+        tanova_nodes::ensure_linked();
+
+        let (_gpu_lock, gpu) = test_gpu();
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            app.pump();
+            let all_present = [CONSTANT, GRADE, VIEWER]
+                .iter()
+                .all(|id| app.graph.node_perf.contains_key(id));
+            if all_present {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Let any follow-up render snapshots land, then re-check: a later
+        // snapshot must never wipe a branch it did not evaluate.
+        let settle = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < settle {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        for (id, label) in [
+            (CONSTANT, "Constant #1"),
+            (GRADE, "Grade #2"),
+            (VIEWER, "Viewer #3"),
+        ] {
+            assert!(
+                app.graph.node_perf.contains_key(&id),
+                "{label} must show a startup timing bar before any user edit"
+            );
+        }
+
         app.kernel.shutdown();
     }
 }

@@ -165,6 +165,16 @@ impl TileBuffer {
             TileStorage::Uniform(_) => None,
         }
     }
+
+    /// Read-only dense pixel data, if the tile is not collapsed.
+    ///
+    /// The slice is `TILE_SIZE * TILE_SIZE` values in Bottom-Left row-major
+    /// order. Callers that walk a whole tile use this to avoid a `HashMap`
+    /// lookup per pixel; uniform tiles keep returning `None` so they can be
+    /// filled without allocating.
+    pub fn as_dense_slice(&self) -> Option<&[f32]> {
+        self.dense_slice()
+    }
 }
 
 fn local_index(lx: u32, ly: u32) -> usize {
@@ -571,14 +581,89 @@ pub fn extract_padded_tile(
     let start_x = origin_x.saturating_sub(apron as i32);
     let start_y = origin_y.saturating_sub(apron as i32);
 
-    let mut out = Vec::with_capacity(stride * stride);
-    for row in 0..stride {
-        let y = start_y.saturating_add(row as i32);
-        for col in 0..stride {
-            let x = start_x.saturating_add(col as i32);
-            out.push(plane.sample(x, y, bbox, edge_mode));
+    // Pre-zeroed output: `BlackOutside` pixels outside `bbox` are simply never
+    // written, so they keep the required `0.0` without any extra work.
+    let mut out = vec![0.0f32; stride * stride];
+
+    // Resolve every output column/row through `edge_mode` exactly once. Edge
+    // resolution is separable per axis, so resolving x with an in-bounds y (and
+    // vice versa) reproduces `ChannelPlane::sample` bit-for-bit while avoiding
+    // a `HashMap` lookup per pixel.
+    let inside_x = bbox.min_x <= start_x && start_x.saturating_add(stride as i32) <= bbox.max_x;
+    let inside_y = bbox.min_y <= start_y && start_y.saturating_add(stride as i32) <= bbox.max_y;
+
+    let xs: Vec<Option<i32>> = if inside_x {
+        (0..stride)
+            .map(|col| Some(start_x.saturating_add(col as i32)))
+            .collect()
+    } else {
+        (0..stride)
+            .map(|col| {
+                let x = start_x.saturating_add(col as i32);
+                edge_mode
+                    .resolve_coord(x, bbox.min_y, bbox)
+                    .map(|(resolved, _)| resolved)
+            })
+            .collect()
+    };
+    let ys: Vec<Option<i32>> = if inside_y {
+        (0..stride)
+            .map(|row| Some(start_y.saturating_add(row as i32)))
+            .collect()
+    } else {
+        (0..stride)
+            .map(|row| {
+                let y = start_y.saturating_add(row as i32);
+                edge_mode
+                    .resolve_coord(bbox.min_x, y, bbox)
+                    .map(|(_, resolved)| resolved)
+            })
+            .collect()
+    };
+
+    for (row, resolved_y) in ys.iter().enumerate() {
+        let Some(resolved_y) = *resolved_y else {
+            continue;
+        };
+        let out_row = row * stride;
+        let mut col = 0;
+        while col < stride {
+            let Some(resolved_x) = xs[col] else {
+                col += 1;
+                continue;
+            };
+
+            let (start_tile, lx, ly) = world_to_tile(resolved_x, resolved_y);
+            // Extend the run while the next column stays inside the same tile
+            // and resolves to the next contiguous world x. This copies one
+            // straight span per tile crossing instead of one pixel at a time.
+            let mut run = 1usize;
+            while col + run < stride && lx as usize + run < TILE_STRIDE {
+                match xs[col + run] {
+                    Some(next_x) if next_x == resolved_x.saturating_add(run as i32) => run += 1,
+                    _ => break,
+                }
+            }
+
+            if let Some(buffer) = plane.get(&start_tile) {
+                let dst = &mut out[out_row + col..out_row + col + run];
+                match buffer.is_uniform() {
+                    Some(value) => dst.fill(value),
+                    None => {
+                        let src = buffer
+                            .as_dense_slice()
+                            .expect("dense tile must expose its slice");
+                        let src_off = ly as usize * TILE_STRIDE + lx as usize;
+                        dst.copy_from_slice(&src[src_off..src_off + run]);
+                    }
+                }
+            }
+            // Absent tile: leave the pre-zeroed span untouched.
+
+            col += run;
         }
     }
+
     out
 }
 
@@ -894,5 +979,100 @@ mod tests {
             ViewerChannel::Alpha,
         );
         assert_eq!(&alpha[0..4], &[128, 128, 128, 255]);
+    }
+
+    /// Reference implementation of the original per-pixel sampling loop.
+    fn naive_extract_padded_tile(
+        plane: &ChannelPlane,
+        tile: TileCoord,
+        apron: u32,
+        bbox: BBox,
+        edge_mode: EdgeMode,
+    ) -> Vec<f32> {
+        let apron = apron as usize;
+        let stride = TILE_STRIDE + 2 * apron;
+        let (origin_x, origin_y) = tile.origin_world();
+        let start_x = origin_x.saturating_sub(apron as i32);
+        let start_y = origin_y.saturating_sub(apron as i32);
+
+        let mut out = Vec::with_capacity(stride * stride);
+        for row in 0..stride {
+            let y = start_y.saturating_add(row as i32);
+            for col in 0..stride {
+                let x = start_x.saturating_add(col as i32);
+                out.push(plane.sample(x, y, bbox, edge_mode));
+            }
+        }
+        out
+    }
+
+    /// The direct-slice apron extractor must be bit-identical to the historical
+    /// per-pixel `sample` loop on interior, negative, and partial 1080p edges,
+    /// for every edge mode.
+    #[test]
+    fn fast_extract_padded_tile_matches_reference_across_partial_1080p_and_negative_edges() {
+        let format = Format::hd_1080();
+        let bbox = format.to_bbox();
+
+        // Mixed uniform/dense tiles covering the frame plus a ring outside it.
+        let mut plane = ChannelPlane::new();
+        for ty in -1..=4i32 {
+            for tx in -1..=7i32 {
+                if (tx + ty).rem_euclid(3) == 0 {
+                    let value = (tx * 3 + ty) as f32 * 0.25;
+                    plane.insert(tile_at(tx, ty), Arc::new(TileBuffer::new_uniform(value)));
+                } else {
+                    let mut data = vec![0.0f32; TILE_PIXELS];
+                    for (index, value) in data.iter_mut().enumerate() {
+                        *value =
+                            ((tx * 131 + ty * 71 + index as i32).rem_euclid(251)) as f32 / 251.0;
+                    }
+                    plane.insert(
+                        tile_at(tx, ty),
+                        Arc::new(TileBuffer::from_vec(data, None).unwrap()),
+                    );
+                }
+            }
+        }
+
+        // Interior, negative, right edge (partial), top edge (partial), corner.
+        let cases = [(3, 2), (-1, 0), (7, 4), (0, 4), (-1, -1), (7, 0), (0, -1)];
+        let modes = [
+            EdgeMode::BlackOutside,
+            EdgeMode::ClampToEdge,
+            EdgeMode::Mirror,
+            EdgeMode::Bounce,
+        ];
+
+        for &(tx, ty) in &cases {
+            for apron in [0u32, 4, 12] {
+                for edge_mode in modes {
+                    let fast = extract_padded_tile(&plane, tile_at(tx, ty), apron, bbox, edge_mode);
+                    let naive =
+                        naive_extract_padded_tile(&plane, tile_at(tx, ty), apron, bbox, edge_mode);
+                    assert_eq!(
+                        fast.len(),
+                        naive.len(),
+                        "length mismatch at ({tx}, {ty}) apron {apron}"
+                    );
+                    for (index, (fast_value, naive_value)) in
+                        fast.iter().zip(naive.iter()).enumerate()
+                    {
+                        assert_eq!(
+                            fast_value, naive_value,
+                            "tile ({tx}, {ty}) apron {apron} {edge_mode:?} at index {index}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // An empty bbox must resolve every sample to 0.0 in both paths.
+        let empty = BBox::new(10, 10, 10, 10);
+        for edge_mode in modes {
+            let fast = extract_padded_tile(&plane, tile_at(3, 2), 4, empty, edge_mode);
+            let naive = naive_extract_padded_tile(&plane, tile_at(3, 2), 4, empty, edge_mode);
+            assert_eq!(fast, naive, "empty bbox mismatch under {edge_mode:?}");
+        }
     }
 }

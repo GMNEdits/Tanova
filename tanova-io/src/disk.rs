@@ -188,6 +188,14 @@ impl DiskCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Clears the cache: drops every cached `Arc<Raster2D>` (releasing their
+    /// `MemoryPermit`s cleanly) and empties the path history.
+    pub fn clear(&self) {
+        let mut state = lock_state(&self.state);
+        state.map.clear();
+        state.history.clear();
+    }
 }
 
 fn lock_state(state: &Mutex<DiskCacheState>) -> MutexGuard<'_, DiskCacheState> {
