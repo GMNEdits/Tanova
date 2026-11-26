@@ -73,7 +73,7 @@ impl NodeTrait for DefocusNode {
         }
 
         let op = DefocusOp {
-            radius: defocus,
+            radius: defocus.min(24.0) * ctx.proxy_scale(),
             aspect,
             mix,
         };

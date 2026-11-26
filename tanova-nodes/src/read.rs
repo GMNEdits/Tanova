@@ -11,8 +11,9 @@ use std::sync::Arc;
 use tanova_io::{CacheStatus, DiskCache, load_exr, resolve_sequence_path};
 use tanova_kernel::{
     EvalContext, KnobTable, KnobValue, NodeCartridgeDescriptor, NodeError, NodeTrait, Packet,
+    RenderForExport,
 };
-use tanova_render::{Channel, ChannelPlane, Format, Raster2D, TileBuffer};
+use tanova_render::{Channel, ChannelPlane, Format, Raster2D, TileBuffer, downsample_raster};
 
 use crate::util::{int_knob, text_knob};
 
@@ -93,31 +94,41 @@ impl NodeTrait for ReadNode {
         let time = ctx.time().unwrap_or(first as f64);
         let path = resolve_frame_path(&file, time, first, last, &missing);
         let governor = ctx.governor().cloned();
+        let scale = ctx.proxy_scale();
+        let read_frame = |raster: &Raster2D| {
+            Ok(packet_from_raster(downsample_raster(
+                raster,
+                scale,
+                ctx.governor(),
+            )?))
+        };
 
-        let Some(cache) = ctx.get::<DiskCache>() else {
-            // Headless/CLI fallback: there is no worker to wake, so load
-            // synchronously and report failures through the missing policy.
+        let cache = ctx.get::<DiskCache>();
+        if let Some(CacheStatus::Ready(raster)) = cache.map(|cache| cache.status(&path)) {
+            return read_frame(&raster);
+        }
+
+        let Some(cache) = cache.filter(|_| !ctx.contains::<RenderForExport>()) else {
+            // Headless renders have no worker to wake. Exports may use a ready
+            // entry, but on a miss they must load the real pixels, not gray.
             return match load_exr(&path, governor.as_ref()) {
-                Ok(raster) => Ok(packet_from_raster(raster)),
-                Err(_) => missing_packet(&missing),
+                Ok(raster) => read_frame(&raster),
+                Err(e @ NodeError::MemoryExceeded { .. }) => Err(e),
+                Err(_) => missing_packet(&missing, scale),
             };
         };
 
-        if let CacheStatus::Ready(raster) = cache.status(&path) {
-            return Ok(packet_from_raster((*raster).clone()));
-        }
-
         if !Path::new(&path).exists() {
-            return missing_packet(&missing);
+            return missing_packet(&missing, scale);
         }
 
         let _ = cache.get_or_load(path.clone(), governor);
 
         match cache.status(&path) {
-            CacheStatus::Ready(raster) => Ok(packet_from_raster((*raster).clone())),
-            CacheStatus::Failed => missing_packet(&missing),
+            CacheStatus::Ready(raster) => read_frame(&raster),
+            CacheStatus::Failed => missing_packet(&missing, scale),
             CacheStatus::Loading | CacheStatus::Missing => Ok(packet_from_raster(uniform_raster(
-                Format::hd_1080(),
+                Format::hd_1080().scaled(scale),
                 LOADING_GRAY,
             ))),
         }
@@ -160,10 +171,10 @@ fn resolve_frame_path(file: &str, time: f64, first: i64, last: i64, missing: &st
     resolve_sequence_path(file, clamped as f64)
 }
 
-fn missing_packet(missing: &str) -> Result<Packet, NodeError> {
+fn missing_packet(missing: &str, scale: f32) -> Result<Packet, NodeError> {
     if missing == "black" {
         Ok(packet_from_raster(uniform_raster(
-            Format::hd_1080(),
+            Format::hd_1080().scaled(scale),
             MISSING_BLACK,
         )))
     } else {
@@ -348,6 +359,52 @@ mod tests {
             .expect("ready cache entry should evaluate");
         let raster = packet.get::<Raster2D>().expect("raster");
         assert_eq!(raster.sample_rgba(0, 0), [0.25, 0.5, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn proxy_read_resamples_without_replacing_the_full_resolution_disk_cache() {
+        let (kernel_tx, _kernel_rx) = unbounded();
+        let cache = DiskCache::with_loader(kernel_tx, |_path, _governor| {
+            Ok(uniform_raster(
+                Format::new("odd", 65, 35, 1.0),
+                [0.25, 0.5, 0.75, 1.0],
+            ))
+        });
+        let path = "/virtual/proxy-ready.exr";
+        let _ = cache.get_or_load(path.to_string(), None);
+        assert!(wait_until(|| matches!(
+            cache.status(path),
+            CacheStatus::Ready(_)
+        )));
+        let mut ctx = context(read_knobs(path, 1, 1, "error"), 1.0);
+        ctx.insert(cache.clone());
+        ctx.insert(tanova_kernel::ProxyScale(0.25));
+        let packet = ReadNode::new().evaluate(&ctx, &[]).unwrap();
+        let raster = packet.get::<Raster2D>().unwrap();
+        assert_eq!((raster.format.width, raster.format.height), (16, 9));
+        assert_eq!(raster.format.logical_size(0.25), (65, 35));
+        assert_eq!(raster.sample_rgba(15, 8), [0.25, 0.5, 0.75, 1.0]);
+        let CacheStatus::Ready(full) = cache.status(path) else {
+            panic!("proxy pull must not change the disk cache entry");
+        };
+        assert_eq!((full.format.width, full.format.height), (65, 35));
+    }
+
+    #[test]
+    fn uncached_export_read_loads_the_plate_instead_of_returning_loading_gray() {
+        let dir = temp_dir("export-read");
+        let path = dir.join("source.exr");
+        write_rgba_file(&path, 5, 3, |_, _| (0.25f32, 0.75f32, 0.0f32, 1.0f32)).unwrap();
+        let (kernel_tx, _kernel_rx) = unbounded();
+        let mut ctx = context(read_knobs(path.to_str().unwrap(), 1, 1, "error"), 1.0);
+        ctx.insert(DiskCache::new(kernel_tx));
+        ctx.insert(RenderForExport);
+        let result = ReadNode::new().evaluate(&ctx, &[]);
+        std::fs::remove_dir_all(dir).unwrap();
+        let packet = result.unwrap();
+        let raster = packet.get::<Raster2D>().unwrap();
+        assert_eq!((raster.format.width, raster.format.height), (5, 3));
+        assert_eq!(raster.sample_rgba(0, 0), [0.25, 0.75, 0.0, 1.0]);
     }
 
     #[test]

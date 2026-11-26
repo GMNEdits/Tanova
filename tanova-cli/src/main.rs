@@ -6,11 +6,15 @@
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use tanova_io::{resolve_sequence_path, write_exr_to_path};
-use tanova_kernel::{Dag, EvalContext, KnobValue, MemoryGovernor, NodeId, RenderEpoch, Time, View};
+use tanova_kernel::{
+    Dag, DagNode, Edge, EvalContext, KnobValue, MemoryGovernor, NodeError, NodeId, PortId,
+    ProxyScale, RenderEpoch, Time, View, find_cartridge,
+};
 use tanova_parse::{ParsedScript, load_nk_into_dag};
-use tanova_render::Raster2D;
+use tanova_render::{DisplayTransform, Raster2D, ViewerChannel};
 
 type CliError = Box<dyn Error + Send + Sync>;
 
@@ -74,6 +78,9 @@ fn run() -> Result<(), CliError> {
     if args.check_headless {
         return run_headless_check();
     }
+    if args.bench_1080p {
+        return run_bench_1080p();
+    }
 
     let script_path = args
         .script
@@ -108,6 +115,7 @@ struct Args {
     out_ppm: Option<PathBuf>,
     out_exr: Option<PathBuf>,
     check_headless: bool,
+    bench_1080p: bool,
 }
 
 impl Args {
@@ -119,6 +127,7 @@ impl Args {
             out_ppm: None,
             out_exr: None,
             check_headless: false,
+            bench_1080p: false,
         };
 
         let mut iter = std::env::args().skip(1);
@@ -144,6 +153,7 @@ impl Args {
                     args.out_exr = Some(iter.next().ok_or("--out-exr needs a path")?.into());
                 }
                 "--check-headless" => args.check_headless = true,
+                "--bench-1080p" => args.bench_1080p = true,
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -291,5 +301,207 @@ fn run_headless_check() -> Result<(), CliError> {
         shake_node.class
     );
     println!("check-headless: OK");
+    Ok(())
+}
+
+/// Times a checkerboard pull and its display conversion separately.
+fn bench_checker_source(width: u32, height: u32) -> Result<[BenchRow; 2], CliError> {
+    let mut dag = Dag::new();
+    let ctx = EvalContext::new();
+    let governor = MemoryGovernor::new(2 * 1024 * 1024 * 1024); // 2.0 GiB cap
+    let epoch = RenderEpoch::new();
+
+    let checker = NodeId(1);
+    let viewer = NodeId(2);
+
+    dag.insert_node(
+        DagNode::new(checker, "CheckerBoard2").with_implementation((find_cartridge(
+            "CheckerBoard2",
+        )
+        .ok_or("CheckerBoard2 cartridge not registered")?
+        .factory)()),
+    )?;
+    dag.set_knob(checker, "format_width", KnobValue::Int(width as i64))?;
+    dag.set_knob(checker, "format_height", KnobValue::Int(height as i64))?;
+    dag.set_knob(checker, "boxsize", KnobValue::Int(64))?;
+
+    dag.insert_node(
+        tanova_kernel::DagNode::new(viewer, "Viewer").with_implementation((find_cartridge(
+            "Viewer",
+        )
+        .ok_or("Viewer cartridge not registered")?
+        .factory)()),
+    )?;
+    dag.connect_edge(Edge::new(checker, PortId(0), viewer, PortId(0)))?;
+
+    let start = Instant::now();
+    let packet = dag.evaluate_pull(viewer, &ctx, &governor, &epoch, epoch.current())?;
+    let elapsed_us = start.elapsed().as_micros() as u64;
+    let held_bytes = governor.allocated_bytes();
+    let raster = packet
+        .get::<Raster2D>()
+        .ok_or("checkerboard produced no raster")?;
+    let start = Instant::now();
+    let display = raster.to_top_left_rgba8_with_view(
+        raster.format.to_bbox(),
+        1.0,
+        1.0,
+        DisplayTransform::Srgb,
+        ViewerChannel::Rgba,
+    );
+    let display_us = start.elapsed().as_micros() as u64;
+    if std::hint::black_box(&display).len() != width as usize * height as usize * 4 {
+        return Err("unexpected RGBA8 output size".into());
+    }
+    Ok([
+        ("CheckerBoard2", (elapsed_us, held_bytes)),
+        ("Display RGBA8 (1920x1080)", (display_us, held_bytes)),
+    ])
+}
+
+/// Builds `CheckerBoard2 -> op -> Viewer` at `width x height`, evaluates the
+/// source once to warm the DAG cache, then times the downstream pull so the
+/// reported `ms` measures the op itself rather than source generation.
+fn bench_op(
+    op_kind: &str,
+    width: u32,
+    height: u32,
+    scale: f32,
+    set_knobs: impl FnOnce(&mut Dag, NodeId) -> Result<(), NodeError>,
+) -> Result<(u64, usize), CliError> {
+    let mut dag = Dag::new();
+    let mut ctx = EvalContext::new();
+    ctx.insert(ProxyScale(scale));
+    let governor = MemoryGovernor::new(2 * 1024 * 1024 * 1024); // 2.0 GiB cap
+    let epoch = RenderEpoch::new();
+
+    let checker = NodeId(1);
+    let op = NodeId(2);
+    let viewer = NodeId(3);
+
+    dag.insert_node(
+        DagNode::new(checker, "CheckerBoard2").with_implementation((find_cartridge(
+            "CheckerBoard2",
+        )
+        .ok_or("CheckerBoard2 cartridge not registered")?
+        .factory)()),
+    )?;
+    dag.set_knob(checker, "format_width", KnobValue::Int(width as i64))?;
+    dag.set_knob(checker, "format_height", KnobValue::Int(height as i64))?;
+    dag.set_knob(checker, "boxsize", KnobValue::Int(64))?;
+
+    dag.insert_node(
+        tanova_kernel::DagNode::new(op, op_kind).with_implementation((find_cartridge(op_kind)
+            .ok_or(format!("{op_kind} cartridge not registered"))?
+            .factory)()),
+    )?;
+    set_knobs(&mut dag, op)?;
+
+    dag.insert_node(
+        tanova_kernel::DagNode::new(viewer, "Viewer").with_implementation((find_cartridge(
+            "Viewer",
+        )
+        .ok_or("Viewer cartridge not registered")?
+        .factory)()),
+    )?;
+    dag.connect_edge(Edge::new(checker, PortId(0), op, PortId(0)))?;
+    dag.connect_edge(Edge::new(op, PortId(0), viewer, PortId(0)))?;
+
+    // Warm the source so the timed pull is the op, not checker generation.
+    let _ = dag.evaluate_pull(checker, &ctx, &governor, &epoch, epoch.current())?;
+    let start = Instant::now();
+    let packet = dag.evaluate_pull(viewer, &ctx, &governor, &epoch, epoch.current())?;
+    let elapsed_us = start.elapsed().as_micros() as u64;
+    let raster = packet
+        .get::<Raster2D>()
+        .ok_or("benchmark produced no raster")?;
+    let expected = (
+        ProxyScale::scale_dim(width, scale),
+        ProxyScale::scale_dim(height, scale),
+    );
+    if (raster.format.width, raster.format.height) != expected {
+        return Err(format!(
+            "{op_kind}: expected benchmark output {expected:?}, got {}x{}",
+            raster.format.width, raster.format.height
+        )
+        .into());
+    }
+    Ok((elapsed_us, governor.allocated_bytes()))
+}
+
+type BenchRow = (&'static str, (u64, usize));
+
+fn bench_hd_ops(scale: f32) -> Result<[BenchRow; 5], CliError> {
+    let grade = bench_op("Grade", 1920, 1080, scale, |dag, op| {
+        dag.set_knob(op, "multiply", KnobValue::Color([1.2; 4]))
+    })?;
+    let blur = bench_op("Blur", 1920, 1080, scale, |dag, op| {
+        dag.set_knob(op, "size", KnobValue::Float(12.0))
+    })?;
+    let defocus = bench_op("Defocus", 1920, 1080, scale, |dag, op| {
+        dag.set_knob(op, "defocus", KnobValue::Float(8.0))?;
+        dag.set_knob(op, "aspect", KnobValue::Float(1.0))?;
+        dag.set_knob(op, "mix", KnobValue::Float(1.0))
+    })?;
+    let corner_pin = bench_op("CornerPin2D", 1920, 1080, scale, |dag, op| {
+        dag.set_knob(op, "to1", KnobValue::Color([0.0, 0.0, 0.0, 0.0]))?;
+        dag.set_knob(op, "to2", KnobValue::Color([1920.0, 0.0, 0.0, 0.0]))?;
+        dag.set_knob(op, "to3", KnobValue::Color([1800.0, 1080.0, 0.0, 0.0]))?;
+        dag.set_knob(op, "to4", KnobValue::Color([120.0, 1080.0, 0.0, 0.0]))?;
+        dag.set_knob(op, "invert", KnobValue::Bool(false))
+    })?;
+    let glow = bench_op("Glow", 1920, 1080, scale, |dag, op| {
+        dag.set_knob(op, "size", KnobValue::Float(12.0))?;
+        dag.set_knob(op, "tolerance", KnobValue::Float(0.2))?;
+        dag.set_knob(op, "mix", KnobValue::Float(1.0))
+    })?;
+    Ok([
+        ("Grade", grade),
+        ("Blur (size=12)", blur),
+        ("Defocus (8.0)", defocus),
+        ("CornerPin2D", corner_pin),
+        ("Glow (size=12)", glow),
+    ])
+}
+
+/// Runs full and half-resolution CPU pulls with identical logical knobs.
+fn run_bench_1080p() -> Result<(), CliError> {
+    let workers = tanova_render::pool::worker_thread_count();
+    println!("tanova-cli --bench-1080p ({workers} workers, 2.0 GiB governor cap)");
+    println!("Op rows time one pull with a warm CheckerBoard2 source, excluding display.");
+    println!();
+
+    println!("1920x1080 @ 1:1");
+    println!("{:<24} {:>8} {:>10}", "OP", "ms", "held MiB");
+    for row in bench_checker_source(1920, 1080)? {
+        print_bench_row(row)?;
+    }
+    for row in bench_hd_ops(1.0)? {
+        print_bench_row(row)?;
+    }
+
+    let defocus_256 = bench_op("Defocus", 256, 256, 1.0, |dag, op| {
+        dag.set_knob(op, "defocus", KnobValue::Float(4.0))?;
+        dag.set_knob(op, "aspect", KnobValue::Float(1.0))?;
+        dag.set_knob(op, "mix", KnobValue::Float(1.0))
+    })?;
+    print_bench_row(("Defocus 256 (4.0)", defocus_256))?;
+
+    println!("\n1920x1080 @ 1:2 Proxy (960x540)");
+    println!("{:<24} {:>8} {:>10}", "OP", "ms", "held MiB");
+    for row in bench_hd_ops(0.5)? {
+        print_bench_row(row)?;
+    }
+    println!("\nbench-1080p: all ops within 2.0 GiB governor cap - OK");
+    Ok(())
+}
+
+fn print_bench_row((name, (us, bytes)): BenchRow) -> Result<(), CliError> {
+    let ms = us as f64 / 1000.0;
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    println!("{name:<24} {ms:8.2} {mib:10.2}");
+    if mib > 2048.0 {
+        return Err("bench-1080p: an op exceeded the 2.0 GiB governor cap".into());
+    }
     Ok(())
 }

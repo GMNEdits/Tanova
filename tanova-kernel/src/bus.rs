@@ -4,18 +4,22 @@
 //! one channel and receives [`KernelEvent`]s over another, so the microkernel
 //! can live on its own thread while the UI stays stateless.
 
+use std::io::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 
 use crate::command::EdgeSnapshot;
-use crate::dag::Dag;
+use crate::dag::{Dag, TANOVA_SCHEMA_VERSION};
 use crate::governor::{MemoryGovernor, RenderEpoch};
 use crate::knobs::{KnobTable, KnobValue};
 use crate::registry::find_cartridge;
-use crate::types::{AnimationCurve, EvalContext, NodeError, Packet, Time};
+use crate::types::{
+    AnimationCurve, EvalContext, NodeError, Packet, ProxyScale, RenderForExport, Time,
+};
 
 /// Identifies a node instance in the graph.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -36,6 +40,82 @@ pub type FrameExporterFn = std::sync::Arc<
 /// (which requires `Clone + Send + Sync`).
 #[derive(Clone)]
 pub struct FrameExporter(pub FrameExporterFn);
+
+/// Monotonic counter keeping temp-file names unique within one process.
+static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Writes `contents` to `path` atomically, using only the standard library.
+///
+/// The bytes go to a unique hidden temp file **in the same directory** as the
+/// destination, are flushed and `fsync`ed, and only then renamed over `path`.
+/// Same-directory placement matters: renaming across filesystems fails with
+/// `EXDEV` on Linux, which would break a `/tmp`-based temp file for a project
+/// stored on another mount.
+///
+/// If any step fails the temp file is removed best-effort, so no orphaned
+/// `.tanova-tmp-*` files are left behind and the previous `path` contents
+/// survive untouched.
+pub fn atomic_write_string(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tanova-project");
+    let counter = ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(".{file_name}.tanova-tmp-{}-{counter}", std::process::id());
+    let tmp_path = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => std::path::PathBuf::from(tmp_name),
+    };
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        // Drop the handle before renaming: Windows refuses to rename an open
+        // file, and closing first is correct everywhere.
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+/// Inserts `# tanova_recovery_source <path>` right after the schema line.
+///
+/// The path is flattened to a single line (`\r`/`\n` stripped) so a hostile or
+/// accidental newline can never inject extra TCL commands into the snapshot.
+fn tcl_with_recovery_source(tcl: &str, source: &std::path::Path) -> String {
+    let sanitized: String = source
+        .to_string_lossy()
+        .chars()
+        .filter(|character| *character != '\r' && *character != '\n')
+        .collect();
+    let marker = format!("# tanova_schema {TANOVA_SCHEMA_VERSION}\n");
+    match tcl.find(&marker) {
+        Some(position) => {
+            let insert_at = position + marker.len();
+            let mut out = String::with_capacity(tcl.len() + sanitized.len() + 32);
+            out.push_str(&tcl[..insert_at]);
+            out.push_str(&format!("# tanova_recovery_source {sanitized}\n"));
+            out.push_str(&tcl[insert_at..]);
+            out
+        }
+        None => format!("# tanova_recovery_source {sanitized}\n{tcl}"),
+    }
+}
 
 /// A state change the UI asks the kernel to perform.
 ///
@@ -175,6 +255,25 @@ pub enum UndoableCommand {
 }
 
 impl UndoableCommand {
+    /// Whether this command only changes canvas positions, not pixels.
+    pub fn is_layout_only(&self) -> bool {
+        match self {
+            Self::MoveNode { .. } => true,
+            Self::Batch(commands) => {
+                !commands.is_empty() && commands.iter().all(Self::is_layout_only)
+            }
+            _ => false,
+        }
+    }
+
+    fn contains_curve_edit(&self) -> bool {
+        match self {
+            Self::SetKnobCurve { .. } => true,
+            Self::Batch(commands) => commands.iter().any(Self::contains_curve_edit),
+            _ => false,
+        }
+    }
+
     /// Builds a [`Batch`] from a vector of commands, collapsing a single
     /// command back to itself and returning `None` for an empty vector.
     pub fn from_vec(cmds: Vec<UndoableCommand>) -> Option<UndoableCommand> {
@@ -308,6 +407,13 @@ impl UndoableCommand {
     }
 }
 
+/// Injected by `tanova-app` so the kernel can purge an external cache
+/// (e.g. `DiskCache` in `tanova-io`) without `tanova-kernel` knowing about
+/// `tanova-io`. The closure is `Arc<dyn Fn() + Send + Sync>` so it can be
+/// called from the kernel thread.
+#[derive(Clone)]
+pub struct ExternalCachePurger(pub std::sync::Arc<dyn Fn() + Send + Sync>);
+
 /// Work sent from the UI thread to the kernel thread.
 #[derive(Debug)]
 pub enum KernelMessage {
@@ -351,11 +457,29 @@ pub enum KernelMessage {
     },
     /// Persist the current DAG to a `.nk` file.
     SaveScript { path: std::path::PathBuf },
+    /// Write a crash-recovery snapshot atomically.
+    ///
+    /// Never touches the undo stack, the dirty flag, or the viewer: an
+    /// auto-save is a background safety net, not a user save. When
+    /// `source_path` is set it is recorded as `# tanova_recovery_source` so a
+    /// restored session re-binds to the real project, not the snapshot.
+    WriteAutoSave {
+        /// Snapshot destination (typically `<recovery>/autosave.tnv`).
+        path: std::path::PathBuf,
+        /// Original project path, when the project has been saved before.
+        source_path: Option<std::path::PathBuf>,
+    },
     /// Render a `Write` node's frame sequence to disk via the registered
     /// `FrameExporter`. Does not mark the project dirty.
     ExecuteWriteNode { node: NodeId },
     /// Ask the kernel thread to exit.
     Shutdown,
+    /// Purge the DAG cache and any injected external cache (e.g. disk cache),
+    /// then report memory stats. Does not touch the viewer frame or dirty flag.
+    PurgeCache,
+    /// Change the viewer proxy scale (`1.0` = 1:1, `0.5` = 1:2, `0.25` = 1:4).
+    /// Coalesced with consecutive `SetProxyScale` messages like `SetTime`.
+    SetProxyScale(f32),
 }
 
 /// Notifications sent from the kernel thread back to the UI.
@@ -414,6 +538,29 @@ pub enum KernelEvent {
         /// Path of the last written frame, if any.
         last_path: Option<std::path::PathBuf>,
     },
+    /// Memory usage reported after renders, NewScript, ReplaceDag,
+    /// ExecuteWriteNode, and PurgeCache so the UI meter stays accurate.
+    MemoryStats {
+        /// Bytes currently reserved by live `MemoryPermit`s.
+        allocated_bytes: usize,
+        /// The governor's configured cap.
+        max_bytes: usize,
+    },
+    /// Per-node evaluation timing samples from the last completed frame.
+    PerfSnapshot(Vec<NodePerfSample>),
+}
+
+/// One per-node evaluation timing sample from a single `evaluate_pull`
+/// traversal. `from_cache` is `true` when the node was served from the
+/// DAG cache (no cartridge ran).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodePerfSample {
+    /// The node that was evaluated (or served from cache).
+    pub node: NodeId,
+    /// Evaluation time in microseconds (floored at 1).
+    pub eval_us: u64,
+    /// `true` when the result came from the DAG cache.
+    pub from_cache: bool,
 }
 
 /// Metadata for a rendered frame delivered off-screen to the UI.
@@ -431,6 +578,8 @@ pub struct FrameNotification {
     pub node: Option<NodeId>,
     /// Render epoch that produced the frame.
     pub epoch: u64,
+    /// Proxy scale the kernel rendered the pixels at (`1.0` = full resolution).
+    pub proxy_scale: f32,
     /// The evaluated packet, ready for the UI to inspect.
     pub packet: Arc<Packet>,
 }
@@ -441,6 +590,7 @@ impl FrameNotification {
         Self {
             node: Some(node),
             epoch,
+            proxy_scale: 1.0,
             packet,
         }
     }
@@ -450,6 +600,7 @@ impl FrameNotification {
         Self {
             node,
             epoch,
+            proxy_scale: 1.0,
             packet: Arc::new(Packet::new()),
         }
     }
@@ -957,6 +1108,15 @@ fn coalesce_batch(batch: Vec<KernelMessage>) -> Vec<KernelMessage> {
                 *last_frame = *frame;
                 true
             }
+            // Only the latest proxy scale matters; collapse consecutive
+            // `SetProxyScale`s so a burst of proxy toggles evaluates once.
+            (
+                KernelMessage::SetProxyScale(scale),
+                Some(KernelMessage::SetProxyScale(last_scale)),
+            ) => {
+                *last_scale = *scale;
+                true
+            }
             (
                 KernelMessage::Execute(UndoableCommand::SetKnob {
                     node,
@@ -1152,11 +1312,19 @@ fn kernel_loop(
                     let _ = frames.send(notification);
                     consecutive_preemptions = 0;
                     render_time = render_start.elapsed();
+                    let _ = events.send(KernelEvent::MemoryStats {
+                        allocated_bytes: governor.allocated_bytes(),
+                        max_bytes: governor.max_bytes(),
+                    });
                     break;
                 }
                 RenderOutcome::Unchanged => {
                     consecutive_preemptions = 0;
                     render_time = render_start.elapsed();
+                    let _ = events.send(KernelEvent::MemoryStats {
+                        allocated_bytes: governor.allocated_bytes(),
+                        max_bytes: governor.max_bytes(),
+                    });
                     break;
                 }
                 RenderOutcome::Preempted => {
@@ -1242,25 +1410,7 @@ fn apply_kernel_message(
 ) {
     match message {
         KernelMessage::Execute(command) => {
-            match &command {
-                UndoableCommand::SetKnob { node, .. }
-                | UndoableCommand::SetDisabled { node, .. }
-                | UndoableCommand::SetKnobCurve { node, .. } => {
-                    dag.invalidate_downstream(*node);
-                }
-                UndoableCommand::Batch(cmds) => {
-                    for cmd in cmds {
-                        if let UndoableCommand::SetKnob { node, .. }
-                        | UndoableCommand::SetDisabled { node, .. }
-                        | UndoableCommand::SetKnobCurve { node, .. } = cmd
-                        {
-                            dag.invalidate_downstream(*node);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            if apply_and_record(dag, undo, events, command) {
+            if apply_and_record(dag, undo, events, command) == Some(true) {
                 *render_dirty = true;
             }
         }
@@ -1268,7 +1418,7 @@ fn apply_kernel_message(
             if let Some(command) = undo.undo() {
                 match dag.undo_command(&command) {
                     Ok(()) => {
-                        dag.cache_mut().clear();
+                        dag.clear_cache();
                         *render_dirty = true;
                         let _ = events.send(KernelEvent::Undone(command));
                         let _ = events.send(KernelEvent::DirtyStateChanged {
@@ -1288,7 +1438,7 @@ fn apply_kernel_message(
             if let Some(command) = undo.redo() {
                 match dag.apply_command(command.clone()) {
                     Ok(_) => {
-                        dag.cache_mut().clear();
+                        dag.clear_cache();
                         *render_dirty = true;
                         let _ = events.send(KernelEvent::Redone(command));
                         let _ = events.send(KernelEvent::DirtyStateChanged {
@@ -1343,6 +1493,11 @@ fn apply_kernel_message(
             let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
             *render_dirty = true;
         }
+        KernelMessage::SetProxyScale(scale) => {
+            base_ctx.insert(ProxyScale(ProxyScale::sanitized(scale)));
+            let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
+            *render_dirty = true;
+        }
         KernelMessage::MarkClean => {
             undo.clear_and_mark_clean();
             let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
@@ -1354,6 +1509,10 @@ fn apply_kernel_message(
             let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
             let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
             let _ = frames.send(FrameNotification::cleared(None, epoch.current()));
+            let _ = events.send(KernelEvent::MemoryStats {
+                allocated_bytes: governor.allocated_bytes(),
+                max_bytes: governor.max_bytes(),
+            });
             *render_dirty = true;
         }
         KernelMessage::ReplaceDag {
@@ -1361,23 +1520,54 @@ fn apply_kernel_message(
             viewer_target,
         } => {
             *dag = *new_dag;
+            dag.clear_cache();
             undo.clear_and_mark_clean();
             *viewer_node = viewer_target;
             let _ = events.send(KernelEvent::EpochChanged(epoch.bump()));
             let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
+            let _ = events.send(KernelEvent::MemoryStats {
+                allocated_bytes: governor.allocated_bytes(),
+                max_bytes: governor.max_bytes(),
+            });
             *render_dirty = true;
         }
         KernelMessage::SaveScript { path } => {
             let tcl = dag.export_to_tcl();
-            match std::fs::write(&path, &tcl) {
+            match atomic_write_string(&path, &tcl) {
                 Ok(()) => {
                     undo.mark_saved();
                     let _ = events.send(KernelEvent::ScriptSaved { path: path.clone() });
                     let _ = events.send(KernelEvent::DirtyStateChanged { is_dirty: false });
                 }
                 Err(e) => {
+                    // A failed save must leave the graph dirty so the user is
+                    // never told an unwritten file is safe. Re-broadcast the
+                    // authoritative dirty state alongside the error.
                     let _ = events.send(KernelEvent::ScriptError {
                         message: e.to_string(),
+                    });
+                    let _ = events.send(KernelEvent::DirtyStateChanged {
+                        is_dirty: undo.is_dirty(),
+                    });
+                }
+            }
+        }
+        KernelMessage::WriteAutoSave { path, source_path } => {
+            // A background snapshot is not a user save: never touch the undo
+            // stack, the dirty flag, or the viewer.
+            let tcl = dag.export_to_tcl();
+            let snapshot = match &source_path {
+                Some(source) => tcl_with_recovery_source(&tcl, source),
+                None => tcl,
+            };
+            match atomic_write_string(&path, &snapshot) {
+                Ok(()) => {
+                    // A background snapshot is not a user save: no event is
+                    // emitted on success so nothing in the UI changes.
+                }
+                Err(e) => {
+                    let _ = events.send(KernelEvent::ScriptError {
+                        message: format!("auto-save failed: {e}"),
                     });
                 }
             }
@@ -1419,6 +1609,12 @@ fn apply_kernel_message(
             }
 
             let saved_time = base_ctx.time();
+            let saved_proxy = base_ctx.proxy_scale();
+            // Write ALWAYS exports full 1:1 resolution even when the Viewer is
+            // in 1:2 or 1:4 Proxy mode: force the base context to full res for
+            // the whole sequence, then restore the interactive scale when done.
+            base_ctx.insert(ProxyScale(1.0));
+            let previous_export = base_ctx.insert(RenderForExport);
             let mut frames_written = 0usize;
             let mut last_path: Option<std::path::PathBuf> = None;
 
@@ -1455,10 +1651,16 @@ fn apply_kernel_message(
                 }
             }
 
-            // Restore the original time and clear the cache so the next
-            // viewer render is unaffected by the sequence evaluation.
+            // Restore the original time, proxy scale, and clear the cache so the
+            // next viewer render is unaffected by the sequence evaluation.
             if let Some(t) = saved_time {
                 base_ctx.insert(Time(t));
+            } else {
+                base_ctx.remove::<Time>();
+            }
+            base_ctx.insert(ProxyScale(saved_proxy));
+            if previous_export.is_none() {
+                base_ctx.remove::<RenderForExport>();
             }
             dag.cache_mut().clear();
 
@@ -1467,9 +1669,26 @@ fn apply_kernel_message(
                 frames_written,
                 last_path,
             });
+            let _ = events.send(KernelEvent::MemoryStats {
+                allocated_bytes: governor.allocated_bytes(),
+                max_bytes: governor.max_bytes(),
+            });
         }
         KernelMessage::Shutdown => {
             *shutdown = true;
+        }
+        KernelMessage::PurgeCache => {
+            // Drop all cached DAG packets, releasing their MemoryPermits.
+            dag.clear_cache();
+            // Invoke the injected external cache purger (e.g. DiskCache::clear)
+            // if one was registered in the base context.
+            if let Some(purger) = base_ctx.get::<ExternalCachePurger>() {
+                (purger.0)();
+            }
+            let _ = events.send(KernelEvent::MemoryStats {
+                allocated_bytes: governor.allocated_bytes(),
+                max_bytes: governor.max_bytes(),
+            });
         }
     }
 }
@@ -1536,38 +1755,55 @@ fn render_viewer(
     match dag.evaluate_pull(target, context, governor, epoch, current_epoch) {
         Ok(packet) if !packet.is_empty() => {
             *displayed_target = Some(target);
-            RenderOutcome::Frame(FrameNotification::frame(target, current_epoch, packet))
+            let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
+            let mut frame = FrameNotification::frame(target, current_epoch, packet);
+            frame.proxy_scale = context.proxy_scale();
+            RenderOutcome::Frame(frame)
         }
-        Ok(_) => {
+        Ok(_packet) => {
             // The chain exists but produced nothing displayable: an
             // unconnected `Viewer`, a detached upstream wire, or a
             // metadata-only packet.
             *displayed_target = None;
+            let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
             RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
         // Preemption is not a failure: the artist moved the timeline or a knob
         // while this render ran. Keep the last good image on screen and let
         // the caller retry with the newest state -- clearing here would blank
         // the viewer on every mid-drag preemption.
-        Err(NodeError::Preempted) => RenderOutcome::Preempted,
+        Err(NodeError::Preempted) => {
+            // A mid-drag preemption can happen many times per second; drain the
+            // partial samples so the buffer cannot grow without bound. The
+            // mirror merges them, so no earlier bar is lost.
+            let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
+            RenderOutcome::Preempted
+        }
         Err(NodeError::Panic(message)) => {
             *displayed_target = None;
             let _ = events.send(KernelEvent::NodeCrashed {
                 node: target,
                 message,
             });
+            // Keep the timings of every node that did evaluate before the
+            // crash so the canvas still shows honest bars.
+            let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
             RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
         Err(_) => {
             // Missing inputs and memory pressure are normal during interactive
-            // editing. Clear the image; the next change retries.
+            // editing. Clear the image; the next change retries. Emit the
+            // partial timings so startup bars appear even when the very first
+            // render cannot complete.
             *displayed_target = None;
+            let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
             RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
     }
 }
 
-/// Applies a command, records it for undo, and reports the outcome.
+/// Applies a command, records it for undo, and returns whether it needs a render.
+/// `None` means the command failed.
 ///
 /// Destructive commands are enriched from the live DAG first, so the undo stack
 /// always holds a full snapshot even if the UI's mirror was stale.
@@ -1576,18 +1812,19 @@ fn apply_and_record(
     undo: &mut UndoStack,
     events: &Sender<KernelEvent>,
     command: UndoableCommand,
-) -> bool {
+) -> Option<bool> {
     let command = dag.enrich(command);
     let command_for_error = command.clone();
+    // The DAG's legacy SetKnobCurve implementation also invalidates internally.
+    // Only batches containing a curve can lose entries during rollback; keep
+    // a shallow snapshot for those, not for normal knob edits or wire splices.
+    let rollback_cache = (matches!(command, UndoableCommand::Batch(_))
+        && command.contains_curve_edit())
+    .then(|| dag.cache().clone());
     match dag.apply_command(command) {
         Ok(enriched_command) => {
-            // Topology changes alter every downstream op hash. Dropping the
-            // RAM cache guarantees the very next pull re-evaluates, so
-            // detaching a wire updates the viewer immediately instead of
-            // serving a packet cached for the old wiring.
-            if changes_topology(&enriched_command) {
-                dag.cache_mut().clear();
-            }
+            invalidate_cache_for_command(dag, &enriched_command);
+            let needs_render = !enriched_command.is_layout_only();
             undo.push(enriched_command.clone());
             let _ = events.send(KernelEvent::Applied(enriched_command));
             // Every graph edit mutates the undo stack, so the dirty flag must
@@ -1595,35 +1832,38 @@ fn apply_and_record(
             let _ = events.send(KernelEvent::DirtyStateChanged {
                 is_dirty: undo.is_dirty(),
             });
-            true
+            Some(needs_render)
         }
         Err(error) => {
+            if let Some(cache) = rollback_cache {
+                *dag.cache_mut() = cache;
+            }
             let _ = events.send(KernelEvent::CommandFailed {
                 command: command_for_error,
                 message: error.to_string(),
             });
-            false
+            None
         }
     }
 }
 
-/// `true` for commands that add, remove, rewire, or bypass nodes.
-///
-/// These invalidate every cached op hash downstream of the change, so the
-/// worker drops the packet cache before the next render.
-fn changes_topology(command: &UndoableCommand) -> bool {
+/// Invalidates a successfully applied command against the final graph.
+fn invalidate_cache_for_command(dag: &mut Dag, command: &UndoableCommand) {
     match command {
-        UndoableCommand::MoveNode { .. } => false,
-        UndoableCommand::Batch(cmds) => cmds.iter().any(changes_topology),
-        _ => matches!(
-            command,
-            UndoableCommand::AddNode { .. }
-                | UndoableCommand::RemoveNode { .. }
-                | UndoableCommand::RestoreNode { .. }
-                | UndoableCommand::ConnectEdge { .. }
-                | UndoableCommand::DisconnectEdge { .. }
-                | UndoableCommand::SetDisabled { .. }
-        ),
+        UndoableCommand::MoveNode { .. } | UndoableCommand::AddNode { .. } => {}
+        UndoableCommand::SetKnob { node, .. }
+        | UndoableCommand::SetKnobCurve { node, .. }
+        | UndoableCommand::SetDisabled { node, .. }
+        | UndoableCommand::ConnectEdge { to_node: node, .. }
+        | UndoableCommand::DisconnectEdge { to_node: node, .. } => dag.invalidate_downstream(*node),
+        UndoableCommand::Batch(commands) => {
+            for command in commands {
+                invalidate_cache_for_command(dag, command);
+            }
+        }
+        UndoableCommand::RemoveNode { .. } | UndoableCommand::RestoreNode { .. } => {
+            dag.clear_cache()
+        }
     }
 }
 
@@ -1701,11 +1941,7 @@ fn route_nuke_viewer(
     });
 
     let batch = UndoableCommand::from_vec(cmds)?;
-    if apply_and_record(dag, undo, events, batch) {
-        Some(viewer_id)
-    } else {
-        None
-    }
+    apply_and_record(dag, undo, events, batch).map(|_| viewer_id)
 }
 
 #[cfg(test)]
@@ -1800,6 +2036,38 @@ mod tests {
         }
     }
 
+    /// A cartridge that reserves a fixed number of bytes from the governor so
+    // its cached packet holds a `MemoryPermit` until the cache is purged.
+    struct PermitPurgerNode;
+
+    impl crate::types::NodeTrait for PermitPurgerNode {
+        fn evaluate(&self, ctx: &EvalContext, _inputs: &[Packet]) -> Result<Packet, NodeError> {
+            let governor = ctx
+                .governor()
+                .ok_or_else(|| NodeError::Other("governor was not injected".to_string()))?;
+            let _permit = governor.request_permit(1024)?;
+            let mut packet = Packet::new();
+            packet.insert(42u32);
+            Ok(packet)
+        }
+
+        fn serialize_to_tcl(&self) -> String {
+            "PermitPurgerNode {}".to_string()
+        }
+    }
+
+    fn permit_purger_factory() -> Arc<dyn crate::types::NodeTrait> {
+        Arc::new(PermitPurgerNode)
+    }
+
+    inventory::submit! {
+        NodeCartridgeDescriptor {
+            kind: "PermitPurger",
+            default_knobs: constant_knobs,
+            factory: permit_purger_factory,
+        }
+    }
+
     fn next_event(kernel: &KernelHandle) -> KernelEvent {
         loop {
             let event = kernel
@@ -1811,7 +2079,9 @@ mod tests {
             match &event {
                 KernelEvent::DirtyStateChanged { .. }
                 | KernelEvent::ScriptSaved { .. }
-                | KernelEvent::ScriptError { .. } => continue,
+                | KernelEvent::ScriptError { .. }
+                | KernelEvent::MemoryStats { .. }
+                | KernelEvent::PerfSnapshot(_) => continue,
                 _ => return event,
             }
         }
@@ -1823,6 +2093,175 @@ mod tests {
             default_knobs: time_probe_knobs,
             factory: time_probe_factory,
         }
+    }
+
+    #[test]
+    fn coalesce_proxy_selection_keeps_the_latest_scale_without_crossing_other_messages() {
+        let messages = coalesce_batch(vec![
+            KernelMessage::SetProxyScale(0.5),
+            KernelMessage::SetProxyScale(0.25),
+            KernelMessage::RequestRender,
+            KernelMessage::SetProxyScale(1.0),
+        ]);
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                KernelMessage::SetProxyScale(0.25),
+                KernelMessage::RequestRender,
+                KernelMessage::SetProxyScale(1.0),
+            ]
+        ));
+    }
+
+    #[test]
+    fn write_spawn_batch_preserves_upstream_cache_and_move_node_skips_render() {
+        struct CountedSource(Arc<AtomicUsize>);
+        impl crate::NodeTrait for CountedSource {
+            fn evaluate(&self, _: &EvalContext, _: &[Packet]) -> Result<Packet, NodeError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                let mut packet = Packet::new();
+                packet.insert(21_u32);
+                Ok(packet)
+            }
+
+            fn serialize_to_tcl(&self) -> String {
+                "CountedSource {}".into()
+            }
+        }
+
+        let source = NodeId(1);
+        let write = NodeId(2);
+        let viewer = NodeId(3);
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let mut dag = Dag::new();
+        dag.add_node_with_implementation(
+            source,
+            "CountedSource",
+            Arc::new(CountedSource(evaluations.clone())),
+        )
+        .unwrap();
+        dag.add_node(viewer, "Viewer").unwrap();
+        let kernel = KernelHandle::spawn().unwrap();
+        kernel
+            .send(KernelMessage::ReplaceDag {
+                dag: Box::new(dag),
+                viewer_target: Some(source),
+            })
+            .unwrap();
+        let receive_frame = || {
+            kernel
+                .frames()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        };
+        let warm = receive_frame();
+        let move_viewer = |from_x, to_x| UndoableCommand::MoveNode {
+            id: viewer,
+            from_x,
+            to_x,
+            from_y: 0.0,
+            to_y: 0.0,
+        };
+        let connect = |from_node, to_node| UndoableCommand::ConnectEdge {
+            from_node,
+            from_port: PortId(0),
+            to_node,
+            to_port: PortId(0),
+        };
+        let spawn = UndoableCommand::Batch(vec![
+            UndoableCommand::AddNode {
+                id: write,
+                kind: "Write".into(),
+                x: 0.0,
+                y: 0.0,
+            },
+            connect(source, write),
+            connect(write, viewer),
+            move_viewer(0.0, 20.0),
+        ]);
+        kernel.send(KernelMessage::Execute(spawn)).unwrap();
+        let after_spawn = receive_frame();
+        assert!(
+            Arc::ptr_eq(&warm.packet, &after_spawn.packet),
+            "the upstream cache entry must survive"
+        );
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+
+        kernel
+            .send(KernelMessage::SetViewerNode(Some(viewer)))
+            .unwrap();
+        let rendered = receive_frame();
+        assert_eq!(rendered.packet.get::<u32>(), Some(&21));
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+        let epoch = kernel.render_epoch().current();
+        let applied = || loop {
+            if let KernelEvent::Applied(command) = next_event(&kernel) {
+                return command;
+            }
+        };
+        assert!(matches!(applied(), UndoableCommand::Batch(ref cmds) if cmds.len() == 4));
+        for command in [
+            move_viewer(20.0, 30.0),
+            UndoableCommand::Batch(vec![move_viewer(30.0, 40.0), move_viewer(40.0, 50.0)]),
+        ] {
+            kernel
+                .send(KernelMessage::Execute(command.clone()))
+                .unwrap();
+            assert_eq!(applied(), command);
+            assert!(
+                matches!(
+                    kernel.frames().recv_timeout(Duration::from_millis(80)),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                ),
+                "a layout edit must not deliver a frame"
+            );
+            assert_eq!(kernel.render_epoch().current(), epoch);
+        }
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn rejected_batch_restores_cache_even_after_a_curve_edit() {
+        let source = NodeId(1);
+        let viewer = NodeId(2);
+        let mut dag = Dag::new();
+        dag.add_node(source, "Constant").unwrap();
+        dag.add_node(viewer, "Viewer").unwrap();
+        dag.connect(source, viewer, PortId(0)).unwrap();
+        let ctx = EvalContext::new();
+        let governor = MemoryGovernor::new(usize::MAX);
+        let epoch = RenderEpoch::new();
+        let frame = dag
+            .evaluate_pull(viewer, &ctx, &governor, &epoch, 0)
+            .unwrap();
+        let hash = dag.compute_op_hash(viewer, &ctx).unwrap();
+        let rejected = UndoableCommand::Batch(vec![
+            UndoableCommand::SetKnobCurve {
+                node: source,
+                name: "gain".into(),
+                curves: vec![AnimationCurve::from_constant(2.0)],
+                previous: vec![],
+            },
+            UndoableCommand::ConnectEdge {
+                from_node: viewer,
+                from_port: PortId(0),
+                to_node: source,
+                to_port: PortId(0),
+            },
+        ]);
+        let (events, rx) = unbounded();
+        let mut undo = UndoStack::new();
+        assert_eq!(
+            apply_and_record(&mut dag, &mut undo, &events, rejected),
+            None
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(KernelEvent::CommandFailed { .. })
+        ));
+        assert!(!undo.can_undo());
+        assert!(Arc::ptr_eq(&dag.cache()[&hash].packet, &frame));
+        assert_eq!(dag.compute_op_hash(viewer, &ctx).unwrap(), hash);
     }
 
     #[test]
@@ -2669,11 +3108,14 @@ mod tests {
         assert_eq!(frame.packet.get::<u32>(), Some(&15));
 
         // Undo must restore the original pre-drag value (0). Drain any stale
-        // EpochChanged events left over from the BumpEpoch messages above.
+        // events left over from the drag burst (EpochChanged, MemoryStats,
+        // PerfSnapshot, DirtyStateChanged), then wait for Undone.
         kernel.send(KernelMessage::Undo).expect("send undo");
+        // Drain the event channel of any stale events first.
+        while kernel.events().try_recv().is_ok() {}
         let mut seen_undone = false;
-        for _ in 0..50 {
-            match kernel.events().recv_timeout(Duration::from_millis(100)) {
+        for _ in 0..100 {
+            match kernel.events().recv_timeout(Duration::from_millis(50)) {
                 Ok(KernelEvent::Undone(UndoableCommand::SetKnob { .. })) => {
                     seen_undone = true;
                     break;
@@ -2881,5 +3323,102 @@ mod tests {
         // Drop the kernel handle: shutdown must complete without hanging.
         // The epoch bump in `KernelHandle::drop` aborts any in-flight render.
         drop(kernel);
+    }
+
+    #[test]
+    fn purge_cache_clears_dag_and_external_cache_and_emits_memory_stats() {
+        let purger_called = Arc::new(AtomicUsize::new(0));
+        let purger_flag = Arc::clone(&purger_called);
+
+        let kernel = KernelHandle::spawn_with_governor(MemoryGovernor::new(usize::MAX))
+            .expect("kernel thread should spawn");
+
+        // Inject the external cache purger so PurgeCache can reach it without
+        // tanova-kernel knowing about tanova-io.
+        let mut ctx = EvalContext::new();
+        ctx.insert(ExternalCachePurger(Arc::new(move || {
+            purger_flag.fetch_add(1, Ordering::SeqCst);
+        })));
+        kernel
+            .send(KernelMessage::SetBaseContext(ctx))
+            .expect("set base context should reach the kernel");
+
+        // Add a permit-allocating node and route a Viewer at it, then render
+        // so the DAG cache holds a packet with a MemoryPermit.
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(1),
+                kind: "PermitPurger".to_string(),
+                x: 10.0,
+                y: 10.0,
+            }))
+            .expect("send AddNode");
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(2),
+                kind: "Viewer".to_string(),
+                x: 60.0,
+                y: 10.0,
+            }))
+            .expect("send AddNode viewer");
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::ConnectEdge {
+                from_node: NodeId(1),
+                from_port: PortId(0),
+                to_node: NodeId(2),
+                to_port: PortId(0),
+            }))
+            .expect("send ConnectEdge");
+        kernel
+            .send(KernelMessage::SetViewerNode(Some(NodeId(2))))
+            .expect("send SetViewerNode");
+        kernel
+            .send(KernelMessage::BumpEpoch)
+            .expect("send BumpEpoch");
+
+        // Wait for the render to complete (MemoryStats is emitted after each render).
+        let mut saw_memory_stats = false;
+        for _ in 0..400 {
+            match kernel.events().recv_timeout(Duration::from_millis(25)) {
+                Ok(KernelEvent::MemoryStats { .. }) => {
+                    saw_memory_stats = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_memory_stats,
+            "kernel must emit MemoryStats after rendering the Viewer"
+        );
+
+        // Purge: clears the DAG cache, invokes the external purger, emits MemoryStats.
+        kernel
+            .send(KernelMessage::PurgeCache)
+            .expect("send PurgeCache");
+
+        let mut purger_was_called = false;
+        for _ in 0..100 {
+            match kernel.events().recv_timeout(Duration::from_millis(50)) {
+                Ok(KernelEvent::MemoryStats { .. }) => {
+                    purger_was_called = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            purger_was_called,
+            "ExternalCachePurger callback must run on PurgeCache"
+        );
+        assert_eq!(
+            purger_called.load(Ordering::SeqCst),
+            1,
+            "external cache purger must be invoked exactly once"
+        );
+
+        kernel.shutdown();
     }
 }

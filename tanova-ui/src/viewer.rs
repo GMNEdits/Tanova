@@ -10,7 +10,9 @@ use egui::{
     Align, Align2, Color32, ColorImage, FontId, Key, Layout, Modifiers, PointerButton, Pos2, Rect,
     Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
 };
-use tanova_kernel::{FrameNotification, KernelMessage, KnobValue, NodeId, Packet, UndoableCommand};
+use tanova_kernel::{
+    FrameNotification, KernelMessage, KnobValue, NodeId, Packet, ProxyScale, UndoableCommand,
+};
 use tanova_render::{BBox, DisplayTransform, Mat3x3, Raster2D, ViewerChannel};
 
 use crate::canvas::GraphMirror;
@@ -86,11 +88,16 @@ pub struct ViewerPanel {
     pub display_transform: DisplayTransform,
     /// Viewer channel solo (`Rgba`, `R`, `G`, `B`, `A`; default `Rgba`).
     pub channel: ViewerChannel,
+    /// Requested proxy mode, independent of the image still on screen.
+    pub proxy_scale: f32,
+    /// Scale of the most recently delivered frame.
+    pub frame_proxy_scale: f32,
     /// Playhead used to evaluate overlay knobs and auto-key animated edits.
     pub current_frame: f64,
-    frame: Option<Arc<Packet>>,
+    last_packet: Option<Arc<Packet>>,
     texture: Option<TextureHandle>,
     dirty: bool,
+    uploaded_view: Option<(u32, u32, DisplayTransform, ViewerChannel)>,
     /// Last whole frame handed to the kernel as `SetTime`.
     ///
     /// Deduplicates scrub/playback messages so a 60 Hz UI does not queue
@@ -115,10 +122,13 @@ impl Default for ViewerPanel {
             zoom: 1.0,
             display_transform: DisplayTransform::Linear,
             channel: ViewerChannel::Rgba,
+            proxy_scale: 1.0,
+            frame_proxy_scale: 1.0,
             current_frame: 1.0,
-            frame: None,
+            last_packet: None,
             texture: None,
             dirty: true,
+            uploaded_view: None,
             last_sent_frame: None,
             jack_drag: None,
             dragging_corner: None,
@@ -214,8 +224,17 @@ impl ViewerPanel {
             self.clear_frame();
             return;
         }
-        self.frame = Some(Arc::clone(&frame.packet));
-        self.dirty = true;
+        let scale = ProxyScale::sanitized(frame.proxy_scale);
+        let same_image = self
+            .last_packet
+            .as_ref()
+            .is_some_and(|packet| Arc::ptr_eq(packet, &frame.packet))
+            && self.frame_proxy_scale == scale
+            && self.texture.is_some()
+            && self.uploaded_view == Some(self.view_settings());
+        self.last_packet = Some(Arc::clone(&frame.packet));
+        self.frame_proxy_scale = scale;
+        self.dirty |= !same_image;
     }
 
     /// Drops the last image and its GPU texture.
@@ -223,9 +242,11 @@ impl ViewerPanel {
     /// The transform jack is reset too: it must never hover over an empty
     /// viewport, because there is no image space to map it into.
     pub fn clear_frame(&mut self) {
-        let had_content = self.frame.is_some() || self.texture.is_some();
-        self.frame = None;
+        let had_content = self.last_packet.is_some() || self.texture.is_some();
+        self.last_packet = None;
+        self.frame_proxy_scale = 1.0;
         self.texture = None;
+        self.uploaded_view = None;
         self.reset_jack_drag();
         self.reset_corner_drag();
         if had_content {
@@ -235,16 +256,22 @@ impl ViewerPanel {
 
     /// `true` when a displayable image is loaded.
     pub fn has_frame(&self) -> bool {
-        self.frame
+        self.last_packet
             .as_ref()
             .is_some_and(|packet| packet.get::<Raster2D>().is_some())
     }
 
     /// The last delivered raster, if any.
     pub fn raster(&self) -> Option<&Raster2D> {
-        self.frame
+        self.last_packet
             .as_ref()
             .and_then(|packet| packet.get::<Raster2D>())
+    }
+
+    /// The displayed frame's dimensions in full-resolution logical pixels.
+    pub fn logical_frame_size(&self) -> Option<(u32, u32)> {
+        self.raster()
+            .map(|raster| raster.format.logical_size(self.frame_proxy_scale))
     }
 
     /// Draws the viewer and uploads the texture when the frame or display
@@ -260,7 +287,7 @@ impl ViewerPanel {
         selected: Option<NodeId>,
     ) -> Vec<KernelMessage> {
         let mut messages = Vec::new();
-        self.show_toolbar(ui);
+        self.show_toolbar(ui, &mut messages);
 
         // Leave room for the timeline strip the app draws below the image.
         //
@@ -301,7 +328,7 @@ impl ViewerPanel {
             }
         }
 
-        let frame = self.frame.clone();
+        let frame = self.last_packet.clone();
         let Some(raster) = frame.as_ref().and_then(|packet| packet.get::<Raster2D>()) else {
             self.reset_jack_drag();
             self.reset_corner_drag();
@@ -319,25 +346,27 @@ impl ViewerPanel {
             return messages;
         };
 
-        if self.dirty || self.texture.is_none() {
+        if self.dirty || self.texture.is_none() || self.uploaded_view != Some(self.view_settings())
+        {
             self.upload(ui.ctx(), raster);
         }
 
-        let format = raster.format.to_bbox();
+        let format = self.logical_format(raster);
         // Capture primary presses before navigation, using the same fitted
         // image rect that both the HUD and the overlay will draw against.
         let was_dragging_corner = self.is_dragging_overlay();
-        messages.extend(self.handle_corner_pin_input(
+        let corner_messages = self.handle_corner_pin_input(
             ui,
             &response,
             self.image_rect(rect, raster),
             format,
             graph,
             selected,
-        ));
-        if !was_dragging_corner && !self.is_dragging_overlay() && messages.is_empty() {
+        );
+        if !was_dragging_corner && !self.is_dragging_overlay() && corner_messages.is_empty() {
             self.handle_navigation(ui, &response);
         }
+        messages.extend(corner_messages);
         let image_rect = self.image_rect(rect, raster);
         #[cfg(test)]
         {
@@ -359,7 +388,7 @@ impl ViewerPanel {
         painter.text(
             image_rect.left_top() + Vec2::new(4.0, 3.0),
             Align2::LEFT_TOP,
-            format!("{}x{}", raster.format.width, raster.format.height),
+            format!("{}x{}", format.width(), format.height()),
             FontId::proportional(10.0),
             FORMAT_LINE,
         );
@@ -370,8 +399,9 @@ impl ViewerPanel {
         let transform_selected = selected
             .and_then(|id| graph.node(id))
             .is_some_and(|node| node.kind == "Transform");
-        if !transform_selected && raster.bbox != format {
-            let bbox_rect = self.world_to_screen(image_rect, format, raster.bbox);
+        let pixel_format = raster.format.to_bbox();
+        if !transform_selected && raster.bbox != pixel_format {
+            let bbox_rect = self.world_to_screen(image_rect, pixel_format, raster.bbox);
             draw_dashed_rect(&painter, bbox_rect, Stroke::new(1.0, BBOX_LINE));
         }
 
@@ -574,7 +604,7 @@ impl ViewerPanel {
         messages
     }
 
-    fn show_toolbar(&mut self, ui: &mut Ui) {
+    fn show_toolbar(&mut self, ui: &mut Ui, messages: &mut Vec<KernelMessage>) {
         ui.horizontal(|ui| {
             ui.colored_label(VIEWER, "VIEWER 1");
             match self.viewer_node {
@@ -657,6 +687,40 @@ impl ViewerPanel {
             if self.display_transform != previous_transform {
                 self.dirty = true;
             }
+            ui.separator();
+            ui.label("Proxy:");
+            for (scale, label) in [(1.0, "1:1"), (0.5, "1:2"), (0.25, "1:4")] {
+                if ui
+                    .selectable_label(self.proxy_scale == scale, label)
+                    .clicked()
+                    && self.proxy_scale != scale
+                {
+                    self.proxy_scale = scale;
+                    messages.push(KernelMessage::SetProxyScale(scale));
+                }
+            }
+            // Don't drop the warning while proxy pixels are still displayed
+            // after selecting 1:1.
+            let badge_scale = if self.proxy_scale < 0.999 {
+                self.proxy_scale
+            } else {
+                self.frame_proxy_scale
+            };
+            let badge = if badge_scale <= 0.25 {
+                " PROXY 1:4 "
+            } else {
+                " PROXY 1:2 "
+            };
+            ui.add_visible(
+                badge_scale < 0.999,
+                egui::Label::new(
+                    egui::RichText::new(badge)
+                        .monospace()
+                        .strong()
+                        .color(Color32::from_rgb(30, 24, 8))
+                        .background_color(VIEWER),
+                ),
+            );
         });
     }
 
@@ -683,9 +747,14 @@ impl ViewerPanel {
         }
     }
 
-    /// Fits the raster into the viewer rect, then applies zoom and pan.
+    fn logical_format(&self, raster: &Raster2D) -> BBox {
+        let (width, height) = raster.format.logical_size(self.frame_proxy_scale);
+        BBox::new(0, 0, width as i32, height as i32)
+    }
+
+    /// Fits the logical frame into the viewer rect, then applies zoom and pan.
     fn image_rect(&self, rect: Rect, raster: &Raster2D) -> Rect {
-        let format = raster.format.to_bbox();
+        let format = self.logical_format(raster);
         let width = format.width().max(1) as f32;
         let height = format.height().max(1) as f32;
         let padding = 24.0;
@@ -1093,6 +1162,15 @@ impl ViewerPanel {
         self.corner_drag_value = None;
     }
 
+    fn view_settings(&self) -> (u32, u32, DisplayTransform, ViewerChannel) {
+        (
+            self.gain.to_bits(),
+            self.gamma.to_bits(),
+            self.display_transform,
+            self.channel,
+        )
+    }
+
     fn upload(&mut self, ctx: &egui::Context, raster: &Raster2D) {
         let width = raster.format.width.max(1) as usize;
         let height = raster.format.height.max(1) as usize;
@@ -1112,6 +1190,7 @@ impl ViewerPanel {
                     Some(ctx.load_texture("tanova_viewer", image, TextureOptions::NEAREST));
             }
         }
+        self.uploaded_view = Some(self.view_settings());
         self.dirty = false;
     }
 
@@ -1130,8 +1209,13 @@ impl ViewerPanel {
         if let Some(pointer) = pointer {
             if image_rect.contains(pointer) {
                 let [x, y] = self.screen_to_image(image_rect, format, pointer);
-                let (x, y) = (x.floor() as i32, y.floor() as i32);
-                let [r, g, b, a] = raster.sample_rgba(x, y);
+                let x = (x.floor() as i32).clamp(0, format.width() - 1);
+                let y = (y.floor() as i32).clamp(0, format.height() - 1);
+                let px = ((x as f32 * self.frame_proxy_scale) as i32)
+                    .min(raster.format.width as i32 - 1);
+                let py = ((y as f32 * self.frame_proxy_scale) as i32)
+                    .min(raster.format.height as i32 - 1);
+                let [r, g, b, a] = raster.sample_rgba(px, py);
                 text = format!("XY: ({x}, {y}) | RGBA: ({r:.4}, {g:.4}, {b:.4}, {a:.4})");
             }
         }
@@ -1575,7 +1659,7 @@ mod tests {
         viewer.viewer_node = Some(NodeId(1));
         let mut packet = Packet::new();
         packet.insert(Raster2D::for_format(Format::new("test", 256, 256, 1.0)));
-        viewer.frame = Some(Arc::new(packet));
+        viewer.last_packet = Some(Arc::new(packet));
         (viewer, graph)
     }
 
@@ -1611,6 +1695,102 @@ mod tests {
             pressed,
             modifiers: Modifiers::NONE,
         }
+    }
+
+    #[test]
+    fn viewer_reuses_texture_for_the_same_packet_until_view_settings_change() {
+        let (mut viewer, graph) = corner_pin_test_scene();
+        let ctx = egui::Context::default();
+        run_corner_viewer(&ctx, &mut viewer, &graph, vec![]);
+        assert!(viewer.texture.is_some() && !viewer.dirty);
+        let mut repeated = FrameNotification::frame(
+            NodeId(1),
+            2,
+            Arc::clone(viewer.last_packet.as_ref().unwrap()),
+        );
+        viewer.set_frame(&repeated);
+        assert!(!viewer.dirty);
+        run_corner_viewer(&ctx, &mut viewer, &graph, vec![]);
+        assert!(!viewer.dirty);
+
+        viewer.gain = 2.0;
+        viewer.set_frame(&repeated);
+        assert!(viewer.dirty);
+        run_corner_viewer(&ctx, &mut viewer, &graph, vec![]);
+        assert_eq!(viewer.uploaded_view, Some(viewer.view_settings()));
+        repeated.proxy_scale = 0.5;
+        viewer.set_frame(&repeated);
+        assert!(viewer.dirty);
+
+        viewer.set_frame(&FrameNotification::cleared(Some(NodeId(1)), 3));
+        assert!(viewer.last_packet.is_none() && viewer.texture.is_none());
+    }
+
+    #[test]
+    fn viewer_corner_pin_drag_in_half_proxy_writes_full_resolution_logical_coords() {
+        let (mut viewer, graph) = corner_pin_test_scene();
+        viewer.pan = Vec2::new(9.0, -6.0);
+        viewer.zoom = 0.87;
+        let ctx = egui::Context::default();
+        run_corner_viewer(&ctx, &mut viewer, &graph, vec![]);
+        let full_rect = viewer.image_rect_for_test.unwrap();
+
+        // A requested mode change cannot reinterpret the old frame's pixels.
+        viewer.proxy_scale = 0.5;
+        run_corner_viewer(&ctx, &mut viewer, &graph, vec![]);
+        assert_eq!(viewer.logical_frame_size(), Some((256, 256)));
+        assert_eq!(viewer.image_rect_for_test, Some(full_rect));
+
+        let mut packet = Packet::new();
+        packet.insert(Raster2D::for_format(Format::new("half", 128, 128, 1.0)));
+        let mut frame = FrameNotification::frame(NodeId(1), 2, Arc::new(packet));
+        frame.proxy_scale = 0.5;
+        viewer.set_frame(&frame);
+        run_corner_viewer(&ctx, &mut viewer, &graph, vec![]);
+        assert_eq!(viewer.frame_proxy_scale, 0.5);
+        assert_eq!(viewer.image_rect_for_test, Some(full_rect));
+        let start = full_rect.left_bottom();
+        run_corner_viewer(
+            &ctx,
+            &mut viewer,
+            &graph,
+            vec![egui::Event::PointerMoved(start)],
+        );
+        run_corner_viewer(
+            &ctx,
+            &mut viewer,
+            &graph,
+            vec![pointer_button(start, PointerButton::Primary, true)],
+        );
+        let logical = BBox::new(0, 0, 256, 256);
+        let end = viewer.world_to_screen_point(full_rect, logical, 192.0, 160.0);
+        let messages = run_corner_viewer(
+            &ctx,
+            &mut viewer,
+            &graph,
+            vec![egui::Event::PointerMoved(end)],
+        );
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [KernelMessage::Execute(UndoableCommand::SetKnob {
+                    knob, value: KnobValue::Color([x, y, _, _]), ..
+                })] if knob == "to1" && (*x - 192.0).abs() < 1e-3 && (*y - 160.0).abs() < 1e-3
+            ),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn viewer_fit_does_not_jump_for_odd_dimensions_in_quarter_proxy() {
+        let mut viewer = ViewerPanel::new();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let format = Format::new("odd", 641, 479, 1.0);
+        let full = Raster2D::for_format(format.clone());
+        let quarter = Raster2D::for_format(format.scaled(0.25));
+        let full_rect = viewer.image_rect(screen, &full);
+        viewer.frame_proxy_scale = 0.25;
+        assert_eq!(viewer.image_rect(screen, &quarter), full_rect);
     }
 
     #[test]

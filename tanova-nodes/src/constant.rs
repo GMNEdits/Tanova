@@ -70,22 +70,19 @@ impl NodeTrait for ConstantNode {
         let width_knob = int_knob(knobs, "format_width", DEFAULT_WIDTH).clamp(1, 8192) as u32;
         let height_knob = int_knob(knobs, "format_height", DEFAULT_HEIGHT).clamp(1, 8192) as u32;
 
-        // When the format knobs are still at the cartridge's static default
-        // (1920x1080) and a project format is active, defer to the project
-        // format so every Constant in the graph shares the active resolution.
-        // If the user edited either knob to any other value, the knob values
-        // win — even when a project format is set.
-        let (width, height) =
-            if width_knob == DEFAULT_WIDTH as u32 && height_knob == DEFAULT_HEIGHT as u32 {
-                match ctx.project_format() {
-                    Some(fmt) => (fmt.width, fmt.height),
-                    None => (width_knob, height_knob),
-                }
-            } else {
-                (width_knob, height_knob)
-            };
+        // DAG pulls supply already-resolved knobs. Only standalone callers
+        // may use the project format as a fallback for cartridge defaults.
+        let (width, height) = if ctx.knobs().is_none()
+            && width_knob == DEFAULT_WIDTH as u32
+            && height_knob == DEFAULT_HEIGHT as u32
+            && let Some(format) = ctx.project_format()
+        {
+            (format.width, format.height)
+        } else {
+            (width_knob, height_knob)
+        };
 
-        let format = Format::new("Constant", width, height, 1.0);
+        let format = Format::new("Constant", width, height, 1.0).scaled(ctx.proxy_scale());
         let mut raster = Raster2D::for_format(format);
 
         let mut red = ChannelPlane::new();

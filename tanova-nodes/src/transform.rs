@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tanova_kernel::{
     EvalContext, KnobTable, KnobValue, MemoryGovernor, NodeCartridgeDescriptor, NodeError,
-    NodeTrait, Packet,
+    NodeTrait, Packet, ProxyScale,
 };
 use tanova_render::coords::BBox;
 use tanova_render::{
@@ -82,17 +82,28 @@ impl NodeTrait for TransformNode {
         let center = color_knob(knobs, "center", DEFAULT_CENTER);
         let rotate = float_knob(knobs, "rotate", DEFAULT_ROTATE);
         let scale = float_knob(knobs, "scale", DEFAULT_SCALE);
+        let proxy = ctx.proxy_scale();
 
         // Output always covers the full project format canvas so every
         // destination pixel (x, y) in 0..format_w, 0..format_h is sampled via
         // inverse mapping. Out-of-bounds source pixels read as transparent
         // black.
         let output_bbox = match ctx.project_format() {
-            Some(fmt) => BBox::new(0, 0, fmt.width as i32, fmt.height as i32),
+            Some(fmt) => BBox::new(
+                0,
+                0,
+                ProxyScale::scale_dim(fmt.width, proxy) as i32,
+                ProxyScale::scale_dim(fmt.height, proxy) as i32,
+            ),
             None => input.format.to_bbox(),
         };
 
-        let matrix = transform_matrix(translate, center, rotate, scale);
+        let matrix = transform_matrix(
+            translate.map(|value| value * proxy),
+            center.map(|value| value * proxy),
+            rotate,
+            scale,
+        );
 
         // Fold this node into an upstream contiguous transform chain when one
         // is present. The whole chain then resamples ONCE from the original

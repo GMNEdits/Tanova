@@ -80,12 +80,22 @@ impl NodeTrait for CornerPinNode {
         // Source quad = the input's full format.
         let from = [[0.0, 0.0], [fw, 0.0], [fw, fh], [0.0, fh]];
         // Destination quad = the four pinned corners.
-        let to = [
+        let logical_to = [
             [to1[0], to1[1]],
             [to2[0], to2[1]],
             [to3[0], to3[1]],
             [to4[0], to4[1]],
         ];
+        let scale = ctx.proxy_scale();
+        let (logical_w, logical_h) = input.format.logical_size(scale);
+        let to = logical_to.map(|[x, y]| {
+            // An exact logical format edge must land on the rounded raster
+            // edge, including odd widths/heights, so identity remains zero-copy.
+            [
+                if x == logical_w as f32 { fw } else { x * scale },
+                if y == logical_h as f32 { fh } else { y * scale },
+            ]
+        });
 
         // Zero-copy identity fast path: every corner sits exactly on its source.
         if !invert {

@@ -5,6 +5,83 @@ All notable changes to Tanova are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.5] - 2026-11-26
+
+**Phase 8 — Project Format Versioning, Atomic Save & Crash Recovery (Milestone 25).**
+
+### Added
+
+- **Schema versioning:** `TANOVA_SCHEMA_VERSION = 1` exported from `tanova-kernel`/`tanova-app`. `export_to_tcl` now writes `# tanova_schema 1` on line 2 of every `.tnv` (line 1 stays Nuke's `version 15.0 v5` so Nuke keeps loading).
+- **Parser validation:** `parse_nk_script`/`load_nk_into_dag` read `# tanova_schema N`; `v == 0 || v > TANOVA_SCHEMA_VERSION` is rejected with `Unsupported Tanova schema version {v} (max supported: {})`. Missing header = `None` and loads normally (legacy `.tnv` / external `.nk`).
+- **Recovery provenance:** `# tanova_recovery_source <path>` is parsed into `ParsedScript.recovery_source`; a restored crash session re-binds to this path, never to the hidden `autosave.tnv`.
+- **`ParsedScript` gains `schema_version: Option<u32>` and `recovery_source: Option<PathBuf>`.**
+- **`tanova_kernel::atomic_write_string`**: pure-std atomic write — hidden temp file in the same directory as the target, `create_new`, `write_all`, `flush`, `sync_all`, drop handle, `rename`, best-effort `remove_file` of the temp on failure (avoids `EXDEV` cross-filesystem renames).
+- **`KernelMessage::WriteAutoSave`** for idle background crash-recovery snapshots.
+- **`tanova-app` recovery fields:** `recovery_dir` (`Some` only in live desktop startup; `None` in headless/tests), `last_user_action`, `last_auto_save`, `recovery_snapshot_path`, `pending_recovery`, `pending_post_save`, `save_in_flight`.
+- **Centered ASCII "Crash Recovery" modal** (Restore / Discard) offered before file/unsaved modals.
+- **`on_exit` shutdown hook** removes any pending recovery snapshot.
+
+### Changed
+
+- **Save is confirmed-only:** `execute_save_to_path` no longer sets `script_path` or `is_dirty = false`; only `ScriptSaved` applies them. Follow-up actions (`pending_post_save`) run only after `ScriptSaved`.
+- **`SaveScript` uses `atomic_write_string`** (same-directory atomic write) instead of `std::fs::write`.
+- **Failed `SaveScript`** emits `ScriptError` plus `DirtyStateChanged { is_dirty: undo_stack.is_dirty() }` and does NOT call `mark_saved()`, so a failed save leaves the project dirty.
+- **`WriteAutoSave`** never calls `mark_saved()`, never changes `is_dirty`, never triggers `render_viewer()`.
+- **Auto-save gating:** idle ≥ 3 s, min interval 30 s, not dragging, no modal/pending recovery, not already saving.
+- Existing save tests now pump until `ScriptSaved` confirms clean state.
+
+### Fixed
+
+- `export_to_tcl` line 1 kept as `version 15.0 v5\n`; schema marker inserted on line 2.
+
+**Phase 8 — Real GUI RAM Budget, Cooperative Eviction & 1080p Speed Gate (Milestone 26).**
+
+### Added
+
+- **Real GUI `MemoryGovernor` cap:** `recommended_gui_memory_cap_bytes()` auto-scales to `1.0 GiB` on systems with ≤8.5 GiB RAM (parsed from `/proc/meminfo` on Linux) and `2.0 GiB` otherwise; desktop `KernelHandle` boots with this cap instead of `usize::MAX`.
+- **Cooperative cache eviction:** `Dag::pull` evicts the lowest-priority cached entry when a `MemoryExceeded` error occurs, retrying evaluation; the cache also pre-evicts above 75% of the governor cap so heavy nodes can allocate tiles.
+- **`DiskCache::clear()`** drops cached `Arc<Raster2D>`s and releases their `MemoryPermit`s cleanly.
+- **`KernelMessage::PurgeCache`** purges the DAG cache and any injected external cache, emitting `KernelEvent::MemoryStats`.
+- **`KernelEvent::MemoryStats`** (`allocated_bytes`, `max_bytes`) emitted after renders, `NewScript`, `ReplaceDag`, `ExecuteWriteNode`, and `PurgeCache`.
+- **`KernelEvent::PerfSnapshot(Vec<NodePerfSample>)`** emitted after each `render_viewer()` frame with per-node `(node, eval_us, from_cache)` timings.
+- **`ExternalCachePurger`** lets `tanova-app` inject a disk-cache purge closure without `tanova-kernel` knowing about `tanova-io`.
+- **`tanova-render/src/pool.rs`:** `worker_thread_count()` (`N - 2`, clamped `1..=6`) and `parallel_map_ordered()` using pure `std::thread::scope`, zero `unsafe`.
+- **Parallel tile ops:** `defocus_raster`, `perspective_warp_raster`, `grade_raster`, `merge_raster` (CPU path), and `blur_padded_rgba` (heavy blurs) parallelize across tiles/rows with pixel-identical output.
+- **Top-bar RAM meter:** compact pure-ASCII `RAM {:.0}/{:.0}M ({}%)` readout with hover tooltip and a `[Purge]` button sending `KernelMessage::PurgeCache`.
+- **Per-node timing heat bar:** 2.5 px performance heat bar on node cards (green/amber/coral) plus tiny `1.2ms`/`C` text when zoomed ≥ 0.75; exposed via `GraphMirror::node_perf`.
+- **`tanova-cli --bench-1080p`:** 1920×1080 speed benchmark gate for Grade, Blur, Defocus, CornerPin2D, Glow on a 40-tile CheckerBoard2 source under the 2.0 GiB cap.
+
+### Changed
+
+- **`MemoryGovernor`** is no longer `usize::MAX` in the GUI; the desktop app uses `recommended_gui_memory_cap_bytes()`.
+- **`Dag::evaluate_pull`** now records per-node perf samples internally, retrievable via `Dag::take_perf_samples()`.
+- **Repo hygiene & CI:** Fixed `Cargo.toml` repository URL (`tanova/tanova` → `GMNEdits/Tanova`), added root `LICENSE-MIT` and `LICENSE-APACHE`, added `deny.toml` (cargo-deny license/advisory checks), and added `.github/workflows/ci.yml` (fmt, clippy, test, headless checks).
+
+**Phase 8 — Full-Res-Safe Viewer Proxy & Remaining Cleanup (Milestone 27).**
+
+### Added
+
+- **Viewer Proxy:** `1:1`, `1:2`, and `1:4` Viewer Proxy modes from the Viewer toolbar; `Ctrl+P` toggles between full and half resolution; an amber `PROXY 1:2` / `PROXY 1:4` badge identifies proxy mode; all spatial knobs, keyframes, radii, and Viewer handles remain in full-resolution logical units while the engine scales math via `proxy_scale`; `Write` always exports at `1:1` without changing the interactive proxy mode.
+- **Proxy-aware evaluation:** Sources and spatial ops render fewer pixels without changing knobs or keyframes; `Read` retains full-resolution EXRs in the disk cache; DAG cache entries are distinct by scale (`ProxyScale` hashed into `OpHash`).
+- **Direct-slice + parallel `to_top_left_rgba8_with_view`:** display conversion borrows tile pointers once per row, uses a uniform-run fast-path, and parallelizes across scanline chunks via `std::thread::scope` for frames ≥ 512×512 pixels — byte-for-byte identical to the naive reference across all display transforms and channel soloing modes.
+- **`tanova-cli --bench-1080p`:** compares full and half-resolution CPU pulls against the same logical scene, plus a `Display RGBA8 (1920x1080)` row.
+
+### Changed
+
+- **Layout-only `MoveNode` render skip:** canvas node drags no longer trigger a Viewer render or texture upload when no frame changed; `ViewerPanel` dedupes repeated identical `Arc<Packet>` uploads.
+- **Surgical downstream cache invalidation:** `AddNode` never invalidates existing nodes; `ConnectEdge`/`DisconnectEdge` invalidate only downstream; `SetKnob`/`SetKnobCurve`/`SetDisabled` invalidate only the edited node's downstream; `Batch` applies recursively — so spawning/wiring `Write` preserves upstream cache entries.
+- **`1920×1080` knob fix:** `Constant`, `CheckerBoard2`, `Ramp`, `Reformat`, and `Crop` now honor explicitly-authored `format_width`/`format_height`/`box_max` knobs instead of hijacking them to the project format; project format only applies when callers supply it through `EvalContext` without authoring knobs.
+- **`CornerPin2D` upstream format inheritance:** auto-chaining below a node stamps `to1`–`to4` to the upstream format; new `[Set to Input]` button in Properties snaps corners to the upstream format.
+- **Top-bar `1280px` fit:** `RAM` and `Purge` restored to the right edge; variable-width project badge truncated with hover tooltip; `"Export status"` removed from the top bar; export confirmation pill (`Exported Nf`) shown on the bottom-left dock tab bar with full path on hover.
+- **Unused `RamCache` removed:** `Dag.cache` is the single canonical cache abstraction.
+- **Repo hygiene & CI:** Fixed `Cargo.toml` repository URL (`tanova/tanova` → `GMNEdits/Tanova`), added root `LICENSE-MIT` and `LICENSE-APACHE`, added `deny.toml` (cargo-deny license/advisory checks), added `.github/workflows/ci.yml` (fmt, clippy, test, headless checks).
+- **`README.md`:** Rewritten as the `v0.6.5` landing page with highlights, 28-node table, architecture summary, Windows/Linux build guides, limitations, and license/trademark notice.
+
+### Fixed
+
+- **Milestone 25:** Nuke-safe `# tanova_schema 1` header on `.tnv` exports; same-folder pure-std atomic save (`create_new` + `rename`); confirmed-only dirty state so save failures keep the project dirty; idle background auto-save (`request_repaint_after`, 0% idle CPU); Crash Recovery modal (Restore / Discard) with clean-exit snapshot removal.
+- **Milestone 26:** Real 1–2 GiB auto-scaled GUI `MemoryGovernor` cap; cooperative `Dag` cache eviction (evicts lowest-priority entry on `MemoryExceeded`, retries once); `DiskCache::clear()` releases `MemoryPermit`s; `PurgeCache` + live top-bar `RAM` meter & `Purge` button; safe `N - 2` `std::thread::scope` tile multi-threading; per-node timing heat bars + non-blocking hover tooltips (`egui::Area`, `interactable(false)`); direct-slice `extract_padded_tile` / `gather_grade_inputs` / `gather_merge_inputs`; `defocus_raster` clipped to `tile_bbox ∩ output_bbox` with prefix-sum rows restricted to the active band; `--bench-1080p` speed gate.
+
 ## [0.6.0] - 2026-11-22
 
 **Phase 7 — Studio Compositing, Spatial Warping & Curve Editor (Milestones 23–24).** Ships an Interactive Curve Editor tab, Node Graph Minimap, projective 4-point homography `CornerPin2D`, optical circular/anamorphic disk `Defocus`, `Mirror`/`Ramp`/`Glow` cartridges (**29 total**), and live-GUI responsiveness fixes for continuous knob/handle dragging.
@@ -288,9 +365,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known Limitations (v0.4.0)
 
-- **Cache Eviction:** No automatic LRU cache eviction during interactive scrubbing; long sessions may accumulate memory until the script is reloaded or a sequence render triggers a cache clear.
+- **Cache Eviction:** No automatic LRU cache eviction during interactive scrubbing; long sessions may accumulate memory until the script is reloaded or a sequence render triggers a cache clear. *(Resolved in v0.5.0/v0.6.5 with bounded GreedyDual-Size caching and governor-driven eviction.)*
 - **Color Management:** Lacks OpenColorIO (OCIO) integration. OpenEXR files are read, processed, and displayed in the Viewer as raw linear data without display transforms (e.g., sRGB/ACES).
-- **Parameter Animation:** No keyframing or Curve Editor. Node knobs (e.g., `Grade` multiply) remain static across the timeline.
+- **Parameter Animation:** No keyframing or Curve Editor. Node knobs (e.g., `Grade` multiply) remain static across the timeline. *(Resolved in v0.5.0/v0.6.0 with keyframes and the Curve Editor.)*
 - **Graph Parallelism:** Branch evaluation in `Dag::pull` is currently single-threaded.
 
 ## [v0.3.1-ux-hardening] - 2026-11-13

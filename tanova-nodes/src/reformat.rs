@@ -110,7 +110,8 @@ impl ReformatOp {
     }
 
     fn dimensions(&self, ctx: &EvalContext) -> (u32, u32) {
-        if (self.width, self.height) == (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        if ctx.knobs().is_none()
+            && (self.width, self.height) == (DEFAULT_WIDTH, DEFAULT_HEIGHT)
             && let Some(format) = ctx.project_format()
         {
             return (format.width, format.height);
@@ -140,7 +141,8 @@ impl NodeTrait for ReformatNode {
         let input = raster_input(inputs, 0).ok_or(NodeError::MissingInput("main"))?;
         let op = ReformatOp::from_knobs(ctx.knobs().unwrap_or(&self.knobs));
         let (width, height) = op.dimensions(ctx);
-        let mut output = Raster2D::for_format(Format::new("Reformat", width, height, 1.0));
+        let format = Format::new("Reformat", width, height, 1.0).scaled(ctx.proxy_scale());
+        let mut output = Raster2D::for_format(format);
         let inverse = op.inverse(&input.format, &output.format);
 
         for (channel, plane) in &input.channels {

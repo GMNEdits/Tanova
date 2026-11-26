@@ -10,6 +10,7 @@
 pub mod coords;
 pub mod matrix;
 pub mod ops;
+pub mod pool;
 pub mod shader;
 pub mod tile;
 
@@ -20,8 +21,8 @@ pub use coords::{
 pub use matrix::{Mat3x3, TransformChain};
 pub use ops::{
     DefocusOp, GradeOp, MergeOp, MergeRequest, blur_padded_rgba, blur_padded_tile, defocus_raster,
-    grade_raster, is_rgba_channel, mask_value, merge_pixel, merge_raster, perspective_warp_raster,
-    rgba_at, transform_gathered_rgba, transform_gathered_tile,
+    downsample_raster, grade_raster, is_rgba_channel, mask_value, merge_pixel, merge_raster,
+    perspective_warp_raster, rgba_at, transform_gathered_rgba, transform_gathered_tile,
 };
 pub use shader::{
     BlurParams, DISPATCH_SIZE, EvalContextGpu, GpuComputeEngine, GradeParams, MergeParams,

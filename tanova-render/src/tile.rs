@@ -165,6 +165,23 @@ impl TileBuffer {
             TileStorage::Uniform(_) => None,
         }
     }
+
+    /// Read-only dense pixel data, if the tile is not collapsed.
+    ///
+    /// The slice is `TILE_SIZE * TILE_SIZE` values in Bottom-Left row-major
+    /// order. Callers that walk a whole tile use this to avoid a `HashMap`
+    /// lookup per pixel; uniform tiles keep returning `None` so they can be
+    /// filled without allocating.
+    pub fn as_dense_slice(&self) -> Option<&[f32]> {
+        self.dense_slice()
+    }
+
+    pub(crate) fn as_dense_slice_mut(&mut self) -> Option<&mut [f32]> {
+        match &mut self.storage {
+            TileStorage::Dense { data, .. } => Some(data),
+            TileStorage::Uniform(_) => None,
+        }
+    }
 }
 
 fn local_index(lx: u32, ly: u32) -> usize {
@@ -477,70 +494,179 @@ impl Raster2D {
         transform: DisplayTransform,
         channel: ViewerChannel,
     ) -> Vec<u8> {
-        let width = display_bbox.width().max(0) as usize;
-        let height = display_bbox.height().max(0) as usize;
-        let mut out = vec![0u8; width * height * 4];
-        if width == 0 || height == 0 {
-            return out;
+        if display_bbox.is_empty() {
+            return Vec::new();
         }
-
-        let has_alpha = self.channels.contains_key(&Channel::RgbaAlpha);
-
-        for row in 0..height {
-            let y = display_bbox.max_y - 1 - row as i32;
-            for col in 0..width {
-                let x = display_bbox.min_x + col as i32;
-                let index = (row * width + col) * 4;
-
-                let mut r = self.sample(&Channel::RgbaRed, x, y) * gain;
-                let mut g = self.sample(&Channel::RgbaGreen, x, y) * gain;
-                let mut b = self.sample(&Channel::RgbaBlue, x, y) * gain;
-                if gamma > 1e-6 {
-                    if r > 0.0 {
-                        r = r.powf(1.0 / gamma);
-                    }
-                    if g > 0.0 {
-                        g = g.powf(1.0 / gamma);
-                    }
-                    if b > 0.0 {
-                        b = b.powf(1.0 / gamma);
-                    }
+        let width = display_bbox.width() as usize;
+        let height = display_bbox.height() as usize;
+        let mut out = vec![0u8; width * height * 4];
+        let planes = [
+            Channel::RgbaRed,
+            Channel::RgbaGreen,
+            Channel::RgbaBlue,
+            Channel::RgbaAlpha,
+        ]
+        .map(|channel| self.channel(&channel));
+        let has_alpha_plane = planes[3].is_some();
+        let overlap = display_bbox.intersection(&self.bbox);
+        let tile_size = TILE_SIZE as i32;
+        let min_tx = overlap.min_x.div_euclid(tile_size);
+        let min_ty = overlap.min_y.div_euclid(tile_size);
+        let mut grid = Vec::new();
+        let mut columns = 0;
+        if !overlap.is_empty() {
+            let max_tx = (overlap.max_x - 1).div_euclid(tile_size);
+            let max_ty = (overlap.max_y - 1).div_euclid(tile_size);
+            columns = (max_tx - min_tx + 1) as usize;
+            grid.reserve(columns * (max_ty - min_ty + 1) as usize);
+            for ty in min_ty..=max_ty {
+                for tx in min_tx..=max_tx {
+                    let tile = TileCoord::new(tx, ty);
+                    grid.push(std::array::from_fn::<_, 4, _>(|c| {
+                        match planes[c].and_then(|plane| plane.get(&tile)) {
+                            Some(buffer) => match buffer.as_dense_slice() {
+                                Some(slice) => DisplaySamples::Dense(slice),
+                                None => DisplaySamples::Uniform(buffer.get(0, 0)),
+                            },
+                            None => DisplaySamples::Uniform(if c == 3 && !has_alpha_plane {
+                                1.0
+                            } else {
+                                0.0
+                            }),
+                        }
+                    }));
                 }
-                r = apply_display_transform(r, transform);
-                g = apply_display_transform(g, transform);
-                b = apply_display_transform(b, transform);
-
-                let a = if has_alpha {
-                    self.sample(&Channel::RgbaAlpha, x, y)
-                } else {
-                    1.0
-                };
-                let a_u8 = to_unorm8(a);
-
-                let bytes = match channel {
-                    ViewerChannel::Rgba => [to_unorm8(r), to_unorm8(g), to_unorm8(b), a_u8],
-                    ViewerChannel::Red => {
-                        let v = to_unorm8(r);
-                        [v, v, v, 255]
-                    }
-                    ViewerChannel::Green => {
-                        let v = to_unorm8(g);
-                        [v, v, v, 255]
-                    }
-                    ViewerChannel::Blue => {
-                        let v = to_unorm8(b);
-                        [v, v, v, 255]
-                    }
-                    ViewerChannel::Alpha => [a_u8, a_u8, a_u8, 255],
-                };
-                out[index] = bytes[0];
-                out[index + 1] = bytes[1];
-                out[index + 2] = bytes[2];
-                out[index + 3] = bytes[3];
             }
         }
+        let inverse_gamma = (gamma > 1e-6 && gamma != 1.0).then(|| 1.0 / gamma);
+        let rgb8 = |value: f32| {
+            let mut value = value * gain;
+            if let Some(exponent) = inverse_gamma
+                && value > 0.0
+            {
+                value = value.powf(exponent);
+            }
+            to_unorm8(apply_display_transform(value, transform))
+        };
+        let encode = |[r, g, b, a]: [f32; 4]| match channel {
+            ViewerChannel::Rgba => [rgb8(r), rgb8(g), rgb8(b), to_unorm8(a)],
+            solo => {
+                let v = match solo {
+                    ViewerChannel::Red => rgb8(r),
+                    ViewerChannel::Green => rgb8(g),
+                    ViewerChannel::Blue => rgb8(b),
+                    ViewerChannel::Alpha => to_unorm8(a),
+                    ViewerChannel::Rgba => unreachable!(),
+                };
+                [v, v, v, 255]
+            }
+        };
+        let black = encode([0.0, 0.0, 0.0, if has_alpha_plane { 0.0 } else { 1.0 }]);
+        let row_bytes = width * 4;
+        let render_rows = |dst: &mut [u8], row_start: usize| {
+            for (row, line) in dst.chunks_exact_mut(row_bytes).enumerate() {
+                let y = display_bbox.max_y - 1 - (row_start + row) as i32;
+                let outside = |pixels: &mut [u8], x_start: i32| {
+                    if self.edge_mode == EdgeMode::BlackOutside || self.bbox.is_empty() {
+                        fill_display_run(pixels, black);
+                    } else {
+                        for (offset, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+                            pixel.copy_from_slice(&encode(
+                                self.sample_rgba(x_start + offset as i32, y),
+                            ));
+                        }
+                    }
+                };
+                if grid.is_empty() || y < overlap.min_y || y >= overlap.max_y {
+                    outside(line, display_bbox.min_x);
+                    continue;
+                }
 
+                let left = (overlap.min_x - display_bbox.min_x) as usize * 4;
+                let right = (overlap.max_x - display_bbox.min_x) as usize * 4;
+                outside(&mut line[..left], display_bbox.min_x);
+                outside(&mut line[right..], overlap.max_x);
+                let tile_row = (y.div_euclid(tile_size) - min_ty) as usize * columns;
+                let row_offset = y.rem_euclid(tile_size) as usize * TILE_STRIDE;
+                let mut lx = overlap.min_x.rem_euclid(tile_size) as usize;
+                let mut remaining = &mut line[left..right];
+                for tiles in &grid[tile_row..tile_row + columns] {
+                    let run_bytes = remaining.len().min((TILE_STRIDE - lx) * 4);
+                    let (run, rest) = remaining.split_at_mut(run_bytes);
+                    match *tiles {
+                        [
+                            DisplaySamples::Uniform(r),
+                            DisplaySamples::Uniform(g),
+                            DisplaySamples::Uniform(b),
+                            DisplaySamples::Uniform(a),
+                        ] => {
+                            fill_display_run(run, encode([r, g, b, a]));
+                        }
+                        [r, g, b, a] => {
+                            let start = row_offset + lx;
+                            let end = start + run_bytes / 4;
+                            let [r, g, b, a] =
+                                [r, g, b, a].map(|samples| samples.slice(start, end));
+                            for (i, pixel) in run.chunks_exact_mut(4).enumerate() {
+                                pixel.copy_from_slice(&encode([
+                                    r.at(i),
+                                    g.at(i),
+                                    b.at(i),
+                                    a.at(i),
+                                ]));
+                            }
+                        }
+                    }
+                    remaining = rest;
+                    lx = 0;
+                }
+            }
+        };
+        let workers = if width * height >= 512 * 512 {
+            crate::pool::worker_thread_count()
+        } else {
+            1
+        };
+        if workers > 1 {
+            let rows_per_worker = height.div_ceil(workers).max(1);
+            std::thread::scope(|scope| {
+                for (i, chunk) in out.chunks_mut(rows_per_worker * row_bytes).enumerate() {
+                    let render = &render_rows;
+                    scope.spawn(move || render(chunk, i * rows_per_worker));
+                }
+            });
+        } else {
+            render_rows(&mut out, 0);
+        }
         out
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DisplaySamples<'a> {
+    Uniform(f32),
+    Dense(&'a [f32]),
+}
+
+impl DisplaySamples<'_> {
+    fn slice(self, start: usize, end: usize) -> Self {
+        match self {
+            Self::Dense(slice) => Self::Dense(&slice[start..end]),
+            uniform => uniform,
+        }
+    }
+
+    fn at(self, index: usize) -> f32 {
+        match self {
+            Self::Uniform(value) => value,
+            Self::Dense(slice) => slice[index],
+        }
+    }
+}
+
+fn fill_display_run(run: &mut [u8], pixel: [u8; 4]) {
+    for dst in run.chunks_exact_mut(4) {
+        dst.copy_from_slice(&pixel);
     }
 }
 
@@ -571,14 +697,89 @@ pub fn extract_padded_tile(
     let start_x = origin_x.saturating_sub(apron as i32);
     let start_y = origin_y.saturating_sub(apron as i32);
 
-    let mut out = Vec::with_capacity(stride * stride);
-    for row in 0..stride {
-        let y = start_y.saturating_add(row as i32);
-        for col in 0..stride {
-            let x = start_x.saturating_add(col as i32);
-            out.push(plane.sample(x, y, bbox, edge_mode));
+    // Pre-zeroed output: `BlackOutside` pixels outside `bbox` are simply never
+    // written, so they keep the required `0.0` without any extra work.
+    let mut out = vec![0.0f32; stride * stride];
+
+    // Resolve every output column/row through `edge_mode` exactly once. Edge
+    // resolution is separable per axis, so resolving x with an in-bounds y (and
+    // vice versa) reproduces `ChannelPlane::sample` bit-for-bit while avoiding
+    // a `HashMap` lookup per pixel.
+    let inside_x = bbox.min_x <= start_x && start_x.saturating_add(stride as i32) <= bbox.max_x;
+    let inside_y = bbox.min_y <= start_y && start_y.saturating_add(stride as i32) <= bbox.max_y;
+
+    let xs: Vec<Option<i32>> = if inside_x {
+        (0..stride)
+            .map(|col| Some(start_x.saturating_add(col as i32)))
+            .collect()
+    } else {
+        (0..stride)
+            .map(|col| {
+                let x = start_x.saturating_add(col as i32);
+                edge_mode
+                    .resolve_coord(x, bbox.min_y, bbox)
+                    .map(|(resolved, _)| resolved)
+            })
+            .collect()
+    };
+    let ys: Vec<Option<i32>> = if inside_y {
+        (0..stride)
+            .map(|row| Some(start_y.saturating_add(row as i32)))
+            .collect()
+    } else {
+        (0..stride)
+            .map(|row| {
+                let y = start_y.saturating_add(row as i32);
+                edge_mode
+                    .resolve_coord(bbox.min_x, y, bbox)
+                    .map(|(_, resolved)| resolved)
+            })
+            .collect()
+    };
+
+    for (row, resolved_y) in ys.iter().enumerate() {
+        let Some(resolved_y) = *resolved_y else {
+            continue;
+        };
+        let out_row = row * stride;
+        let mut col = 0;
+        while col < stride {
+            let Some(resolved_x) = xs[col] else {
+                col += 1;
+                continue;
+            };
+
+            let (start_tile, lx, ly) = world_to_tile(resolved_x, resolved_y);
+            // Extend the run while the next column stays inside the same tile
+            // and resolves to the next contiguous world x. This copies one
+            // straight span per tile crossing instead of one pixel at a time.
+            let mut run = 1usize;
+            while col + run < stride && lx as usize + run < TILE_STRIDE {
+                match xs[col + run] {
+                    Some(next_x) if next_x == resolved_x.saturating_add(run as i32) => run += 1,
+                    _ => break,
+                }
+            }
+
+            if let Some(buffer) = plane.get(&start_tile) {
+                let dst = &mut out[out_row + col..out_row + col + run];
+                match buffer.is_uniform() {
+                    Some(value) => dst.fill(value),
+                    None => {
+                        let src = buffer
+                            .as_dense_slice()
+                            .expect("dense tile must expose its slice");
+                        let src_off = ly as usize * TILE_STRIDE + lx as usize;
+                        dst.copy_from_slice(&src[src_off..src_off + run]);
+                    }
+                }
+            }
+            // Absent tile: leave the pre-zeroed span untouched.
+
+            col += run;
         }
     }
+
     out
 }
 
@@ -730,6 +931,124 @@ mod tests {
         let clamped = extract_padded_tile(&plane, tile_at(0, 0), 1, bounds, EdgeMode::ClampToEdge);
         assert_eq!(clamped[0], 7.0, "the apron clamps onto the edge pixel");
         assert_eq!(clamped[stride * stride - 1], 7.0);
+    }
+
+    #[test]
+    fn fast_to_top_left_rgba8_with_view_matches_reference_across_transforms_and_channels() {
+        fn reference(
+            raster: &Raster2D,
+            display: BBox,
+            gain: f32,
+            gamma: f32,
+            transform: DisplayTransform,
+            solo: ViewerChannel,
+        ) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for y in (display.min_y..display.max_y).rev() {
+                for x in display.min_x..display.max_x {
+                    let [r, g, b, alpha] = raster.sample_rgba(x, y);
+                    let rgb = [r, g, b].map(|sample| {
+                        let value = sample * gain;
+                        let value = if value > 0.0 && gamma > 1e-6 {
+                            value.powf(1.0 / gamma)
+                        } else {
+                            value
+                        };
+                        to_unorm8(apply_display_transform(value, transform))
+                    });
+                    let alpha = to_unorm8(alpha);
+                    bytes.extend_from_slice(&match solo {
+                        ViewerChannel::Rgba => [rgb[0], rgb[1], rgb[2], alpha],
+                        ViewerChannel::Red => [rgb[0], rgb[0], rgb[0], 255],
+                        ViewerChannel::Green => [rgb[1], rgb[1], rgb[1], 255],
+                        ViewerChannel::Blue => [rgb[2], rgb[2], rgb[2], 255],
+                        ViewerChannel::Alpha => [alpha, alpha, alpha, 255],
+                    });
+                }
+            }
+            bytes
+        }
+
+        let display = BBox::new(-225, -140, 287, 160);
+        let bbox = BBox::new(-200, -125, 270, 151);
+        let format = Format::new("display", 512, 300, 1.0);
+        let mut raster = Raster2D::new(format, bbox, EdgeMode::BlackOutside);
+        for (c, channel) in [
+            Channel::RgbaRed,
+            Channel::RgbaGreen,
+            Channel::RgbaBlue,
+            Channel::RgbaAlpha,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut plane = ChannelPlane::new();
+            for (i, tile) in bbox.tile_coords().into_iter().enumerate() {
+                let buffer = match i {
+                    1 if c == 3 => continue, // present alpha plane but missing tile
+                    0 | 2 => TileBuffer::new_uniform(0.25 * (c + 1) as f32),
+                    _ => TileBuffer::from_vec(
+                        (0..TILE_PIXELS)
+                            .map(|pixel| {
+                                if pixel % 193 == 0 {
+                                    f32::NAN
+                                } else {
+                                    ((pixel * (c + 1) + i) % 997) as f32 / 601.0 - 0.2
+                                }
+                            })
+                            .collect(),
+                        None,
+                    )
+                    .unwrap(),
+                };
+                plane.insert(tile, Arc::new(buffer));
+            }
+            raster.insert_channel(channel, plane);
+        }
+        for has_alpha in [true, false] {
+            if !has_alpha {
+                raster.channels.shift_remove(&Channel::RgbaAlpha);
+            }
+            for (transform, gain, gamma) in [
+                (DisplayTransform::Linear, 1.0, 1.0),
+                (DisplayTransform::Srgb, 1.27, 1.7),
+                (DisplayTransform::Rec709, 0.82, 0.0),
+                (DisplayTransform::AcesTonemap, 1.8, 2.2),
+            ] {
+                for channel in [
+                    ViewerChannel::Rgba,
+                    ViewerChannel::Red,
+                    ViewerChannel::Green,
+                    ViewerChannel::Blue,
+                    ViewerChannel::Alpha,
+                ] {
+                    assert_eq!(
+                        raster
+                            .to_top_left_rgba8_with_view(display, gain, gamma, transform, channel),
+                        reference(&raster, display, gain, gamma, transform, channel),
+                        "{transform:?}, {channel:?}, alpha plane={has_alpha}",
+                    );
+                }
+            }
+        }
+
+        // Cross the parallel threshold with a height that doesn't divide
+        // evenly into worker chunks, and exercise the non-black edge fallback.
+        let large = BBox::new(-225, -270, 287, 255);
+        let (transform, channel) = (DisplayTransform::Srgb, ViewerChannel::Rgba);
+        assert_eq!(
+            raster.to_top_left_rgba8_with_view(large, 1.0, 1.0, transform, channel),
+            reference(&raster, large, 1.0, 1.0, transform, channel),
+        );
+        let edge = BBox::new(-210, -135, -190, -115);
+        for mode in [EdgeMode::ClampToEdge, EdgeMode::Mirror, EdgeMode::Bounce] {
+            raster.edge_mode = mode;
+            assert_eq!(
+                raster.to_top_left_rgba8_with_view(edge, 1.0, 1.0, transform, channel),
+                reference(&raster, edge, 1.0, 1.0, transform, channel),
+            );
+        }
+        assert!(raster.to_top_left_rgba8(BBox::new(-1, 0, -1, 1)).is_empty());
     }
 
     #[test]
@@ -894,5 +1213,100 @@ mod tests {
             ViewerChannel::Alpha,
         );
         assert_eq!(&alpha[0..4], &[128, 128, 128, 255]);
+    }
+
+    /// Reference implementation of the original per-pixel sampling loop.
+    fn naive_extract_padded_tile(
+        plane: &ChannelPlane,
+        tile: TileCoord,
+        apron: u32,
+        bbox: BBox,
+        edge_mode: EdgeMode,
+    ) -> Vec<f32> {
+        let apron = apron as usize;
+        let stride = TILE_STRIDE + 2 * apron;
+        let (origin_x, origin_y) = tile.origin_world();
+        let start_x = origin_x.saturating_sub(apron as i32);
+        let start_y = origin_y.saturating_sub(apron as i32);
+
+        let mut out = Vec::with_capacity(stride * stride);
+        for row in 0..stride {
+            let y = start_y.saturating_add(row as i32);
+            for col in 0..stride {
+                let x = start_x.saturating_add(col as i32);
+                out.push(plane.sample(x, y, bbox, edge_mode));
+            }
+        }
+        out
+    }
+
+    /// The direct-slice apron extractor must be bit-identical to the historical
+    /// per-pixel `sample` loop on interior, negative, and partial 1080p edges,
+    /// for every edge mode.
+    #[test]
+    fn fast_extract_padded_tile_matches_reference_across_partial_1080p_and_negative_edges() {
+        let format = Format::hd_1080();
+        let bbox = format.to_bbox();
+
+        // Mixed uniform/dense tiles covering the frame plus a ring outside it.
+        let mut plane = ChannelPlane::new();
+        for ty in -1..=4i32 {
+            for tx in -1..=7i32 {
+                if (tx + ty).rem_euclid(3) == 0 {
+                    let value = (tx * 3 + ty) as f32 * 0.25;
+                    plane.insert(tile_at(tx, ty), Arc::new(TileBuffer::new_uniform(value)));
+                } else {
+                    let mut data = vec![0.0f32; TILE_PIXELS];
+                    for (index, value) in data.iter_mut().enumerate() {
+                        *value =
+                            ((tx * 131 + ty * 71 + index as i32).rem_euclid(251)) as f32 / 251.0;
+                    }
+                    plane.insert(
+                        tile_at(tx, ty),
+                        Arc::new(TileBuffer::from_vec(data, None).unwrap()),
+                    );
+                }
+            }
+        }
+
+        // Interior, negative, right edge (partial), top edge (partial), corner.
+        let cases = [(3, 2), (-1, 0), (7, 4), (0, 4), (-1, -1), (7, 0), (0, -1)];
+        let modes = [
+            EdgeMode::BlackOutside,
+            EdgeMode::ClampToEdge,
+            EdgeMode::Mirror,
+            EdgeMode::Bounce,
+        ];
+
+        for &(tx, ty) in &cases {
+            for apron in [0u32, 4, 12] {
+                for edge_mode in modes {
+                    let fast = extract_padded_tile(&plane, tile_at(tx, ty), apron, bbox, edge_mode);
+                    let naive =
+                        naive_extract_padded_tile(&plane, tile_at(tx, ty), apron, bbox, edge_mode);
+                    assert_eq!(
+                        fast.len(),
+                        naive.len(),
+                        "length mismatch at ({tx}, {ty}) apron {apron}"
+                    );
+                    for (index, (fast_value, naive_value)) in
+                        fast.iter().zip(naive.iter()).enumerate()
+                    {
+                        assert_eq!(
+                            fast_value, naive_value,
+                            "tile ({tx}, {ty}) apron {apron} {edge_mode:?} at index {index}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // An empty bbox must resolve every sample to 0.0 in both paths.
+        let empty = BBox::new(10, 10, 10, 10);
+        for edge_mode in modes {
+            let fast = extract_padded_tile(&plane, tile_at(3, 2), 4, empty, edge_mode);
+            let naive = naive_extract_padded_tile(&plane, tile_at(3, 2), 4, empty, edge_mode);
+            assert_eq!(fast, naive, "empty bbox mismatch under {edge_mode:?}");
+        }
     }
 }
