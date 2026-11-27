@@ -105,6 +105,18 @@ Real 1–2 GiB auto-scaled GUI `MemoryGovernor` cap; cooperative `Dag` cache evi
 **Milestone 27: Full-Res-Safe Viewer Proxy & Remaining Cleanup** — COMPLETE (v0.6.5)
 `1:1` / `1:2` / `1:4` Viewer Proxy (`ProxyScale`, `Ctrl+P`, amber `PROXY` badge, full-res logical handles & full-res `Write` lock); direct-slice + parallel `to_top_left_rgba8_with_view`; layout-only `MoveNode` render skip & `Arc<Packet>` upload dedupe; surgical downstream cache invalidation on `AddNode`/`ConnectEdge`/`Batch`; `1920×1080` knob fix across `Constant`/`CheckerBoard2`/`Ramp`/`Reformat`/`Crop`; `CornerPin2D` upstream format inheritance + `[Set to Input]`; top-bar `1280px` fit + bottom-dock export pill; unused `RamCache` removal; `Cargo.toml` repo URL fix; `LICENSE-MIT`/`LICENSE-APACHE`, `deny.toml`, `.github/workflows/ci.yml`; plain-English `README.md` rewrite.
 
+# TANOVA ROADMAP - PHASE 9 (v0.7.0): MASKING, KEYING & ERROR UX
+*AI DIRECTIVE: Execute one milestone at a time. Do not skip or combine milestones.*
+
+**Milestone 28: Shared Viewer Overlay Module, `Ramp` Handles & Node Error UX** (this milestone)
+A shared, extensible Viewer overlay module (`tanova-ui/src/overlay.rs`) so every 2D handle — `Transform` jack, `CornerPin2D` corners, and new `Ramp` endpoints — lives in one input path. `OverlayViewport` reproduces the Viewer coordinate helpers proxy-safely so all handles write full-resolution logical coordinates even at 1:2/1:4 proxy. `emit_2d_knob_command` preserves the untouched alpha channels (`[x, y, prev[2], prev[3]]`) and auto-keys via `Batch([SetKnob, SetKnobCurve])` when the knob has an active curve. `OverlayState` with `is_dragging()` and `OverlayResponse { consumed_pointer, commands }`; per-kind handlers for `Transform` (exact red X/green Y/crosshair/dashed box/smooth drag), `CornerPin2D` (orange quad + numbered handles clamped to `[-fw..=2*fw, -fh..=2*fh]`, auto-key) and `Ramp` (`p0`/`p1` from effective `KnobValue::Color`, `Color32::from_rgb(100,200,255)` line 1.5px, 7.0px `"P0"`/`"P1"` handles highlighted on hover/drag, full-res logical coords, suppress pan, `request_repaint`). `ViewerPanel::show` signature and `is_dragging_overlay()` stay 100% backward-compatible; the overlay runs strictly before pan/drag handling. Exact-origin node error reporting: `NodeErrorInfo { node, message, crashed }` and `KernelEvent::NodeErrors(Vec<NodeErrorInfo>)` emitted on every `render_viewer()` pass (empty vec clears), reporting the failing origin node (e.g. `Read #4` → `NodeId(4)`, never the Viewer `NodeId(3)`). `GraphMirror::node_errors` updated on `NodeErrors`, pruned on `RemoveNode`, cleared on `clear()`/`NewScript`/`ReplaceDag`; canvas draws a 2.0px `Color32::from_rgb(235,75,70)` border plus `"CRASH"`/`"ERR"` pill, and the `Order::Tooltip` hover area shows the truncated error reason. `ViewerPanel::active_error` paints a non-blocking dark-red banner pinned to the top interior edge of the Viewer viewport.
+
+**Milestone 29: Extensible Node Data Model & Interactive `Roto`**
+Extensible per-node data model; interactive `Roto` shape drawing with Viewer overlay handles.
+
+**Milestone 30: `ChromaKey`**
+`ChromaKey` cartridge with screen color selection, spill suppression, and Viewer integration.
+
 ## Release & Tagging Policy
 
 - Every milestone/version tag must first record all Added, Changed, and Fixed items in `CHANGELOG.md`.

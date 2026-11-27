@@ -511,11 +511,17 @@ pub enum KernelEvent {
         message: String,
     },
     /// The dirty-state flag flipped; `is_dirty` reflects `UndoStack::is_dirty()`.
-    DirtyStateChanged { is_dirty: bool },
+    DirtyStateChanged {
+        is_dirty: bool,
+    },
     /// A script was saved successfully to `path`.
-    ScriptSaved { path: std::path::PathBuf },
+    ScriptSaved {
+        path: std::path::PathBuf,
+    },
     /// A script save or load failed.
-    ScriptError { message: String },
+    ScriptError {
+        message: String,
+    },
     /// A `Write` node rendered one frame to disk.
     WriteFrameRendered {
         /// Node being written.
@@ -548,6 +554,7 @@ pub enum KernelEvent {
     },
     /// Per-node evaluation timing samples from the last completed frame.
     PerfSnapshot(Vec<NodePerfSample>),
+    NodeErrors(Vec<NodeErrorInfo>),
 }
 
 /// One per-node evaluation timing sample from a single `evaluate_pull`
@@ -561,6 +568,21 @@ pub struct NodePerfSample {
     pub eval_us: u64,
     /// `true` when the result came from the DAG cache.
     pub from_cache: bool,
+}
+
+/// Exact failure report for one node during a viewer render pass.
+///
+/// `node` is the failing origin — never a downstream consumer — so the UI can
+/// paint `"ERR"`/`"CRASH"` on the right card.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeErrorInfo {
+    /// The failing node.
+    pub node: NodeId,
+    /// Human-readable error message.
+    pub message: String,
+    /// `true` when the node panicked (airbag caught) rather than returning a
+    /// plain `NodeError`.
+    pub crashed: bool,
 }
 
 /// Metadata for a rendered frame delivered off-screen to the UI.
@@ -1720,6 +1742,24 @@ impl RenderOutcome {
     }
 }
 
+/// Makes a node error message safe to paint in the UI: one line of printable
+/// ASCII. Control characters become spaces and non-ASCII characters become `?`
+/// so the canvas tooltip and Viewer banner can never split a UTF-8 boundary.
+fn sanitize_error_message(message: &str) -> String {
+    message
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 /// Evaluates the viewer and yields the notification the UI should receive.
 ///
 /// Every dead end clears the viewer instead of leaving stale pixels behind:
@@ -1752,10 +1792,12 @@ fn render_viewer(
     }
 
     let current_epoch = epoch.bump();
-    match dag.evaluate_pull(target, context, governor, epoch, current_epoch) {
+    match dag.evaluate_pull_with_origin(target, context, governor, epoch, current_epoch) {
         Ok(packet) if !packet.is_empty() => {
             *displayed_target = Some(target);
             let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
+            // A clean render clears any stale error badge.
+            let _ = events.send(KernelEvent::NodeErrors(Vec::new()));
             let mut frame = FrameNotification::frame(target, current_epoch, packet);
             frame.proxy_scale = context.proxy_scale();
             RenderOutcome::Frame(frame)
@@ -1766,37 +1808,50 @@ fn render_viewer(
             // metadata-only packet.
             *displayed_target = None;
             let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
+            let _ = events.send(KernelEvent::NodeErrors(Vec::new()));
             RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
         // Preemption is not a failure: the artist moved the timeline or a knob
         // while this render ran. Keep the last good image on screen and let
         // the caller retry with the newest state -- clearing here would blank
         // the viewer on every mid-drag preemption.
-        Err(NodeError::Preempted) => {
+        Err((_, NodeError::Preempted)) => {
             // A mid-drag preemption can happen many times per second; drain the
             // partial samples so the buffer cannot grow without bound. The
             // mirror merges them, so no earlier bar is lost.
             let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
+            let _ = events.send(KernelEvent::NodeErrors(Vec::new()));
             RenderOutcome::Preempted
         }
-        Err(NodeError::Panic(message)) => {
+        Err((origin, NodeError::Panic(message))) => {
             *displayed_target = None;
             let _ = events.send(KernelEvent::NodeCrashed {
-                node: target,
-                message,
+                node: origin,
+                message: message.clone(),
             });
             // Keep the timings of every node that did evaluate before the
             // crash so the canvas still shows honest bars.
             let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
+            let _ = events.send(KernelEvent::NodeErrors(vec![NodeErrorInfo {
+                node: origin,
+                message: sanitize_error_message(&message),
+                crashed: true,
+            }]));
             RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
-        Err(_) => {
+        Err((origin, error)) => {
             // Missing inputs and memory pressure are normal during interactive
             // editing. Clear the image; the next change retries. Emit the
             // partial timings so startup bars appear even when the very first
-            // render cannot complete.
+            // render cannot complete. Report the exact failing origin node,
+            // not the viewer target.
             *displayed_target = None;
             let _ = events.send(KernelEvent::PerfSnapshot(dag.take_perf_samples()));
+            let _ = events.send(KernelEvent::NodeErrors(vec![NodeErrorInfo {
+                node: origin,
+                message: sanitize_error_message(&error.to_string()),
+                crashed: false,
+            }]));
             RenderOutcome::Frame(FrameNotification::cleared(Some(target), current_epoch))
         }
     }
@@ -2081,7 +2136,8 @@ mod tests {
                 | KernelEvent::ScriptSaved { .. }
                 | KernelEvent::ScriptError { .. }
                 | KernelEvent::MemoryStats { .. }
-                | KernelEvent::PerfSnapshot(_) => continue,
+                | KernelEvent::PerfSnapshot(_)
+                | KernelEvent::NodeErrors(_) => continue,
                 _ => return event,
             }
         }

@@ -14,7 +14,8 @@ pub mod types;
 
 pub use bus::{
     ExternalCachePurger, FrameExporter, FrameNotification, KernelEvent, KernelHandle,
-    KernelMessage, NodeId, NodePerfSample, PortId, UndoStack, UndoableCommand, atomic_write_string,
+    KernelMessage, NodeErrorInfo, NodeId, NodePerfSample, PortId, UndoStack, UndoableCommand,
+    atomic_write_string,
 };
 pub use command::{EdgeSnapshot, NodeSnapshot};
 pub use dag::{Dag, DagNode, Edge, OpHash, TANOVA_SCHEMA_VERSION};
@@ -58,7 +59,8 @@ mod tests {
                 | KernelEvent::ScriptSaved { .. }
                 | KernelEvent::ScriptError { .. }
                 | KernelEvent::MemoryStats { .. }
-                | KernelEvent::PerfSnapshot(_) => continue,
+                | KernelEvent::PerfSnapshot(_)
+                | KernelEvent::NodeErrors(_) => continue,
                 _ => return event,
             }
         }

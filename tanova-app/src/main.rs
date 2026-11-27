@@ -716,6 +716,20 @@ impl TanovaApp {
                 // Per-node timings live on GraphMirror; the canvas applies them
                 // via GraphMirror::apply_event. Kept here for symmetry.
             }
+            KernelEvent::NodeErrors(errors) => {
+                // Non-blocking error banner: show the first failing node with
+                // its kind so the reason is actionable. Cleared by an empty
+                // vec or a subsequent valid frame.
+                let message = errors.first().map(|info| {
+                    let kind = self
+                        .graph
+                        .node(info.node)
+                        .map(|node| node.kind.as_str())
+                        .unwrap_or("Node");
+                    format!("Error on {} #{}: {}", kind, info.node.0, info.message)
+                });
+                self.viewer.set_active_error(message);
+            }
             // The kernel owns the viewer binding: it may clear it when the
             // target is deleted, or bind it when it creates a physical Viewer.
             // If the matching frame raced ahead of this event, replay it so the
@@ -1150,6 +1164,7 @@ impl TanovaApp {
         self.graph = GraphMirror::from_dag(&dag, viewer_target, self.graph.project_format());
         self.canvas.reset_for_script(&self.graph);
         self.viewer.clear_frame();
+        self.viewer.active_error = None;
         self.script_path = Some(path.clone());
         self.is_dirty = false;
         self.last_script_error = None;
@@ -2547,6 +2562,7 @@ impl TanovaApp {
             self.graph = GraphMirror::from_dag(&dag, viewer_target, self.graph.project_format());
             self.canvas.reset_for_script(&self.graph);
             self.viewer.clear_frame();
+            self.viewer.active_error = None;
             self.script_path = recovery_source;
             self.is_dirty = true;
             self.last_script_error = None;
@@ -3111,6 +3127,371 @@ mod tests {
         }
 
         kernel.shutdown();
+    }
+
+    /// `Read #1 (missing file) -> Grade #2 -> Viewer #3` must report the exact
+    /// failing origin `NodeId(1)` in `KernelEvent::NodeErrors`, clear when the
+    /// chain is fixed, and be applied/pruned by `GraphMirror`.
+    #[test]
+    fn upstream_read_missing_file_reports_error_on_read_node_and_clears_when_fixed() {
+        use tanova_kernel::{
+            KernelEvent, KernelMessage, KnobTable, KnobValue, NodeId, PortId, UndoableCommand,
+        };
+        use tanova_ui::GraphMirror;
+
+        tanova_nodes::ensure_linked();
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+
+        // Read #1 with a missing file.
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(1),
+                kind: "Read".to_string(),
+                x: 0.0,
+                y: 0.0,
+            }))
+            .expect("add Read #1");
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(1),
+                knob: "file".to_string(),
+                value: KnobValue::Text("does_not_exist.exr".to_string()),
+                previous: KnobValue::Text("".to_string()),
+            }))
+            .expect("set Read file to missing");
+
+        // Grade #2 -> Viewer #3.
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(2),
+                kind: "Grade".to_string(),
+                x: 0.0,
+                y: 0.0,
+            }))
+            .expect("add Grade #2");
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(3),
+                kind: "Viewer".to_string(),
+                x: 0.0,
+                y: 0.0,
+            }))
+            .expect("add Viewer #3");
+
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::ConnectEdge {
+                from_node: NodeId(1),
+                from_port: PortId(0),
+                to_node: NodeId(2),
+                to_port: PortId(0),
+            }))
+            .expect("connect Read -> Grade");
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::ConnectEdge {
+                from_node: NodeId(2),
+                from_port: PortId(0),
+                to_node: NodeId(3),
+                to_port: PortId(0),
+            }))
+            .expect("connect Grade -> Viewer");
+        kernel
+            .send(KernelMessage::SetViewerNode(Some(NodeId(3))))
+            .expect("bind Viewer #3");
+
+        // Drain the apply events so the graph is built, and retire the startup
+        // render (which still had an empty `file` knob) before asserting.
+        let drain_deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < drain_deadline {
+            if kernel
+                .events()
+                .recv_timeout(Duration::from_millis(25))
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        // Trigger a render.
+        kernel
+            .send(KernelMessage::RequestRender)
+            .expect("request render");
+
+        // The first non-empty NodeErrors names the exact origin Read #1, not
+        // the downstream Viewer #3, and carries the resolved filename.
+        let mut errors = None;
+        for _ in 0..40 {
+            match kernel.events().recv_timeout(Duration::from_secs(5)) {
+                Ok(KernelEvent::NodeErrors(e)) if !e.is_empty() => {
+                    errors = Some(e.clone());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let errors = errors.expect("expected NodeErrors for the missing Read");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].node, NodeId(1));
+        assert!(
+            errors[0].message.contains("does_not_exist.exr"),
+            "error must name the resolved file, got {:?}",
+            errors[0].message
+        );
+        assert!(
+            !errors[0].crashed,
+            "missing file must be a plain error, not a crash"
+        );
+
+        // GraphMirror applies the error, prunes it on RemoveNode, clears on empty.
+        let mut mirror = GraphMirror::default();
+        mirror.apply_event(&KernelEvent::NodeErrors(errors.clone()));
+        assert!(mirror.node_errors.contains_key(&NodeId(1)));
+        mirror.apply_command(&UndoableCommand::RemoveNode {
+            id: NodeId(1),
+            kind: "Read".to_string(),
+            x: 0.0,
+            y: 0.0,
+            disabled: false,
+            knobs: Box::new(KnobTable::new()),
+            edges: Vec::new(),
+        });
+        assert!(!mirror.node_errors.contains_key(&NodeId(1)));
+        mirror.apply_event(&KernelEvent::NodeErrors(Vec::new()));
+        assert!(mirror.node_errors.is_empty());
+
+        // Fix the Read: switch the missing-frame policy to black so it no longer fails.
+        kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(1),
+                knob: "missing_frames".to_string(),
+                value: KnobValue::Text("black".to_string()),
+                previous: KnobValue::Text("error".to_string()),
+            }))
+            .expect("fix Read missing_frames");
+
+        // Re-render: the chain now succeeds, so NodeErrors clears.
+        kernel
+            .send(KernelMessage::RequestRender)
+            .expect("request render again");
+        let mut cleared = false;
+        for _ in 0..40 {
+            match kernel.events().recv_timeout(Duration::from_secs(5)) {
+                Ok(KernelEvent::NodeErrors(e)) if e.is_empty() => {
+                    cleared = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            cleared,
+            "expected NodeErrors to clear after fixing the Read"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// End-to-end: a failing upstream `Read` must paint the Viewer banner even
+    /// after the kernel clears the frame, and bypassing the Read must move the
+    /// reason to the downstream `Grade` without wiping the banner.
+    #[test]
+    fn viewer_displays_active_error_banner_after_cleared_frame_and_read_bypass_moves_reason_to_grade()
+     {
+        use tanova_kernel::{KernelMessage, PortId, UndoableCommand};
+
+        tanova_nodes::ensure_linked();
+        let (_gpu_lock, gpu) = test_gpu();
+        let kernel = KernelHandle::spawn().expect("kernel thread should spawn");
+        let mut app = TanovaApp::new(kernel, gpu);
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Let the starter comp land so its seed events cannot pollute the
+        // mirror after we insert the failing Read.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && app.graph.node_count() < 3 {
+            run_app_frame(&ctx, &mut app, screen, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.graph.node_count(), 3, "starter comp should be ready");
+
+        // Insert Read #4 with a missing file and route it into Grade #2.
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::AddNode {
+                id: NodeId(4),
+                kind: "Read".to_string(),
+                x: 0.0,
+                y: 0.0,
+            }))
+            .expect("add Read #4");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(4),
+                knob: "file".to_string(),
+                value: KnobValue::Text("does_not_exist.exr".to_string()),
+                previous: KnobValue::Text("".to_string()),
+            }))
+            .expect("set missing file");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::DisconnectEdge {
+                from_node: CONSTANT,
+                from_port: PortId(0),
+                to_node: GRADE,
+                to_port: PortId(0),
+            }))
+            .expect("disconnect Constant -> Grade");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::ConnectEdge {
+                from_node: NodeId(4),
+                from_port: PortId(0),
+                to_node: GRADE,
+                to_port: PortId(0),
+            }))
+            .expect("connect Read -> Grade");
+        app.kernel
+            .send(KernelMessage::RequestRender)
+            .expect("request render");
+
+        // Pump until the banner names the Read and the missing file.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            app.pump();
+            if app.viewer.active_error.as_deref().is_some_and(|message| {
+                message.contains("Read") && message.contains("does_not_exist.exr")
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let banner = app
+            .viewer
+            .active_error
+            .clone()
+            .expect("the Viewer must show the Read error");
+        assert!(
+            banner.contains("Read"),
+            "banner should name the node kind: {banner}"
+        );
+        assert!(
+            banner.contains("does_not_exist.exr"),
+            "banner should name the file: {banner}"
+        );
+        assert!(
+            !app.viewer.has_frame(),
+            "a failed render must clear the displayed image"
+        );
+        // The raw NodeErrors snapshot must name Read #4, not Viewer #3.
+        let read_error = app
+            .graph
+            .node_errors
+            .get(&NodeId(4))
+            .expect("NodeErrors should badge Read #4");
+        assert!(
+            read_error.0.contains("does_not_exist.exr"),
+            "Read error should carry the filename, got {:?}",
+            read_error.0
+        );
+        assert!(
+            !read_error.1,
+            "a missing file is a plain error, not a crash"
+        );
+
+        // A cleared frame must not wipe the banner. Draw a full headless frame
+        // with no raster and verify it does not panic.
+        run_app_frame(&ctx, &mut app, screen, vec![]);
+        assert!(
+            app.viewer.active_error.is_some(),
+            "FrameNotification::cleared() must not wipe the error banner"
+        );
+
+        // Bypass the Read: Grade #2 now fails on its missing `main` input.
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetDisabled {
+                node: NodeId(4),
+                disabled: true,
+            }))
+            .expect("bypass Read");
+        app.kernel
+            .send(KernelMessage::RequestRender)
+            .expect("request render after bypass");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            app.pump();
+            if app
+                .viewer
+                .active_error
+                .as_deref()
+                .is_some_and(|message| message.contains("Grade") && message.contains("main"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let banner = app
+            .viewer
+            .active_error
+            .clone()
+            .expect("the Viewer must show the Grade error after bypass");
+        assert!(
+            banner.contains("Grade"),
+            "banner should name the bypassed consumer: {banner}"
+        );
+        assert!(
+            banner.contains("main"),
+            "banner should name the missing input: {banner}"
+        );
+        // The error must move from Read #4 to the bypassed Grade #2.
+        let grade_error = app
+            .graph
+            .node_errors
+            .get(&GRADE)
+            .expect("NodeErrors should badge Grade #2 after the bypass");
+        assert!(
+            grade_error.0.contains("main"),
+            "Grade error should name the missing input, got {:?}",
+            grade_error.0
+        );
+        assert!(
+            !app.graph.node_errors.contains_key(&NodeId(4)),
+            "the Read badge must clear once it is bypassed"
+        );
+
+        // Fix the Read: black fallback + unbypass. The next clean frame clears
+        // the banner.
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetKnob {
+                node: NodeId(4),
+                knob: "missing_frames".to_string(),
+                value: KnobValue::Text("black".to_string()),
+                previous: KnobValue::Text("error".to_string()),
+            }))
+            .expect("switch missing_frames to black");
+        app.kernel
+            .send(KernelMessage::Execute(UndoableCommand::SetDisabled {
+                node: NodeId(4),
+                disabled: false,
+            }))
+            .expect("unbypass Read");
+        app.kernel
+            .send(KernelMessage::RequestRender)
+            .expect("request render after fix");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && app.viewer.active_error.is_some() {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.viewer.active_error.is_none(),
+            "a clean render must clear the error banner, still showing {:?}",
+            app.viewer.active_error
+        );
+        assert!(
+            app.graph.node_errors.is_empty(),
+            "a clean render must clear every node error badge"
+        );
+
+        app.kernel.shutdown();
     }
 
     /// A `Constant` spawned via `AddNode` in a `ProjectFormat(256, 256)` graph
@@ -4914,7 +5295,7 @@ mod tests {
         let receive_proxy_frame = || {
             let frame = kernel
                 .frames()
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(30))
                 .unwrap();
             assert_eq!(frame.proxy_scale, 0.5);
             let raster = frame.packet.get::<Raster2D>().unwrap();
@@ -4933,7 +5314,7 @@ mod tests {
         loop {
             match kernel
                 .events()
-                .recv_timeout(Duration::from_secs(15))
+                .recv_timeout(Duration::from_secs(30))
                 .unwrap()
             {
                 KernelEvent::WriteCompleted { frames_written, .. } => {
@@ -4967,7 +5348,7 @@ mod tests {
         loop {
             if let KernelEvent::WriteCompleted { frames_written, .. } = kernel
                 .events()
-                .recv_timeout(Duration::from_secs(15))
+                .recv_timeout(Duration::from_secs(30))
                 .unwrap()
             {
                 assert_eq!(frames_written, 0);

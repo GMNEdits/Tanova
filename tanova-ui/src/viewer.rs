@@ -7,35 +7,34 @@
 use std::sync::Arc;
 
 use egui::{
-    Align, Align2, Color32, ColorImage, FontId, Key, Layout, Modifiers, PointerButton, Pos2, Rect,
-    Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
+    Align, Align2, Color32, ColorImage, FontId, Key, Layout, Modifiers, Pos2, Rect, Sense, Shape,
+    Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
 };
-use tanova_kernel::{
-    FrameNotification, KernelMessage, KnobValue, NodeId, Packet, ProxyScale, UndoableCommand,
-};
-use tanova_render::{BBox, DisplayTransform, Mat3x3, Raster2D, ViewerChannel};
+#[allow(unused_imports)]
+use tanova_kernel::KnobValue;
+use tanova_kernel::{FrameNotification, KernelMessage, NodeErrorInfo, NodeId, Packet, ProxyScale};
+use tanova_render::{BBox, DisplayTransform, Raster2D, ViewerChannel};
 
-use crate::canvas::GraphMirror;
-use crate::properties::{effective_knob_value, set_curve_values};
+use crate::canvas::{CanvasNode, GraphMirror};
+#[cfg(test)]
+use crate::overlay::jack_hit;
+pub use crate::overlay::{AxisConstraint, JackDragState, forward_transform_matrix};
+use crate::overlay::{OverlayResponse, OverlayState, OverlayViewport, draw_dashed_rect};
+
+#[cfg(test)]
+use egui::PointerButton;
+#[cfg(test)]
+use tanova_kernel::UndoableCommand;
 
 const VIEWER_BG: Color32 = Color32::from_rgb(14, 14, 17);
 const CHECKER_DARK: Color32 = Color32::from_rgb(26, 26, 30);
 const CHECKER_LIGHT: Color32 = Color32::from_rgb(34, 34, 40);
 const FORMAT_LINE: Color32 = Color32::from_rgb(150, 150, 165);
-const BBOX_LINE: Color32 = Color32::from_rgb(110, 200, 255);
 const HUD_BG: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 190);
 const VIEWER: Color32 = Color32::from_rgb(255, 190, 40);
-const JACK: Color32 = Color32::from_rgb(255, 214, 92);
-const JACK_HOVER: Color32 = Color32::from_rgb(255, 238, 170);
 
 const MIN_ZOOM: f32 = 0.02;
 const MAX_ZOOM: f32 = 64.0;
-const JACK_RADIUS: f32 = 8.0;
-const JACK_HIT_RADIUS: f32 = 18.0;
-const JACK_ARROW_LENGTH: f32 = 45.0;
-const JACK_SHAFT_HIT_RADIUS: f32 = 8.0;
-const JACK_X_COLOR: Color32 = Color32::from_rgb(232, 72, 72);
-const JACK_Y_COLOR: Color32 = Color32::from_rgb(84, 210, 96);
 /// Gold tick marks for keyframes on the timeline rail.
 const KEYFRAME_TICK: Color32 = Color32::from_rgb(255, 200, 50);
 /// Recessed timeline scrubber track fill.
@@ -46,29 +45,6 @@ const TRACK_BORDER: Color32 = Color32::from_rgb(55, 60, 70);
 const RULER_TICK: Color32 = Color32::from_rgb(75, 82, 95);
 /// High-contrast playhead line and cap.
 const PLAYHEAD_COLOR: Color32 = Color32::from_rgb(245, 135, 35);
-
-/// Restricts a jack drag to one Nuke axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AxisConstraint {
-    /// Only horizontal image-space movement.
-    X,
-    /// Only vertical image-space movement.
-    Y,
-}
-
-/// In-flight transform jack drag.
-///
-/// The accumulated translation lives here so the handle and bounding box keep
-/// moving even before the kernel round-trips a new `GraphMirror`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct JackDragState {
-    /// Transform node being dragged.
-    pub node_id: NodeId,
-    /// Accumulated `[translate_x, translate_y]` in image pixels.
-    pub current_translate: [f32; 2],
-    /// `None` for free 2D movement, otherwise a single axis.
-    pub axis_constraint: Option<AxisConstraint>,
-}
 
 /// Height reserved at the bottom of the viewer for the timeline strip.
 pub const TIMELINE_HEIGHT: f32 = 32.0;
@@ -94,6 +70,8 @@ pub struct ViewerPanel {
     pub frame_proxy_scale: f32,
     /// Playhead used to evaluate overlay knobs and auto-key animated edits.
     pub current_frame: f64,
+    /// Non-blocking error banner text for the current render pass.
+    pub active_error: Option<String>,
     last_packet: Option<Arc<Packet>>,
     texture: Option<TextureHandle>,
     dirty: bool,
@@ -103,11 +81,8 @@ pub struct ViewerPanel {
     /// Deduplicates scrub/playback messages so a 60 Hz UI does not queue
     /// duplicate renders for a frame the kernel already has.
     last_sent_frame: Option<i64>,
-    /// In-flight transform jack drag, if any.
-    jack_drag: Option<JackDragState>,
-    /// In-flight corner-pin handle drag: `(node_id, corner_index)`.
-    dragging_corner: Option<(NodeId, usize)>,
-    corner_drag_value: Option<[f32; 2]>,
+    /// Shared 2D overlay drag state (Transform, CornerPin2D, Ramp).
+    overlay: OverlayState,
     #[cfg(test)]
     image_rect_for_test: Option<Rect>,
 }
@@ -125,14 +100,13 @@ impl Default for ViewerPanel {
             proxy_scale: 1.0,
             frame_proxy_scale: 1.0,
             current_frame: 1.0,
+            active_error: None,
             last_packet: None,
             texture: None,
             dirty: true,
             uploaded_view: None,
             last_sent_frame: None,
-            jack_drag: None,
-            dragging_corner: None,
-            corner_drag_value: None,
+            overlay: OverlayState::default(),
             #[cfg(test)]
             image_rect_for_test: None,
         }
@@ -194,9 +168,26 @@ impl ViewerPanel {
         self.viewer_node
     }
 
-    /// `true` while a CornerPin2D corner handle is being dragged on the Viewer.
+    /// `true` while any Viewer overlay handle is being dragged.
     pub fn is_dragging_overlay(&self) -> bool {
-        self.dragging_corner.is_some()
+        self.overlay.is_dragging()
+    }
+
+    /// Replaces the non-blocking error banner from one kernel render pass.
+    ///
+    /// An empty slice clears it; the banner shows the first failing node.
+    pub fn set_node_errors(&mut self, errors: &[NodeErrorInfo]) {
+        self.active_error = errors
+            .first()
+            .map(|error| format!("#{} | {}", error.node.0, error.message));
+    }
+
+    /// Sets or clears the non-blocking error banner text.
+    ///
+    /// The app formats this with the failing node's kind and id so the banner
+    /// reads like `Error on Read #4: File not found: plate.0001.exr`.
+    pub fn set_active_error(&mut self, message: Option<String>) {
+        self.active_error = message;
     }
 
     /// Binds the viewer to a node (or clears it).
@@ -210,6 +201,8 @@ impl ViewerPanel {
         self.viewer_node = node;
         self.clear_frame();
         self.dirty = true;
+        // A new target (or clearing the target) retires the stale error banner.
+        self.active_error = None;
     }
 
     /// Accepts a frame from the kernel, ignoring frames for other targets.
@@ -224,6 +217,8 @@ impl ViewerPanel {
             self.clear_frame();
             return;
         }
+        // A displayable frame proves the current chain rendered cleanly.
+        self.active_error = None;
         let scale = ProxyScale::sanitized(frame.proxy_scale);
         let same_image = self
             .last_packet
@@ -247,8 +242,7 @@ impl ViewerPanel {
         self.frame_proxy_scale = 1.0;
         self.texture = None;
         self.uploaded_view = None;
-        self.reset_jack_drag();
-        self.reset_corner_drag();
+        self.overlay.reset();
         if had_content {
             self.dirty = true;
         }
@@ -330,19 +324,34 @@ impl ViewerPanel {
 
         let frame = self.last_packet.clone();
         let Some(raster) = frame.as_ref().and_then(|packet| packet.get::<Raster2D>()) else {
-            self.reset_jack_drag();
-            self.reset_corner_drag();
+            self.overlay.reset();
             self.handle_navigation(ui, &response);
-            painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                match self.viewer_node {
-                    Some(node) => format!("Waiting for a frame from #{}", node.0),
-                    None => "No viewer target: select a node and press 1".to_string(),
-                },
-                FontId::proportional(13.0),
-                Color32::from_rgb(130, 130, 140),
-            );
+            if self.active_error.is_some() {
+                // The render failed, so "Waiting for a frame" is misleading:
+                // point the artist at the banner instead.
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Render stopped - see error banner above".to_string(),
+                    FontId::proportional(13.0),
+                    Color32::from_rgb(130, 130, 140),
+                );
+            } else {
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    match self.viewer_node {
+                        Some(node) => format!("Waiting for a frame from #{}", node.0),
+                        None => "No viewer target: select a node and press 1".to_string(),
+                    },
+                    FontId::proportional(13.0),
+                    Color32::from_rgb(130, 130, 140),
+                );
+            }
+            // The banner must paint even when there is no raster: a failed
+            // render clears the frame, and this is the only place the reason
+            // can reach the artist.
+            self.draw_error_banner(ui, &painter, rect);
             return messages;
         };
 
@@ -352,21 +361,6 @@ impl ViewerPanel {
         }
 
         let format = self.logical_format(raster);
-        // Capture primary presses before navigation, using the same fitted
-        // image rect that both the HUD and the overlay will draw against.
-        let was_dragging_corner = self.is_dragging_overlay();
-        let corner_messages = self.handle_corner_pin_input(
-            ui,
-            &response,
-            self.image_rect(rect, raster),
-            format,
-            graph,
-            selected,
-        );
-        if !was_dragging_corner && !self.is_dragging_overlay() && corner_messages.is_empty() {
-            self.handle_navigation(ui, &response);
-        }
-        messages.extend(corner_messages);
         let image_rect = self.image_rect(rect, raster);
         #[cfg(test)]
         {
@@ -402,16 +396,35 @@ impl ViewerPanel {
         let pixel_format = raster.format.to_bbox();
         if !transform_selected && raster.bbox != pixel_format {
             let bbox_rect = self.world_to_screen(image_rect, pixel_format, raster.bbox);
-            draw_dashed_rect(&painter, bbox_rect, Stroke::new(1.0, BBOX_LINE));
+            draw_dashed_rect(
+                &painter,
+                bbox_rect,
+                Stroke::new(1.0, crate::overlay::BBOX_LINE),
+            );
         }
 
         self.draw_hud(ui, &painter, rect, image_rect, format, raster);
-        messages.extend(
-            self.draw_transform_overlay(
-                ui, &painter, &response, image_rect, format, graph, selected,
-            ),
+
+        // Every 2D handle shares one input pass. It must run before the
+        // pan/zoom navigation so a live handle owns the pointer.
+        let viewport = OverlayViewport::new(
+            image_rect,
+            format.width() as f32,
+            format.height() as f32,
+            self.current_frame,
         );
-        self.draw_corner_pin_overlay(ui, &painter, image_rect, format, graph, selected);
+        let OverlayResponse {
+            consumed_pointer,
+            commands,
+        } = self
+            .overlay
+            .show_and_handle(ui, &painter, &response, viewport, graph, selected);
+        if !consumed_pointer {
+            self.handle_navigation(ui, &response);
+        }
+        messages.extend(commands.into_iter().map(KernelMessage::Execute));
+
+        self.draw_error_banner(ui, &painter, rect);
         messages
     }
 
@@ -783,6 +796,7 @@ impl ViewerPanel {
     }
 
     /// Maps one Bottom-Left world point into the displayed image rect.
+    #[allow(dead_code)]
     fn world_to_screen_point(&self, image_rect: Rect, format: BBox, x: f32, y: f32) -> Pos2 {
         let width = format.width().max(1) as f32;
         let height = format.height().max(1) as f32;
@@ -796,6 +810,7 @@ impl ViewerPanel {
     }
 
     /// Converts a screen-space drag delta back into world units.
+    #[allow(dead_code)]
     fn screen_delta_to_world(&self, image_rect: Rect, format: BBox, delta: Vec2) -> Vec2 {
         let width = format.width().max(1) as f32;
         let height = format.height().max(1) as f32;
@@ -814,352 +829,20 @@ impl ViewerPanel {
         ]
     }
 
-    /// Draws the selected Transform node's Nuke-style jack and turns primary
-    /// drags into `SetKnob` commands for the `translate` knob.
-    ///
-    /// While a drag is in flight the handle and the dashed box read
-    /// `jack_drag.current_translate`, so they never wait for `GraphMirror`.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_transform_overlay(
-        &mut self,
-        ui: &Ui,
-        painter: &egui::Painter,
-        response: &egui::Response,
-        image_rect: Rect,
-        format: BBox,
-        graph: &GraphMirror,
-        selected: Option<NodeId>,
-    ) -> Vec<KernelMessage> {
-        let Some(knobs) = selected_transform(graph, selected) else {
-            self.reset_jack_drag();
-            return Vec::new();
-        };
-        let node_id = knobs.node_id;
-
-        // Begin a drag only when the press landed on the jack or one of its
-        // axis arrows.
-        if response.drag_started_by(PointerButton::Primary) {
-            if let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) {
-                let anchor = self.jack_anchor(image_rect, format, &knobs, self.jack_drag);
-                if let Some(constraint) = jack_hit(anchor, pointer) {
-                    self.jack_drag = Some(JackDragState {
-                        node_id,
-                        current_translate: [knobs.translate[0], knobs.translate[1]],
-                        axis_constraint: constraint,
-                    });
-                }
-            }
-        }
-
-        let mut messages = Vec::new();
-
-        // Accumulate this frame's pointer delta on top of the in-flight value.
-        if response.dragged_by(PointerButton::Primary) {
-            let delta = response.drag_delta();
-            let world = self.screen_delta_to_world(image_rect, format, delta);
-            if let Some((before, after)) = self.accumulate_jack_drag(node_id, world) {
-                messages.push(KernelMessage::Execute(UndoableCommand::SetKnob {
-                    node: node_id,
-                    knob: "translate".to_string(),
-                    value: KnobValue::Color([
-                        after[0],
-                        after[1],
-                        knobs.translate[2],
-                        knobs.translate[3],
-                    ]),
-                    previous: KnobValue::Color([
-                        before[0],
-                        before[1],
-                        knobs.translate[2],
-                        knobs.translate[3],
-                    ]),
-                }));
-            }
-        }
-
-        // The dashed box follows the forward matrix (scale 0.5 shrinks),
-        // using the in-flight translation while this node is dragged.
-        let translate = self.effective_translate(node_id, knobs.translate);
-        let forward = forward_transform_matrix(translate, knobs.center, knobs.rotate, knobs.scale);
-        let transformed = format.transform(&forward);
-        draw_dashed_rect(
-            painter,
-            self.world_to_screen(image_rect, format, transformed),
-            Stroke::new(1.0, BBOX_LINE),
-        );
-
-        let anchor = self.jack_anchor(image_rect, format, &knobs, self.jack_drag);
-        let hovered = ui.input(|input| {
-            input
-                .pointer
-                .hover_pos()
-                .is_some_and(|pointer| jack_hit(anchor, pointer).is_some())
-        });
-        let color = if hovered || self.jack_drag.is_some_and(|drag| drag.node_id == node_id) {
-            JACK_HOVER
-        } else {
-            JACK
-        };
-        draw_jack(painter, anchor, color);
-
-        // Release ends the drag; this frame still draws the final value.
-        if ui.input(|input| input.pointer.primary_released()) {
-            self.reset_jack_drag();
-        }
-
-        messages
-    }
-
-    /// Image-space translate to draw: the in-flight drag value when it belongs
-    /// to `node_id`, otherwise the mirror's value.
-    fn effective_translate(&self, node_id: NodeId, graph_translate: [f32; 4]) -> [f32; 4] {
-        match self.jack_drag.filter(|drag| drag.node_id == node_id) {
-            Some(drag) => [
-                drag.current_translate[0],
-                drag.current_translate[1],
-                graph_translate[2],
-                graph_translate[3],
-            ],
-            None => graph_translate,
-        }
-    }
-
-    /// Screen position of the jack: `center + translate` in image pixels.
-    fn jack_anchor(
-        &self,
-        image_rect: Rect,
-        format: BBox,
-        knobs: &TransformKnobs,
-        drag: Option<JackDragState>,
-    ) -> Pos2 {
-        let translate = match drag.filter(|drag| drag.node_id == knobs.node_id) {
-            Some(drag) => drag.current_translate,
-            None => [knobs.translate[0], knobs.translate[1]],
-        };
-        self.world_to_screen_point(
-            image_rect,
-            format,
-            knobs.center[0] + translate[0],
-            knobs.center[1] + translate[1],
-        )
-    }
-
-    /// Adds one image-space delta to the active drag.
-    ///
-    /// Returns `(before, after)` so the caller can emit an exact undo step.
+    /// Adds one image-space delta to the active jack drag.
+    #[allow(dead_code)]
     fn accumulate_jack_drag(
         &mut self,
         node_id: NodeId,
         world_delta: Vec2,
     ) -> Option<([f32; 2], [f32; 2])> {
-        let drag = self
-            .jack_drag
-            .as_mut()
-            .filter(|drag| drag.node_id == node_id)?;
-        let mut dx = world_delta.x;
-        let mut dy = world_delta.y;
-        match drag.axis_constraint {
-            Some(AxisConstraint::X) => dy = 0.0,
-            Some(AxisConstraint::Y) => dx = 0.0,
-            None => {}
-        }
-        if dx == 0.0 && dy == 0.0 {
-            return None;
-        }
-        let before = drag.current_translate;
-        drag.current_translate[0] += dx;
-        drag.current_translate[1] += dy;
-        Some((before, drag.current_translate))
+        self.overlay.accumulate_jack_drag(node_id, world_delta)
     }
 
-    fn reset_jack_drag(&mut self) {
-        self.jack_drag = None;
-    }
-
-    /// Captures handle presses before navigation, without waiting for egui's
-    /// drag threshold (which can move the pointer outside the hit zone).
-    #[allow(clippy::too_many_arguments)]
-    fn handle_corner_pin_input(
-        &mut self,
-        ui: &Ui,
-        response: &egui::Response,
-        image_rect: Rect,
-        format: BBox,
-        graph: &GraphMirror,
-        selected: Option<NodeId>,
-    ) -> Vec<KernelMessage> {
-        let Some(node_id) = selected.filter(|id| {
-            graph
-                .node(*id)
-                .is_some_and(|node| node.kind == "CornerPin2D")
-        }) else {
-            self.reset_corner_drag();
-            return Vec::new();
-        };
-
-        let node = graph.node(node_id).unwrap();
-        if self.dragging_corner.is_some_and(|(id, _)| id != node_id) {
-            self.reset_corner_drag();
-        }
-        let corners = self.corner_pin_corners(node, format);
-        let corner_names = ["to1", "to2", "to3", "to4"];
-
-        let pressed = ui.input(|input| input.pointer.primary_pressed());
-        if pressed && response.contains_pointer() {
-            if let Some(pointer) = ui.input(|input| input.pointer.press_origin()) {
-                for (i, &corner) in corners.iter().enumerate() {
-                    let screen =
-                        self.world_to_screen_point(image_rect, format, corner[0], corner[1]);
-                    if pointer.distance(screen) <= 12.0 {
-                        self.dragging_corner = Some((node_id, i));
-                        self.corner_drag_value = Some(corner);
-                        ui.ctx().request_repaint();
-                        break;
-                    }
-                }
-            }
-        }
-
-        let mut messages = Vec::new();
-
-        if let Some((_, corner_idx)) = self.dragging_corner {
-            let pointer = ui.input(|input| input.pointer.interact_pos());
-            if !pressed && let Some(pointer) = pointer {
-                let [x, y] = self.screen_to_image(image_rect, format, pointer);
-                let fw = format.width() as f32;
-                let fh = format.height() as f32;
-                let xy = [x.clamp(-fw, 2.0 * fw), y.clamp(-fh, 2.0 * fh)];
-                let current = self.corner_drag_value.unwrap_or(corners[corner_idx]);
-                if xy.iter().zip(current).any(|(a, b)| (a - b).abs() > 1e-4) {
-                    let name = corner_names[corner_idx];
-                    let value = KnobValue::Color([xy[0], xy[1], 0.0, 0.0]);
-                    let set = UndoableCommand::SetKnob {
-                        node: node_id,
-                        knob: name.to_string(),
-                        value: value.clone(),
-                        previous: node
-                            .knobs
-                            .get(name)
-                            .cloned()
-                            .unwrap_or(KnobValue::Color([current[0], current[1], 0.0, 0.0])),
-                    };
-                    let command = match node.curves.get(name) {
-                        Some(previous) if previous.iter().any(|curve| !curve.is_empty()) => {
-                            UndoableCommand::Batch(vec![
-                                set,
-                                UndoableCommand::SetKnobCurve {
-                                    node: node_id,
-                                    name: name.to_string(),
-                                    curves: set_curve_values(
-                                        previous.clone(),
-                                        &value,
-                                        self.current_frame,
-                                    ),
-                                    previous: previous.clone(),
-                                },
-                            ])
-                        }
-                        _ => set,
-                    };
-                    messages.push(KernelMessage::Execute(command));
-                    self.corner_drag_value = Some(xy);
-                    ui.ctx().request_repaint();
-                }
-            }
-        }
-
-        // Also release capture when the window loses the pointer/button.
-        if !ui.input(|input| input.pointer.primary_down()) {
-            self.reset_corner_drag();
-        }
-        messages
-    }
-
-    fn corner_pin_corners(&self, node: &crate::canvas::CanvasNode, format: BBox) -> [[f32; 2]; 4] {
-        let fw = format.width() as f32;
-        let fh = format.height() as f32;
-        let defaults = [[0.0, 0.0], [fw, 0.0], [fw, fh], [0.0, fh]];
-        std::array::from_fn(|i| {
-            if self.dragging_corner == Some((node.id, i))
-                && let Some(xy) = self.corner_drag_value
-            {
-                return xy;
-            }
-            let name = format!("to{}", i + 1);
-            let base = node.knobs.get(&name).cloned().unwrap_or(KnobValue::Color([
-                defaults[i][0],
-                defaults[i][1],
-                0.0,
-                0.0,
-            ]));
-            match effective_knob_value(node, &name, &base, self.current_frame) {
-                KnobValue::Color(c) => [c[0], c[1]],
-                _ => defaults[i],
-            }
-        })
-    }
-
-    /// Paint the quad after the image, using the same effective values as hit testing.
-    fn draw_corner_pin_overlay(
-        &self,
-        ui: &Ui,
-        painter: &egui::Painter,
-        image_rect: Rect,
-        format: BBox,
-        graph: &GraphMirror,
-        selected: Option<NodeId>,
-    ) {
-        let Some(node) = selected
-            .and_then(|id| graph.node(id))
-            .filter(|node| node.kind == "CornerPin2D")
-        else {
-            return;
-        };
-        let node_id = node.id;
-        let corners = self.corner_pin_corners(node, format);
-        // Draw the wireframe quad: to1 -> to2 -> to3 -> to4 -> to1.
-        let screen_corners: [Pos2; 4] =
-            corners.map(|c| self.world_to_screen_point(image_rect, format, c[0], c[1]));
-        for i in 0..4 {
-            let next = (i + 1) % 4;
-            painter.line_segment(
-                [screen_corners[i], screen_corners[next]],
-                Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 175, 55, 200)),
-            );
-        }
-
-        // Draw handles.
-        for (i, &screen) in screen_corners.iter().enumerate() {
-            let is_dragging = self
-                .dragging_corner
-                .is_some_and(|(n, idx)| n == node_id && idx == i);
-            let hovered = ui.input(|input| {
-                input
-                    .pointer
-                    .hover_pos()
-                    .is_some_and(|p| p.distance(screen) <= 12.0)
-            });
-            let color = if hovered || is_dragging {
-                JACK_HOVER
-            } else {
-                JACK
-            };
-            let label = (i + 1).to_string();
-            painter.circle_filled(screen, 7.0, color);
-            painter.circle_stroke(screen, 7.0, Stroke::new(1.0, Color32::WHITE));
-            painter.text(
-                screen + Vec2::new(JACK_RADIUS + 2.0, 0.0),
-                Align2::LEFT_CENTER,
-                label,
-                FontId::proportional(10.0),
-                color,
-            );
-        }
-    }
-
-    fn reset_corner_drag(&mut self) {
-        self.dragging_corner = None;
-        self.corner_drag_value = None;
+    #[allow(dead_code)]
+    fn corner_pin_corners(&self, node: &CanvasNode, format: BBox) -> [[f32; 2]; 4] {
+        self.overlay
+            .corner_pin_corners(node, format, self.current_frame)
     }
 
     fn view_settings(&self) -> (u32, u32, DisplayTransform, ViewerChannel) {
@@ -1230,154 +913,63 @@ impl ViewerPanel {
         painter.rect_filled(hud, 3, HUD_BG);
         painter.galley(hud.min + padding, galley, Color32::WHITE);
     }
-}
 
-/// Knobs the transform overlay needs from the selected node.
-struct TransformKnobs {
-    node_id: NodeId,
-    translate: [f32; 4],
-    center: [f32; 4],
-    rotate: f32,
-    scale: f32,
-}
+    /// Paints the non-blocking error banner pinned to the top interior edge of
+    /// the Viewer viewport. One truncated line at rest; the full text on hover.
+    fn draw_error_banner(&self, ui: &Ui, painter: &egui::Painter, rect: Rect) {
+        let Some(message) = &self.active_error else {
+            return;
+        };
+        let banner_height = 20.0;
+        let banner_rect = Rect::from_min_size(
+            rect.min + Vec2::new(8.0, 8.0),
+            Vec2::new(rect.width() - 16.0, banner_height),
+        );
+        let banner_bg = Color32::from_rgba_unmultiplied(130, 26, 26, 235);
+        painter.rect_filled(banner_rect, 2.0, banner_bg);
+        painter.rect_stroke(
+            banner_rect,
+            2.0,
+            Stroke::new(1.0, Color32::from_rgb(235, 75, 70)),
+            StrokeKind::Inside,
+        );
 
-/// Reads the selected node's Transform knobs, if it is a `Transform`.
-fn selected_transform(graph: &GraphMirror, selected: Option<NodeId>) -> Option<TransformKnobs> {
-    let id = selected?;
-    let node = graph.node(id)?;
-    if node.kind != "Transform" {
-        return None;
+        let hovered = ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|p| banner_rect.contains(p))
+        });
+        let font = FontId::proportional(11.0);
+        let full = painter.layout_no_wrap(message.clone(), font.clone(), Color32::WHITE);
+        let available = banner_rect.width() - 16.0;
+        let display: String = if hovered || full.size().x <= available {
+            message.clone()
+        } else {
+            // Truncate to one line, appending an ellipsis. Walk chars so a
+            // non-ASCII byte never splits a UTF-8 boundary.
+            let mut truncated = String::new();
+            for ch in message.chars() {
+                let candidate = format!("{truncated}{ch}...");
+                let galley = painter.layout_no_wrap(candidate, font.clone(), Color32::WHITE);
+                if galley.size().x > available {
+                    break;
+                }
+                truncated.push(ch);
+            }
+            format!("{truncated}...")
+        };
+        painter.text(
+            banner_rect.min + Vec2::new(8.0, 0.0),
+            Align2::LEFT_CENTER,
+            display,
+            font,
+            Color32::WHITE,
+        );
     }
-
-    let translate = match node.knobs.get("translate") {
-        Some(KnobValue::Color(color)) => *color,
-        _ => [0.0, 0.0, 0.0, 1.0],
-    };
-    let center = match node.knobs.get("center") {
-        Some(KnobValue::Color(color)) => *color,
-        _ => [0.0, 0.0, 0.0, 1.0],
-    };
-    let rotate = match node.knobs.get("rotate") {
-        Some(KnobValue::Float(value)) => *value as f32,
-        _ => 0.0,
-    };
-    let scale = match node.knobs.get("scale") {
-        Some(KnobValue::Float(value)) => *value as f32,
-        _ => 1.0,
-    };
-    Some(TransformKnobs {
-        node_id: id,
-        translate,
-        center,
-        rotate,
-        scale,
-    })
 }
 
-/// Forward matrix `T(translate) * T(center) * S(scale) * R(rotate) * T(-center)`.
-///
-/// Mirrors the cartridge's `transform_matrix`, so the overlay box shrinks when
-/// the render shrinks.
-fn forward_transform_matrix(
-    translate: [f32; 4],
-    center: [f32; 4],
-    rotate_degrees: f32,
-    scale: f32,
-) -> Mat3x3 {
-    Mat3x3::translate(translate[0], translate[1])
-        .mul(&Mat3x3::translate(center[0], center[1]))
-        .mul(&Mat3x3::scale(scale, scale))
-        .mul(&Mat3x3::rotate(rotate_degrees.to_radians()))
-        .mul(&Mat3x3::translate(-center[0], -center[1]))
-}
-
-/// Hit-tests the jack and its axis arrows.
-///
-/// `Some(None)` is a free 2D grab, `Some(Some(axis))` is an axis-locked grab,
-/// and `None` means the pointer missed the jack entirely.
-fn jack_hit(anchor: Pos2, pointer: Pos2) -> Option<Option<AxisConstraint>> {
-    if pointer.distance(anchor) <= JACK_HIT_RADIUS {
-        return Some(None);
-    }
-
-    let x_tip = anchor + Vec2::new(JACK_ARROW_LENGTH, 0.0);
-    if distance_to_segment(pointer, anchor, x_tip) <= JACK_SHAFT_HIT_RADIUS {
-        return Some(Some(AxisConstraint::X));
-    }
-
-    let y_tip = anchor - Vec2::new(0.0, JACK_ARROW_LENGTH);
-    if distance_to_segment(pointer, anchor, y_tip) <= JACK_SHAFT_HIT_RADIUS {
-        return Some(Some(AxisConstraint::Y));
-    }
-
-    None
-}
-
-fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
-    let segment = end - start;
-    let length_sq = segment.length_sq();
-    if length_sq <= f32::EPSILON {
-        return point.distance(start);
-    }
-    let t = ((point - start).dot(segment) / length_sq).clamp(0.0, 1.0);
-    point.distance(start + segment * t)
-}
-
-/// Draws a Nuke-style transform jack: red `+X`, green `+Y`, yellow pivot.
-fn draw_jack(painter: &egui::Painter, position: Pos2, color: Color32) {
-    // Nuke +X: red arrow to the right.
-    let x_tip = position + Vec2::new(JACK_ARROW_LENGTH, 0.0);
-    painter.line_segment([position, x_tip], Stroke::new(2.0, JACK_X_COLOR));
-    painter.add(Shape::convex_polygon(
-        vec![
-            x_tip,
-            x_tip - Vec2::new(8.0, 4.5),
-            x_tip - Vec2::new(8.0, -4.5),
-        ],
-        JACK_X_COLOR,
-        Stroke::NONE,
-    ));
-
-    // Nuke +Y: green arrow upward (screen -Y).
-    let y_tip = position - Vec2::new(0.0, JACK_ARROW_LENGTH);
-    painter.line_segment([position, y_tip], Stroke::new(2.0, JACK_Y_COLOR));
-    painter.add(Shape::convex_polygon(
-        vec![
-            y_tip,
-            y_tip + Vec2::new(-4.5, 8.0),
-            y_tip + Vec2::new(4.5, 8.0),
-        ],
-        JACK_Y_COLOR,
-        Stroke::NONE,
-    ));
-
-    // Yellow centre ring + crosshair.
-    let stroke = Stroke::new(1.5, color);
-    painter.circle_stroke(position, JACK_RADIUS, stroke);
-    painter.line_segment(
-        [
-            position - Vec2::new(14.0, 0.0),
-            position + Vec2::new(14.0, 0.0),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            position - Vec2::new(0.0, 14.0),
-            position + Vec2::new(0.0, 14.0),
-        ],
-        stroke,
-    );
-    painter.circle_filled(position, 2.0, color);
-    painter.text(
-        position + Vec2::new(12.0, -12.0),
-        Align2::LEFT_BOTTOM,
-        "Transform",
-        FontId::proportional(10.0),
-        color,
-    );
-}
-
+/// Draws a checkerboard pattern behind the viewer viewport.
 fn draw_checkerboard(painter: &egui::Painter, rect: Rect) {
     let step = 16.0;
     let mut row = 0;
@@ -1402,17 +994,6 @@ fn draw_checkerboard(painter: &egui::Painter, rect: Rect) {
         y += step;
         row += 1;
     }
-}
-
-fn draw_dashed_rect(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
-    let corners = [
-        rect.left_top(),
-        rect.right_top(),
-        rect.right_bottom(),
-        rect.left_bottom(),
-        rect.left_top(),
-    ];
-    painter.extend(egui::Shape::dashed_line(&corners, stroke, 5.0, 4.0));
 }
 
 #[cfg(test)]
@@ -1521,7 +1102,7 @@ mod tests {
         let image_rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(200.0, 100.0));
         let format = BBox::new(0, 0, 100, 50);
         let node = NodeId(7);
-        viewer.jack_drag = Some(JackDragState {
+        viewer.overlay.jack_drag = Some(JackDragState {
             node_id: node,
             current_translate: [0.0, 0.0],
             axis_constraint: None,
@@ -1557,7 +1138,7 @@ mod tests {
         let mut viewer = ViewerPanel::new();
         let node = NodeId(7);
 
-        viewer.jack_drag = Some(JackDragState {
+        viewer.overlay.jack_drag = Some(JackDragState {
             node_id: node,
             current_translate: [1.0, 2.0],
             axis_constraint: Some(AxisConstraint::X),
@@ -1567,7 +1148,7 @@ mod tests {
             .expect("x drag");
         assert_eq!(after, [5.0, 2.0]);
 
-        viewer.jack_drag = Some(JackDragState {
+        viewer.overlay.jack_drag = Some(JackDragState {
             node_id: node,
             current_translate: [1.0, 2.0],
             axis_constraint: Some(AxisConstraint::Y),
@@ -1818,7 +1399,7 @@ mod tests {
                 vec![pointer_button(start, PointerButton::Primary, true)],
             );
             assert!(pressed.is_empty());
-            assert_eq!(viewer.dragging_corner, Some((NodeId(1), 0)));
+            assert_eq!(viewer.overlay.dragging_corner, Some((NodeId(1), 0)));
             assert!(viewer.is_dragging_overlay());
             let end = start + Vec2::new(50.0, -30.0);
             let messages = run_corner_viewer(
@@ -1951,5 +1532,80 @@ mod tests {
         let corners = viewer.corner_pin_corners(graph.node(NodeId(1)).unwrap(), format);
         assert!((corners[0][0] - 45.0).abs() < 1e-3);
         assert_eq!(viewer.pan, Vec2::ZERO);
+    }
+
+    fn ramp_test_scene() -> (ViewerPanel, GraphMirror) {
+        tanova_nodes::ensure_linked();
+        let mut graph = GraphMirror::default();
+        graph.apply_command(&UndoableCommand::AddNode {
+            id: NodeId(1),
+            kind: "Ramp".to_string(),
+            x: 0.0,
+            y: 0.0,
+        });
+        let mut viewer = ViewerPanel::new();
+        viewer.viewer_node = Some(NodeId(1));
+        let mut packet = Packet::new();
+        packet.insert(Raster2D::for_format(Format::new("test", 128, 128, 1.0)));
+        viewer.last_packet = Some(Arc::new(packet));
+        viewer.frame_proxy_scale = 0.5;
+        (viewer, graph)
+    }
+
+    #[test]
+    fn ramp_overlay_drag_in_half_proxy_writes_full_resolution_logical_p0_and_p1() {
+        let (mut viewer, graph) = ramp_test_scene();
+        viewer.proxy_scale = 0.5;
+        let ctx = egui::Context::default();
+        run_corner_viewer(&ctx, &mut viewer, &graph, vec![]);
+        assert_eq!(viewer.logical_frame_size(), Some((256, 256)));
+
+        let image_rect = viewer.image_rect_for_test.unwrap();
+        // P1 defaults to (256, 256) logical -> top-right corner of the image rect.
+        let p1_screen = Pos2::new(image_rect.right(), image_rect.top());
+
+        // Hover then press on P1 to start the drag (matching the corner-pin test pattern).
+        run_corner_viewer(
+            &ctx,
+            &mut viewer,
+            &graph,
+            vec![egui::Event::PointerMoved(p1_screen)],
+        );
+        run_corner_viewer(
+            &ctx,
+            &mut viewer,
+            &graph,
+            vec![pointer_button(p1_screen, PointerButton::Primary, true)],
+        );
+        assert!(viewer.is_dragging_overlay());
+        assert_eq!(viewer.overlay.dragging_ramp, Some((NodeId(1), 1)));
+
+        // Drag P1 to logical (150.0, 100.0).
+        let new_screen = Pos2::new(
+            image_rect.left() + (150.0 / 256.0) * image_rect.width(),
+            image_rect.bottom() - (100.0 / 256.0) * image_rect.height(),
+        );
+        let messages = run_corner_viewer(
+            &ctx,
+            &mut viewer,
+            &graph,
+            vec![egui::Event::PointerMoved(new_screen)],
+        );
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [KernelMessage::Execute(UndoableCommand::SetKnob {
+                    knob, value: KnobValue::Color([x, y, 0.0, 0.0]), ..
+                })] if knob == "p1"
+                    && (*x - 150.0).abs() < 1e-3
+                    && (*y - 100.0).abs() < 1e-3
+            ),
+            "{messages:?}"
+        );
+        assert_eq!(
+            viewer.pan,
+            Vec2::ZERO,
+            "panning must not be driven by the overlay drag"
+        );
     }
 }

@@ -1123,6 +1123,21 @@ impl Dag {
         epoch: &RenderEpoch,
         target_epoch: u64,
     ) -> Result<Arc<Packet>, NodeError> {
+        self.evaluate_pull_with_origin(target, ctx, governor, epoch, target_epoch)
+            .map_err(|(_, error)| error)
+    }
+
+    /// Like [`Dag::evaluate_pull`], but preserves the exact failing origin
+    /// [`NodeId`] (e.g. a `Read #4` missing-file error reports `NodeId(4)`,
+    /// never the downstream Viewer `NodeId(3)`).
+    pub fn evaluate_pull_with_origin(
+        &mut self,
+        target: NodeId,
+        ctx: &EvalContext,
+        governor: &MemoryGovernor,
+        epoch: &RenderEpoch,
+        target_epoch: u64,
+    ) -> Result<Arc<Packet>, (NodeId, NodeError)> {
         self.perf_samples.clear();
         self.pull(
             target,
@@ -1142,12 +1157,12 @@ impl Dag {
         epoch: &RenderEpoch,
         target_epoch: u64,
         visiting: &mut HashSet<NodeId>,
-    ) -> Result<Arc<Packet>, NodeError> {
+    ) -> Result<Arc<Packet>, (NodeId, NodeError)> {
         if !epoch.is_current(target_epoch) {
-            return Err(NodeError::Preempted);
+            return Err((id, NodeError::Preempted));
         }
         if !self.nodes.contains_key(&id) {
-            return Err(NodeError::UnknownNode(id.0));
+            return Err((id, NodeError::UnknownNode(id.0)));
         }
         // Remember the frame being evaluated so curve edits can keep the
         // static fallback knob synced without an extra parameter.
@@ -1155,13 +1170,16 @@ impl Dag {
             self.current_frame = time;
         }
         if !visiting.insert(id) {
-            return Err(NodeError::CycleDetected {
-                from: id.0,
-                to: id.0,
-            });
+            return Err((
+                id,
+                NodeError::CycleDetected {
+                    from: id.0,
+                    to: id.0,
+                },
+            ));
         }
 
-        let hash = self.compute_op_hash(id, ctx)?;
+        let hash = self.compute_op_hash(id, ctx).map_err(|e| (id, e))?;
         self.node_hashes.insert(id, hash);
         // Cache hit: refresh priority so actively scrubbed nodes stay hot.
         if let Some(entry) = self.cache.get_mut(&hash) {
@@ -1186,7 +1204,7 @@ impl Dag {
                 self.nodes
                     .get(&id)
                     .and_then(|node| node.implementation.clone())
-                    .ok_or(NodeError::NoImplementation(id.0))?,
+                    .ok_or((id, NodeError::NoImplementation(id.0)))?,
             )
         };
 
@@ -1302,7 +1320,7 @@ impl Dag {
 
         if !epoch.is_current(target_epoch) {
             visiting.remove(&id);
-            return Err(NodeError::Preempted);
+            return Err((id, NodeError::Preempted));
         }
 
         let packet = match evaluated {
@@ -1319,7 +1337,7 @@ impl Dag {
                     }
                 }
                 visiting.remove(&id);
-                return Err(error);
+                return Err((id, error));
             }
         };
 

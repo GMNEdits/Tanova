@@ -80,7 +80,7 @@ impl NodeTrait for ReadNode {
         let knobs = ctx.knobs().unwrap_or(&self.knobs);
         let file = text_knob(knobs, "file", DEFAULT_FILE);
         if file.is_empty() {
-            return Err(NodeError::Other("EXR read failed".to_string()));
+            return Err(NodeError::Other("No file selected".to_string()));
         }
 
         let first = int_knob(knobs, "first", DEFAULT_FIRST);
@@ -111,22 +111,30 @@ impl NodeTrait for ReadNode {
         let Some(cache) = cache.filter(|_| !ctx.contains::<RenderForExport>()) else {
             // Headless renders have no worker to wake. Exports may use a ready
             // entry, but on a miss they must load the real pixels, not gray.
+            if !Path::new(&path).exists() {
+                return missing_packet(&missing, &path, scale, None);
+            }
             return match load_exr(&path, governor.as_ref()) {
                 Ok(raster) => read_frame(&raster),
                 Err(e @ NodeError::MemoryExceeded { .. }) => Err(e),
-                Err(_) => missing_packet(&missing, scale),
+                Err(e) => missing_packet(&missing, &path, scale, Some(e)),
             };
         };
 
         if !Path::new(&path).exists() {
-            return missing_packet(&missing, scale);
+            return missing_packet(&missing, &path, scale, None);
         }
 
         let _ = cache.get_or_load(path.clone(), governor);
 
         match cache.status(&path) {
             CacheStatus::Ready(raster) => read_frame(&raster),
-            CacheStatus::Failed => missing_packet(&missing, scale),
+            CacheStatus::Failed => missing_packet(
+                &missing,
+                &path,
+                scale,
+                Some(NodeError::Other(format!("Failed to read {path}"))),
+            ),
             CacheStatus::Loading | CacheStatus::Missing => Ok(packet_from_raster(uniform_raster(
                 Format::hd_1080().scaled(scale),
                 LOADING_GRAY,
@@ -171,14 +179,21 @@ fn resolve_frame_path(file: &str, time: f64, first: i64, last: i64, missing: &st
     resolve_sequence_path(file, clamped as f64)
 }
 
-fn missing_packet(missing: &str, scale: f32) -> Result<Packet, NodeError> {
+fn missing_packet(
+    missing: &str,
+    path: &str,
+    scale: f32,
+    cause: Option<NodeError>,
+) -> Result<Packet, NodeError> {
     if missing == "black" {
         Ok(packet_from_raster(uniform_raster(
             Format::hd_1080().scaled(scale),
             MISSING_BLACK,
         )))
     } else {
-        Err(NodeError::Other("EXR read failed".to_string()))
+        // Keep the exact failure reason so the Viewer banner and node tooltip
+        // can show the resolved filename instead of a generic "read failed".
+        Err(cause.unwrap_or_else(|| NodeError::Other(format!("File not found: {path}"))))
     }
 }
 
@@ -286,10 +301,19 @@ mod tests {
         let result = ReadNode::new().evaluate(&ctx, &[]);
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert!(matches!(
-            result,
-            Err(NodeError::Other(message)) if message == "EXR read failed"
-        ));
+        let message = match result {
+            Err(NodeError::Other(message)) => message,
+            Err(other) => panic!("expected a plain NodeError, got {other:?}"),
+            Ok(_) => panic!("a missing file must fail in `error` mode"),
+        };
+        assert!(
+            message.contains("File not found"),
+            "missing-file error should be descriptive, got {message:?}"
+        );
+        assert!(
+            message.contains("frame.0001.exr"),
+            "missing-file error should name the resolved frame, got {message:?}"
+        );
     }
 
     #[test]

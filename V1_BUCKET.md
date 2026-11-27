@@ -225,3 +225,19 @@ All budgets are measured on our daily reference laptop with the OS and browser t
 \- \*(2026-11-22)\* Watch disk space across the 3 git worktrees (\`tanova\`, \`tanova-codex\`, \`tanova-kilo\`); purge unused \`target/\` caches if disk gets tight.
 
 \- \*(2026-11-26)* Optimize small-format Defocus/Blur border-tile spill (expanding 0..256 to -4..260 currently allocates 9 tiles / ~9.75 MiB instead of clipping or sparse-skipping empty border regions).
+
+### Milestone 28 — Shared Viewer Overlay, `Ramp` Handles & Node Error UX
+
+- [x] **Shared Viewer overlay module (`tanova-ui/src/overlay.rs`):** `OverlayViewport` reproduces the Viewer coordinate helpers proxy-safely so all 2D handles write full-resolution logical coordinates at 1:1/1:2/1:4 proxy; `OverlayState` with `is_dragging()` and `OverlayResponse { consumed_pointer, commands }`; `emit_2d_knob_command` preserves `[x, y, prev[2], prev[3]]` and auto-keys via `Batch([SetKnob, SetKnobCurve])`.
+
+- [x] **Overlay handlers:** `Transform` (red X/green Y/crosshair/dashed box/smooth drag), `CornerPin2D` (orange quad + numbered handles clamped to `[-fw..=2*fw, -fh..=2*fh]`, auto-key) and new `Ramp` (`p0`/`p1` from effective `KnobValue::Color`, `Color32::from_rgb(100,200,255)` line 1.5 px, 7.0 px `"P0"`/`"P1"` handles highlighted on hover/drag, full-res logical coords, pan suppressed, `request_repaint`).
+
+- [x] **Viewer backward compatibility:** `ViewerPanel::show` signature and `is_dragging_overlay()` unchanged; overlay runs strictly before pan/drag handling; `TanovaApp::fold_event` still protects `self.mirror` while `is_dragging_overlay()`.
+
+- [x] **Exact-origin node error reporting:** `NodeErrorInfo { node, message, crashed }` and `KernelEvent::NodeErrors(Vec<NodeErrorInfo>)` emitted on every `render_viewer()` pass (empty vec clears), reporting the failing origin node (e.g. `Read #4` → `NodeId(4)`, never the Viewer `NodeId(3)`); panic/airbag tests green.
+
+- [x] **`GraphMirror::node_errors`:** updated on `NodeErrors`, pruned on `RemoveNode`, cleared on `clear()`/`NewScript`/`ReplaceDag`.
+
+- [x] **Canvas error badges:** 2.0 px `Color32::from_rgb(235,75,70)` border plus `"CRASH"`/`"ERR"` pill; `Order::Tooltip` hover area shows the truncated error reason even without timing data.
+
+- [x] **Viewer error banner:** `ViewerPanel::active_error`, non-blocking dark-red banner pinned to the top interior edge of the Viewer viewport.

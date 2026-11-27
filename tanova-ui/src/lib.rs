@@ -6,6 +6,7 @@
 
 pub mod canvas;
 pub mod curve_editor;
+pub mod overlay;
 pub mod properties;
 pub mod theme;
 pub mod viewer;

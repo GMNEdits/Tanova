@@ -5,6 +5,25 @@ All notable changes to Tanova are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - v0.7.0
+
+**Phase 9 — Masking, Keying & Error UX (Milestone 28).**
+
+### Added
+
+- **Shared Viewer overlay module (`tanova-ui/src/overlay.rs`):** every 2D handle (`Transform` jack, `CornerPin2D` corners, `Ramp` endpoints) lives in one input path that runs strictly before pan/drag handling. `OverlayViewport` reproduces the Viewer coordinate helpers proxy-safely so all handles write full-resolution logical coordinates even at 1:2/1:4 proxy.
+- **`OverlayState` / `OverlayResponse`:** `is_dragging()`, `consumed_pointer`, and `commands` shared across overlay kinds.
+- **`emit_2d_knob_command`:** preserves untouched channels (`[x, y, prev[2], prev[3]]`) and auto-keys via `Batch([SetKnob, SetKnobCurve])` when the knob has an active curve.
+- **`Ramp` Viewer handles:** `p0`/`p1` read from effective `KnobValue::Color`, `Color32::from_rgb(100,200,255)` 1.5 px guide line, 7.0 px `"P0"`/`"P1"` handles highlighted on hover/drag, full-resolution logical coords, pan suppressed, `request_repaint`.
+- **`ViewerPanel`:** `show` signature and `is_dragging_overlay()` remain 100% backward-compatible; the overlay refactor keeps `Transform` (red X/green Y/crosshair/dashed box/smooth drag) and `CornerPin2D` (orange quad + numbered handles clamped to `[-fw..=2*fw, -fh..=2*fh]`, auto-key) behavior identical.
+
+### Changed
+
+- **Node Error Badges & Viewer banner:** `NodeErrorInfo { node, message, crashed }` and `KernelEvent::NodeErrors(Vec<NodeErrorInfo>)` emitted on every `render_viewer()` pass (empty vec clears), reporting the exact failing origin node (e.g. `Read #4` → `NodeId(4)`, never the Viewer `NodeId(3)`).
+- **`GraphMirror::node_errors`:** updated on `NodeErrors`, pruned on `RemoveNode`, cleared on `clear()`/`NewScript`/`ReplaceDag`.
+- **Canvas:** 2.0 px `Color32::from_rgb(235,75,70)` border plus `"CRASH"`/`"ERR"` pill on erroring nodes; the `Order::Tooltip` hover area shows the truncated error reason even without timing data.
+- **`ViewerPanel::active_error`:** non-blocking dark-red banner (`Color32::from_rgba_unmultiplied(120,24,24,225)`, 1 px bright-red border, one truncated line, full text on hover) pinned to the top interior edge of the Viewer viewport.
+
 ## [0.6.5] - 2026-11-26
 
 **Phase 8 — Project Format Versioning, Atomic Save & Crash Recovery (Milestone 25).**

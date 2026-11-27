@@ -125,6 +125,9 @@ pub struct GraphMirror {
     project_format: Option<ProjectFormat>,
     /// Per-node evaluation timing from `KernelEvent::PerfSnapshot`.
     pub node_perf: std::collections::HashMap<NodeId, (u64, bool)>,
+    /// Live evaluation errors from `KernelEvent::NodeErrors`, keyed by the
+    /// exact failing origin node. `(message, crashed)`.
+    pub node_errors: std::collections::HashMap<NodeId, (String, bool)>,
 }
 
 impl GraphMirror {
@@ -139,6 +142,7 @@ impl GraphMirror {
         self.nodes.clear();
         self.edges.clear();
         self.node_perf.clear();
+        self.node_errors.clear();
     }
 
     /// Rebuilds the mirror directly from a kernel `Dag`, populating nodes with
@@ -176,6 +180,7 @@ impl GraphMirror {
             edges,
             project_format,
             node_perf: std::collections::HashMap::new(),
+            node_errors: std::collections::HashMap::new(),
         }
     }
 
@@ -329,6 +334,15 @@ impl GraphMirror {
                         .insert(sample.node, (sample.eval_us, sample.from_cache));
                 }
             }
+            KernelEvent::NodeErrors(errors) => {
+                // Each render pass publishes a fresh snapshot: replace the
+                // whole map so cleared errors disappear and new ones appear.
+                self.node_errors.clear();
+                for error in errors {
+                    self.node_errors
+                        .insert(error.node, (error.message.clone(), error.crashed));
+                }
+            }
         }
     }
 
@@ -368,6 +382,7 @@ impl GraphMirror {
                 self.edges
                     .retain(|edge| edge.from_node != *id && edge.to_node != *id);
                 self.node_perf.remove(id);
+                self.node_errors.remove(id);
             }
             UndoableCommand::RestoreNode {
                 id,
@@ -1970,6 +1985,7 @@ impl NodeCanvas {
                 &pal,
                 active_port,
                 graph.node_perf.get(&node.id).copied(),
+                graph.node_errors.get(&node.id),
             );
         }
 
@@ -2111,9 +2127,10 @@ impl NodeCanvas {
             }
         }
 
-        // Non-blocking per-node timing tooltip. Drawn as an `interactable(false)`
-        // area so it can never steal a click, drag, or context menu from the
-        // canvas hit-test chain above.
+        // Non-blocking per-node error / timing tooltip. Drawn as an
+        // `interactable(false)` area so it can never steal a click, drag, or
+        // context menu from the canvas hit-test chain above. An error reason
+        // shows even when there is no timing data for the node.
         let hover_quiet = !spawn_ui_open
             && !minimap_active
             && state.active_wire_drag.is_none()
@@ -2129,15 +2146,24 @@ impl NodeCanvas {
                 !is_backdrop_node(&node.kind)
                     && node_screen_rect(state, node.id, rect, graph).contains(pointer)
             })
-            && let Some(&(eval_us, from_cache)) = graph.node_perf.get(&node.id)
         {
-            let ms = eval_us as f64 / 1000.0;
-            let state_str = if from_cache { "cached" } else { "computed" };
-            let text = format!(
-                "{} #{} | {:.2} ms ({})",
-                node.kind, node.id.0, ms, state_str
-            );
-            draw_node_perf_tooltip(ui, pointer, &text);
+            let text = if let Some((message, _crashed)) = graph.node_errors.get(&node.id) {
+                let truncated = tooltip_error_text(message, 160);
+                format!("{} #{} | ERROR: {}", node.kind, node.id.0, truncated)
+            } else if let Some(&(eval_us, from_cache)) = graph.node_perf.get(&node.id) {
+                let ms = eval_us as f64 / 1000.0;
+                let state_str = if from_cache { "cached" } else { "computed" };
+                format!(
+                    "{} #{} | {:.2} ms ({})",
+                    node.kind, node.id.0, ms, state_str
+                )
+            } else {
+                // No error and no timing: nothing useful to report.
+                String::new()
+            };
+            if !text.is_empty() {
+                draw_node_perf_tooltip(ui, pointer, &text);
+            }
         }
 
         if let Some(message) = draw_tab_search(ui, state, graph, workflow) {
@@ -3658,8 +3684,9 @@ fn draw_node(
     pal: &ThemePalette,
     active_port: Option<PortId>,
     perf: Option<(u64, bool)>,
+    error: Option<&(String, bool)>,
 ) {
-    let crashed = node.crashed.is_some();
+    let crashed = node.crashed.is_some() || error.is_some_and(|(_, crashed)| *crashed);
     let disabled = node.disabled;
     let cat = node_category(&node.kind);
 
@@ -3838,7 +3865,26 @@ fn draw_node(
         }
     }
 
-    if crashed {
+    // Error badge pill: "CRASH" for airbag panics, "ERR" for other failures.
+    // Placed at the top-right interior so it never collides with the `#id`
+    // title (bottom-left) or the `VIEWER 1`/`VIEWER 2` pill (bottom-right).
+    if let Some((message, crashed)) = error {
+        let label = if *crashed { "CRASH" } else { "ERR" };
+        let font = FontId::proportional((9.0 * zoom).clamp(8.0, 12.0));
+        let galley = painter.layout_no_wrap(label.to_string(), font, Color32::from_rgb(30, 24, 8));
+        let pill = Rect::from_min_size(
+            rect.right_top() + Vec2::new(-galley.size().x - 10.0 * zoom, 6.0 * zoom),
+            galley.size() + Vec2::splat(8.0 * zoom),
+        );
+        painter.rect_filled(pill, 2.0 * zoom, Color32::from_rgb(235, 75, 70));
+        painter.galley(
+            pill.min + Vec2::splat(4.0 * zoom),
+            galley,
+            Color32::from_rgb(30, 24, 8),
+        );
+        // Truncated reason, shown on hover via the canvas tooltip.
+        let _ = message;
+    } else if crashed {
         painter.text(
             rect.right_top() + Vec2::new(-7.0 * zoom, 5.0 * zoom),
             Align2::RIGHT_TOP,
@@ -3849,7 +3895,10 @@ fn draw_node(
     }
 
     // 4. Card border & active selection rim on `rect` with full_rounding.
-    let (border_color, border_width) = if crashed {
+    let (border_color, border_width) = if error.is_some() {
+        // Kernel-reported error badge: 2.0 px red border on the erroring node.
+        (Color32::from_rgb(235, 75, 70), 2.0)
+    } else if crashed {
         (Color32::from_rgb(230, 70, 70), 2.0)
     } else if selected {
         (pal.selected_rim, 2.0)
@@ -3899,6 +3948,31 @@ fn draw_node(
             FontId::proportional((9.0 * zoom).clamp(7.0, 11.0)),
             Color32::from_rgb(30, 24, 8),
         );
+    }
+}
+
+/// Truncates a node error to one line of printable ASCII for the tooltip.
+///
+/// The kernel already sanitizes messages, but the canvas also defends itself:
+/// a non-ASCII character becomes `?` and whitespace becomes a plain space so
+/// truncation can never split a UTF-8 boundary or paint a control glyph.
+fn tooltip_error_text(message: &str, max_chars: usize) -> String {
+    let mut sanitized = String::with_capacity(message.len());
+    for c in message.chars() {
+        if c.is_ascii_graphic() || c == ' ' {
+            sanitized.push(c);
+        } else if c.is_whitespace() {
+            sanitized.push(' ');
+        } else {
+            sanitized.push('?');
+        }
+    }
+    if sanitized.chars().count() > max_chars {
+        let mut truncated: String = sanitized.chars().take(max_chars).collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        sanitized
     }
 }
 

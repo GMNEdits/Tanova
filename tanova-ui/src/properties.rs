@@ -72,6 +72,8 @@ const BACKDROP_COLORS: &[&str] = &[
 ];
 /// Ramp interpolation modes for the `Ramp` node's `ramp_type` knob.
 const RAMP_MODES: &[&str] = &["linear", "smooth", "plinear"];
+/// Missing-frame policies for the `Read` node's `missing_frames` knob.
+const MISSING_FRAMES_MODES: &[&str] = &["error", "black", "nearest"];
 /// Nuke's keyframe blue: the knob has a key on the current frame.
 const KEYFRAME_BLUE: Color32 = Color32::from_rgb(80, 175, 255);
 /// Interpolated teal: the knob is animated but has no key on this frame.
@@ -466,6 +468,9 @@ impl PropertiesPanel {
                                             Some(BACKDROP_COLORS)
                                         }
                                         "ramp_type" if node.kind == "Ramp" => Some(RAMP_MODES),
+                                        "missing_frames" if node.kind == "Read" => {
+                                            Some(MISSING_FRAMES_MODES)
+                                        }
                                         _ => None,
                                     };
                                     if let Some(presets) = presets {
