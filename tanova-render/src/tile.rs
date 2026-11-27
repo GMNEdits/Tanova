@@ -410,12 +410,16 @@ impl Raster2D {
 
     /// Samples all four RGBA channels at one Bottom-Left `(x, y)` pixel.
     ///
-    /// A missing alpha plane reads as fully opaque, matching the display path.
+    /// A missing alpha plane reads as fully opaque (`1.0`) inside `bbox` and
+    /// transparent black (`0.0`) outside it for `BlackOutside`, matching the
+    /// missing-plane policy used by the uniform and gathered paths.
     pub fn sample_rgba(&self, x: i32, y: i32) -> [f32; 4] {
         let alpha = if self.channels.contains_key(&Channel::RgbaAlpha) {
             self.sample(&Channel::RgbaAlpha, x, y)
-        } else {
+        } else if self.bbox.contains(x, y) {
             1.0
+        } else {
+            0.0
         };
         [
             self.sample(&Channel::RgbaRed, x, y),
@@ -561,7 +565,9 @@ impl Raster2D {
                 [v, v, v, 255]
             }
         };
-        let black = encode([0.0, 0.0, 0.0, if has_alpha_plane { 0.0 } else { 1.0 }]);
+        // Outside `self.bbox` is transparent black in every case; a missing
+        // alpha plane is only implicitly opaque *inside* the bbox.
+        let black = encode([0.0, 0.0, 0.0, 0.0]);
         let row_bytes = width * 4;
         let render_rows = |dst: &mut [u8], row_start: usize| {
             for (row, line) in dst.chunks_exact_mut(row_bytes).enumerate() {

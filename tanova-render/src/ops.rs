@@ -61,14 +61,34 @@ impl Default for GradeOp {
 
 impl GradeOp {
     /// Grades one premultiplied RGBA pixel with the given mask value.
+    ///
+    /// Exact endpoints: `effective_mix <= 0.0` returns the original pixel
+    /// (no round-trip drift at mask `0.0`); `effective_mix >= 1.0` returns the
+    /// processed result directly (no `orig + (res - orig)` precision loss).
+    /// When `unpremult` is set, the sequence is `unpremult -> process ->
+    /// premult`, and transparent (`alpha == 0` or non-finite) pixels always
+    /// grade to `[0, 0, 0, alpha]` so `offset`/`lift` can never leak RGB onto
+    /// transparent pixels.
     pub fn apply_pixel(&self, rgba: [f32; 4], mask: f32) -> [f32; 4] {
         let alpha = rgba[3];
-        let unpremultiply = self.unpremult && alpha > 1e-5;
-        let work_rgb = if unpremultiply {
-            [rgba[0] / alpha, rgba[1] / alpha, rgba[2] / alpha]
-        } else {
-            [rgba[0], rgba[1], rgba[2]]
-        };
+        let effective_mix = (self.mix * mask).clamp(0.0, 1.0);
+        if effective_mix <= 0.0 {
+            return rgba;
+        }
+
+        let unpremultiply = self.unpremult;
+        let alpha_invalid = alpha == 0.0 || !alpha.is_finite();
+        let mut work_rgb = [rgba[0], rgba[1], rgba[2]];
+        if unpremultiply {
+            if alpha_invalid {
+                work_rgb = [0.0, 0.0, 0.0];
+            } else {
+                work_rgb = std::array::from_fn(|c| {
+                    let q = rgba[c] / alpha;
+                    if q.is_finite() { q } else { rgba[c] }
+                });
+            }
+        }
 
         let mut graded = [0.0f32; 3];
         for channel in 0..3 {
@@ -94,15 +114,23 @@ impl GradeOp {
             graded[channel] = value;
         }
 
-        let effective_mix = (self.mix * mask).clamp(0.0, 1.0);
+        if unpremultiply {
+            // Always repremultiply: `offset`/`lift` can never leak RGB onto
+            // transparent (`alpha == 0`) or non-finite alpha pixels because the
+            // processed RGB is forced to `[0, 0, 0]` there.
+            graded = if alpha_invalid {
+                [0.0, 0.0, 0.0]
+            } else {
+                [graded[0] * alpha, graded[1] * alpha, graded[2] * alpha]
+            };
+        }
+
+        if effective_mix >= 1.0 {
+            return [graded[0], graded[1], graded[2], alpha];
+        }
         let mut out = [0.0f32; 4];
         for channel in 0..3 {
-            let blended = work_rgb[channel] + (graded[channel] - work_rgb[channel]) * effective_mix;
-            out[channel] = if unpremultiply {
-                blended * alpha
-            } else {
-                blended
-            };
+            out[channel] = rgba[channel] + (graded[channel] - rgba[channel]) * effective_mix;
         }
         out[3] = alpha;
         out
@@ -200,7 +228,11 @@ impl MergeOp {
             Self::Plus => map2(a, b, |a, b| a + b),
             Self::From => map2(a, b, |a, b| b - a),
             Self::Minus => map2(a, b, |a, b| a - b),
-            Self::Multiply => map2(a, b, |a, b| a * b),
+            Self::Multiply => map2(a, b, |a, b| {
+                // Nuke's `multiply`: two super-blacks stay negative instead of
+                // flipping positive, per component.
+                if a < 0.0 && b < 0.0 { a } else { a * b }
+            }),
             Self::Stencil => {
                 let inv_alpha = 1.0 - a[3];
                 map2(a, b, |_, b| b * inv_alpha)
@@ -236,8 +268,16 @@ pub fn merge_pixel(
     mask: f32,
     mix: f32,
 ) -> [f32; 4] {
-    let result = operation.apply(foreground, background);
     let effective_mix = (mix * mask).clamp(0.0, 1.0);
+    // Exact endpoints: mix 0.0 returns the background, mix 1.0 returns the
+    // operation result (no `b + (result - b)` precision loss).
+    if effective_mix <= 0.0 {
+        return background;
+    }
+    let result = operation.apply(foreground, background);
+    if effective_mix >= 1.0 {
+        return result;
+    }
     let mut out = [0.0f32; 4];
     for channel in 0..4 {
         out[channel] =
@@ -267,13 +307,11 @@ pub fn mask_value(mask: Option<&Raster2D>, x: i32, y: i32) -> f32 {
 }
 
 /// Samples all four RGBA channels of a raster at one pixel.
+///
+/// Uses [`Raster2D::sample_rgba`] so a missing alpha plane reads as implicit
+/// `1.0` inside `bbox` and `0.0` outside, matching the rest of the pipeline.
 pub fn rgba_at(raster: &Raster2D, x: i32, y: i32) -> [f32; 4] {
-    [
-        raster.sample(&Channel::RgbaRed, x, y),
-        raster.sample(&Channel::RgbaGreen, x, y),
-        raster.sample(&Channel::RgbaBlue, x, y),
-        raster.sample(&Channel::RgbaAlpha, x, y),
-    ]
+    raster.sample_rgba(x, y)
 }
 
 /// Returns `true` for the four RGBA display channels.
@@ -295,10 +333,23 @@ pub fn uniform_rgba(raster: &Raster2D, tile: TileCoord, region: BBox) -> Option<
 }
 
 /// Uniform mask value over `region`, or `None` when the mask must be sampled.
+///
+/// Matches [`mask_value`]: a missing mask is `1.0`, an empty region or one
+/// entirely outside the mask's `bbox` is `0.0`, and a region crossing the bbox
+/// boundary must be sampled per pixel (`None`).
 pub fn uniform_mask_value(mask: Option<&Raster2D>, tile: TileCoord, region: BBox) -> Option<f32> {
     let Some(raster) = mask else {
         return Some(1.0);
     };
+    if region.is_empty() {
+        return Some(0.0);
+    }
+    if region.intersection(&raster.bbox).is_empty() {
+        return Some(0.0);
+    }
+    if !bbox_contains(raster.bbox, region) {
+        return None;
+    }
     if raster.channels.contains_key(&Channel::RgbaAlpha) {
         uniform_channel_value(raster, &Channel::RgbaAlpha, tile, region)
     } else if raster.channels.contains_key(&Channel::RgbaRed) {
@@ -331,7 +382,15 @@ fn uniform_channel_value(
 
     match raster.channels.get(channel) {
         Some(plane) => plane.get(&tile).and_then(|buffer| buffer.is_uniform()),
-        None => Some(0.0),
+        // A missing alpha plane is implicit opaque inside `bbox`; any other
+        // missing plane is transparent black.
+        None => {
+            if *channel == Channel::RgbaAlpha {
+                Some(1.0)
+            } else {
+                Some(0.0)
+            }
+        }
     }
 }
 
@@ -343,18 +402,44 @@ fn bbox_contains(outer: BBox, inner: BBox) -> bool {
             && outer.max_y >= inner.max_y)
 }
 
+/// Extracts an apron-padded single-channel tile for a missing alpha plane:
+/// implicit opaque (`1.0`) at samples inside `input.bbox`, transparent black
+/// (`0.0`) at exterior samples (`BlackOutside`).
+fn extract_implicit_alpha_padded(input: &Raster2D, tile: TileCoord, apron: u32) -> Vec<f32> {
+    let apron = apron as usize;
+    let stride = TILE_SIZE as usize + 2 * apron;
+    let (origin_x, origin_y) = tile.origin_world();
+    let start_x = origin_x.saturating_sub(apron as i32);
+    let start_y = origin_y.saturating_sub(apron as i32);
+    let bbox = input.bbox;
+    let mut out = vec![0.0f32; stride * stride];
+    for py in 0..stride {
+        let y = start_y + py as i32;
+        for px in 0..stride {
+            let x = start_x + px as i32;
+            if bbox.contains(x, y) {
+                out[py * stride + px] = 1.0;
+            }
+        }
+    }
+    out
+}
+
 /// Convolves one padded RGBA tile with a normalized separable 1D Gaussian on the CPU.
 ///
 /// A 2D Gaussian is separable (`G(x, y) = G(x) * G(y)`), so a horizontal 1D pass
 /// followed by a vertical 1D pass costs `2 * (2 * radius + 1)` samples per pixel
 /// instead of `(2 * radius + 1)^2`, producing the same mathematical result.
-/// RGB is weighted; alpha is passed through from the center pixel.
+/// When `blur_alpha` is true (`Blur`) all four premultiplied channels are
+/// convolved; when false (`Glow`) only RGB is weighted and alpha passes
+/// through from the center pixel.
 /// Returns one dense `TILE_SIZE x TILE_SIZE` interleaved tile.
 pub fn blur_padded_rgba(
     padded: &[[f32; 4]],
     radius: u32,
     sigma: f32,
     padded_width: u32,
+    blur_alpha: bool,
 ) -> Vec<[f32; 4]> {
     let radius_i = radius as i32;
     let stride = padded_width as usize;
@@ -384,15 +469,23 @@ pub fn blur_padded_rgba(
         for out_x in 0..TILE_SIZE {
             let center_x = out_x as i32 + radius_i;
             let center = padded[row_offset + center_x as usize];
-            let mut rgb = [0.0f32; 3];
+            let mut out = [0.0f32; 4];
             for dx in -radius_i..=radius_i {
                 let weight = weights[(dx + radius_i) as usize] * inv_weight_sum;
                 let sample = padded[row_offset + (center_x + dx) as usize];
-                rgb[0] += sample[0] * weight;
-                rgb[1] += sample[1] * weight;
-                rgb[2] += sample[2] * weight;
+                if blur_alpha {
+                    out[0] += sample[0] * weight;
+                    out[1] += sample[1] * weight;
+                    out[2] += sample[2] * weight;
+                    out[3] += sample[3] * weight;
+                } else {
+                    out[0] += sample[0] * weight;
+                    out[1] += sample[1] * weight;
+                    out[2] += sample[2] * weight;
+                    out[3] = center[3];
+                }
             }
-            row.push([rgb[0], rgb[1], rgb[2], center[3]]);
+            row.push(out);
         }
         row
     };
@@ -417,7 +510,7 @@ pub fn blur_padded_rgba(
         }
     }
 
-    // Pass 2: vertical 1D convolution, preserving the center pixel's alpha.
+    // Pass 2: vertical 1D convolution.
     let mut out = Vec::with_capacity(TILE_PIXELS);
     out.resize(TILE_PIXELS, [0.0f32; 4]);
 
@@ -426,16 +519,25 @@ pub fn blur_padded_rgba(
         let center_y = out_y as i32 + radius_i;
         let mut row = Vec::with_capacity(tsize);
         for out_x in 0..TILE_SIZE {
-            let mut rgb = [0.0f32; 3];
+            let center_index = center_y as usize * tsize + out_x as usize;
+            let center_alpha = intermediate[center_index][3];
+            let mut out = [0.0f32; 4];
             for dy in -radius_i..=radius_i {
                 let weight = weights[(dy + radius_i) as usize] * inv_weight_sum;
                 let sample = intermediate[((center_y + dy) as usize) * tsize + out_x as usize];
-                rgb[0] += sample[0] * weight;
-                rgb[1] += sample[1] * weight;
-                rgb[2] += sample[2] * weight;
+                if blur_alpha {
+                    out[0] += sample[0] * weight;
+                    out[1] += sample[1] * weight;
+                    out[2] += sample[2] * weight;
+                    out[3] += sample[3] * weight;
+                } else {
+                    out[0] += sample[0] * weight;
+                    out[1] += sample[1] * weight;
+                    out[2] += sample[2] * weight;
+                    out[3] = center_alpha;
+                }
             }
-            let center_alpha = intermediate[center_y as usize * tsize + out_x as usize][3];
-            row.push([rgb[0], rgb[1], rgb[2], center_alpha]);
+            row.push(out);
         }
         row
     };
@@ -462,19 +564,28 @@ pub fn blur_padded_rgba(
 }
 
 /// Runs the Gaussian blur over one padded tile, using the GPU when present.
+///
+/// `blur_alpha` (`true` = `Blur`, all four channels; `false` = `Glow`, RGB
+/// only) selects whether the alpha channel is convolved too.
 pub fn blur_padded_tile(
     padded: &[[f32; 4]],
     radius: u32,
     sigma: f32,
     padded_width: u32,
+    blur_alpha: bool,
     gpu: Option<&GpuComputeEngine>,
 ) -> Result<Vec<f32>, NodeError> {
     match gpu {
-        Some(engine) => engine.blur_tile(padded, &BlurParams::new(radius, sigma, padded_width)),
-        None => Ok(blur_padded_rgba(padded, radius, sigma, padded_width)
-            .into_iter()
-            .flatten()
-            .collect()),
+        Some(engine) => engine.blur_tile(
+            padded,
+            &BlurParams::new(radius, sigma, padded_width, blur_alpha),
+        ),
+        None => Ok(
+            blur_padded_rgba(padded, radius, sigma, padded_width, blur_alpha)
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
     }
 }
 
@@ -489,37 +600,41 @@ pub fn transform_gathered_rgba(
     height: u32,
     matrix: &Mat3x3,
 ) -> Vec<f32> {
-    let width_f = width as f32;
-    let height_f = height as f32;
     let stride = width as usize;
-    let max_x = width as i32 - 1;
-    let max_y = height as i32 - 1;
     let mut output = Vec::with_capacity(TILE_PIXELS * 4);
 
     for y in 0..TILE_SIZE {
         for x in 0..TILE_SIZE {
             let (u, v) = matrix.transform_point(x as f32, y as f32);
-            if u < 0.0 || v < 0.0 || u > width_f - 1.0 || v > height_f - 1.0 {
-                output.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
-                continue;
-            }
-
             let x0 = u.floor() as i32;
             let y0 = v.floor() as i32;
             let fx = u - x0 as f32;
             let fy = v - y0 as f32;
-            let x1 = (x0 + 1).min(max_x);
-            let y1 = (y0 + 1).min(max_y);
 
-            let index = |ix: i32, iy: i32| (iy as usize * stride + ix as usize) * 4;
-            let c00 = index(x0, y0);
-            let c10 = index(x1, y0);
-            let c01 = index(x0, y1);
-            let c11 = index(x1, y1);
+            // Resolve each of the four bilinear taps independently: an
+            // exterior tap (BlackOutside) reads transparent black, so the
+            // half-pixel strip before the first / after the last pixel center
+            // blends toward zero instead of being rejected outright.
+            let sample = |tx: i32, ty: i32| -> [f32; 4] {
+                if tx < 0 || ty < 0 || tx >= width as i32 || ty >= height as i32 {
+                    return [0.0; 4];
+                }
+                let idx = (ty as usize * stride + tx as usize) * 4;
+                [
+                    gathered[idx],
+                    gathered[idx + 1],
+                    gathered[idx + 2],
+                    gathered[idx + 3],
+                ]
+            };
+            let c00 = sample(x0, y0);
+            let c10 = sample(x0 + 1, y0);
+            let c01 = sample(x0, y0 + 1);
+            let c11 = sample(x0 + 1, y0 + 1);
 
             for channel in 0..4 {
-                let top = gathered[c00 + channel] * (1.0 - fx) + gathered[c10 + channel] * fx;
-                let bottom = gathered[c01 + channel] * (1.0 - fx) + gathered[c11 + channel] * fx;
+                let top = c00[channel] * (1.0 - fx) + c10[channel] * fx;
+                let bottom = c01[channel] * (1.0 - fx) + c11[channel] * fx;
                 output.push(top * (1.0 - fy) + bottom * fy);
             }
         }
@@ -714,6 +829,9 @@ fn gather_rgba_tile(raster: &Raster2D, tile: TileCoord) -> Vec<f32> {
     ];
     let stride = TILE_SIZE as usize;
     let mut out = vec![0.0f32; TILE_PIXELS * 4];
+    let (origin_x, origin_y) = tile.origin_world();
+    let bbox = raster.bbox;
+    let alpha_missing = planes[3].is_none();
 
     for_each_resolved_span(
         raster.bbox,
@@ -721,8 +839,16 @@ fn gather_rgba_tile(raster: &Raster2D, tile: TileCoord) -> Vec<f32> {
         tile,
         |col, row, run, source_tile, lx, ly| {
             let base = (row * stride + col) * 4;
-            for (index, plane) in planes.iter().enumerate() {
-                let Some(buffer) = plane.and_then(|plane| plane.get(&source_tile)) else {
+            // Every present plane (including a present alpha plane) reads its
+            // tile; missing planes keep the transparent-black default.
+            for index in 0..4 {
+                if index == 3 && alpha_missing {
+                    continue;
+                }
+                let Some(plane) = planes[index] else {
+                    continue;
+                };
+                let Some(buffer) = plane.get(&source_tile) else {
                     continue;
                 };
                 match buffer.is_uniform() {
@@ -737,6 +863,17 @@ fn gather_rgba_tile(raster: &Raster2D, tile: TileCoord) -> Vec<f32> {
                         for k in 0..run {
                             out[base + k * 4 + index] = src[src_off + k];
                         }
+                    }
+                }
+            }
+            // A missing alpha plane is implicit opaque inside `bbox` and
+            // transparent black outside it (matching `sample_rgba`).
+            if alpha_missing {
+                for k in 0..run {
+                    let x = origin_x + col as i32 + k as i32;
+                    let y = origin_y + row as i32;
+                    if bbox.contains(x, y) {
+                        out[base + k * 4 + 3] = 1.0;
                     }
                 }
             }
@@ -981,13 +1118,16 @@ pub fn downsample_raster(
     );
     let tiles = dst_bbox.tile_coords();
     let inv = f64::from(scale).recip();
-    let taps = |range: std::ops::Range<i32>, low: i32, high: i32| {
+    let taps = |range: std::ops::Range<i32>| {
         range
             .map(|dst| {
-                let sample =
-                    ((f64::from(dst) + 0.5) * inv - 0.5).clamp(f64::from(low), f64::from(high));
+                // Do not hard-clamp the source coordinate to the bbox: an
+                // exterior tap (BlackOutside) reads transparent black instead
+                // of the edge pixel, so a sample 0.25 px before the first
+                // pixel center blends 0.25 toward zero.
+                let sample = (f64::from(dst) + 0.5) * inv - 0.5;
                 let a = sample.floor() as i32;
-                let b = (sample.ceil() as i32).min(high);
+                let b = a + 1;
                 (a, b, (sample - f64::from(a)) as f32)
             })
             .collect::<Vec<_>>()
@@ -995,8 +1135,8 @@ pub fn downsample_raster(
     for (channel, plane) in &input.channels {
         let render_tile = |tile: &TileCoord| -> Result<Arc<TileBuffer>, NodeError> {
             let region = tile.to_bbox().intersection(&dst_bbox);
-            let xs = taps(region.min_x..region.max_x, source.min_x, source.max_x - 1);
-            let ys = taps(region.min_y..region.max_y, source.min_y, source.max_y - 1);
+            let xs = taps(region.min_x..region.max_x);
+            let ys = taps(region.min_y..region.max_y);
             let (first, _, _) = world_to_tile(xs[0].0, ys[0].0);
             let (last, _, _) = world_to_tile(xs[xs.len() - 1].1, ys[ys.len() - 1].1);
             // Only look up the small source footprint this output tile touches.
@@ -1017,7 +1157,13 @@ pub fn downsample_raster(
                 return Ok(Arc::new(TileBuffer::new_uniform(value)));
             }
             let sample = |x, y| {
-                let (coord, lx, ly) = world_to_tile(x, y);
+                // Resolve each tap independently through the bbox/edge mode:
+                // exterior taps read transparent black in `BlackOutside` and
+                // clamp/mirror/bounce for the other modes.
+                let Some((rx, ry)) = input.edge_mode.resolve_coord(x, y, source) else {
+                    return 0.0;
+                };
+                let (coord, lx, ly) = world_to_tile(rx, ry);
                 let index =
                     (coord.ty - first.ty) as usize * columns + (coord.tx - first.tx) as usize;
                 grid[index].map_or(0.0, |buf| buf.get(lx, ly))
@@ -1145,6 +1291,7 @@ pub fn perspective_warp_raster(
             grid_h,
         )
     });
+    let alpha_missing = input.channel(&Channel::RgbaAlpha).is_none();
 
     /// Samples one channel from the grid at world pixel `(x, y)`, resolving
     /// through `edge_mode`. `TileBuffer::Uniform(v)` returns `v` immediately;
@@ -1189,17 +1336,14 @@ pub fn perspective_warp_raster(
         max_ty: i32,
         edge_mode: EdgeMode,
         bbox: BBox,
+        alpha_missing: bool,
         x: f32,
         y: f32,
     ) -> [f32; 4] {
-        if x < bbox.min_x as f32
-            || x >= bbox.max_x as f32
-            || y < bbox.min_y as f32
-            || y >= bbox.max_y as f32
-        {
-            return [0.0; 4];
-        }
-
+        // Each bilinear tap is resolved independently against `edge_mode`:
+        // exterior taps read transparent black instead of the whole sample
+        // being rejected, so the half-pixel strip before the first / after the
+        // last pixel center blends toward zero.
         let x0 = x.floor() as i32;
         let y0 = y.floor() as i32;
         let fx = x - x0 as f32;
@@ -1209,6 +1353,22 @@ pub fn perspective_warp_raster(
 
         let mut out = [0.0f32; 4];
         for channel in 0..4 {
+            // A missing alpha plane is implicit opaque (`1.0`) inside `bbox`
+            // and transparent (`0.0`) outside, matching `sample_rgba`; resolve
+            // it per tap so the exterior half-pixel strip fades out.
+            if channel == 3 && alpha_missing {
+                let alpha_at = |tx: i32, ty: i32| {
+                    if bbox.contains(tx, ty) { 1.0f32 } else { 0.0 }
+                };
+                let c00 = alpha_at(x0, y0);
+                let c10 = alpha_at(x1, y0);
+                let c01 = alpha_at(x0, y1);
+                let c11 = alpha_at(x1, y1);
+                let top = c00 * (1.0 - fx) + c10 * fx;
+                let bottom = c01 * (1.0 - fx) + c11 * fx;
+                out[channel] = top * (1.0 - fy) + bottom * fy;
+                continue;
+            }
             let g = &grids[channel];
             let c00 = grid_sample(
                 g, grid_w, min_tx, min_ty, max_tx, max_ty, edge_mode, bbox, x0, y0,
@@ -1254,6 +1414,7 @@ pub fn perspective_warp_raster(
                         max_ty,
                         input.edge_mode,
                         input.bbox,
+                        alpha_missing,
                         source[0] - 0.5,
                         source[1] - 0.5,
                     ),
@@ -1600,16 +1761,37 @@ pub fn defocus_raster(
                 input.edge_mode,
             );
 
-            let alpha_uniform = region_uniform_value(input, &Channel::RgbaAlpha, padded_region);
+            let alpha_plane = input.channel(&Channel::RgbaAlpha);
+            let alpha_missing = alpha_plane.is_none();
+
+            // Missing alpha plane: implicit opaque (`1.0`) inside `input.bbox`,
+            // transparent black (`0.0`) outside — matching `sample_rgba`.
+            let alpha_uniform = if alpha_missing {
+                if padded_region.is_empty() {
+                    Some(0.0)
+                } else if bbox_contains(input.bbox, padded_region) {
+                    Some(1.0)
+                } else if padded_region.intersection(&input.bbox).is_empty() {
+                    Some(0.0)
+                } else {
+                    None
+                }
+            } else {
+                region_uniform_value(input, &Channel::RgbaAlpha, padded_region)
+            };
 
             let alpha_padded = if alpha_uniform.is_none() {
-                Some(extract_padded_tile(
-                    input.channel(&Channel::RgbaAlpha).unwrap_or(&empty_plane),
-                    tile,
-                    apron as u32,
-                    input.bbox,
-                    input.edge_mode,
-                ))
+                if alpha_missing {
+                    Some(extract_implicit_alpha_padded(input, tile, apron as u32))
+                } else {
+                    Some(extract_padded_tile(
+                        alpha_plane.unwrap(),
+                        tile,
+                        apron as u32,
+                        input.bbox,
+                        input.edge_mode,
+                    ))
+                }
             } else {
                 None
             };
@@ -1959,7 +2141,7 @@ mod tests {
             ];
         }
 
-        let cpu = blur_padded_rgba(&padded, radius, sigma, padded_width);
+        let cpu = blur_padded_rgba(&padded, radius, sigma, padded_width, true);
         assert_eq!(cpu.len(), TILE_PIXELS);
 
         // Reference: direct 2D Gaussian convolution (pre-separable math).
@@ -1976,7 +2158,7 @@ mod tests {
             for x in 0..TILE_SIZE {
                 let cx = x as i32 + radius_i;
                 let cy = y as i32 + radius_i;
-                let mut rgb = [0.0f32; 3];
+                let mut rgba = [0.0f32; 4];
                 let mut wi = 0usize;
                 for dy in -radius_i..=radius_i {
                     let row = (cy + dy) as usize * stride;
@@ -1984,17 +2166,16 @@ mod tests {
                         let w = ref_w[wi];
                         wi += 1;
                         let s = padded[row + (cx + dx) as usize];
-                        rgb[0] += s[0] * w;
-                        rgb[1] += s[1] * w;
-                        rgb[2] += s[2] * w;
+                        for channel in 0..4 {
+                            rgba[channel] += s[channel] * w;
+                        }
                     }
                 }
-                let center = padded[cy as usize * stride + cx as usize];
                 let expected = [
-                    rgb[0] / ref_sum,
-                    rgb[1] / ref_sum,
-                    rgb[2] / ref_sum,
-                    center[3],
+                    rgba[0] / ref_sum,
+                    rgba[1] / ref_sum,
+                    rgba[2] / ref_sum,
+                    rgba[3] / ref_sum,
                 ];
                 let actual = cpu[y as usize * TILE_SIZE as usize + x as usize];
                 for channel in 0..4 {
@@ -2008,13 +2189,13 @@ mod tests {
             }
         }
 
-        // Impulse sanity: a single lit pixel blurs to the normalized Gaussian,
-        // and the center alpha passes through untouched.
+        // Impulse sanity: a single lit pixel blurs to the normalized Gaussian in
+        // all four premultiplied channels, so alpha matches RGB exactly.
         let mut impulse = vec![[0.0f32; 4]; (padded_width * padded_width) as usize];
         let impulse_x = (TILE_SIZE / 2) as i32 + radius_i;
         let impulse_y = (TILE_SIZE / 2) as i32 + radius_i;
         impulse[(impulse_y as usize * padded_width as usize) + impulse_x as usize] = [1.0; 4];
-        let out = blur_padded_rgba(&impulse, radius, sigma, padded_width);
+        let out = blur_padded_rgba(&impulse, radius, sigma, padded_width, true);
         let ox = (TILE_SIZE / 2) as usize;
         let oy = (TILE_SIZE / 2) as usize;
         let center = out[oy * TILE_SIZE as usize + ox];
@@ -2029,11 +2210,36 @@ mod tests {
             center[0],
             expected_center
         );
-        assert!((center[3] - 1.0).abs() < 1e-5, "impulse alpha preserved");
+        assert!(
+            (center[3] - expected_center).abs() < 1e-5,
+            "impulse alpha blurs like RGB: {} vs {}",
+            center[3],
+            expected_center
+        );
+        let neighbor = out[oy * TILE_SIZE as usize + ox + 1];
+        assert!(
+            (neighbor[3] - neighbor[0]).abs() < 1e-6,
+            "blurred alpha matches blurred RGB off-center"
+        );
+
+        // `Glow`-style blur keeps the center alpha untouched.
+        let rgb_only = blur_padded_rgba(&padded, radius, sigma, padded_width, false);
+        for y in 0..TILE_SIZE {
+            for x in 0..TILE_SIZE {
+                let cx = x as i32 + radius_i;
+                let cy = y as i32 + radius_i;
+                let center_alpha = padded[cy as usize * stride + cx as usize][3];
+                let actual = rgb_only[y as usize * TILE_SIZE as usize + x as usize];
+                assert!(
+                    (actual[3] - center_alpha).abs() < 1e-6,
+                    "rgb-only blur must preserve center alpha"
+                );
+            }
+        }
 
         // GPU vs CPU parity within 1e-4.
         if let Some(engine) = test_render_engine() {
-            let gpu = blur_padded_tile(&padded, radius, sigma, padded_width, Some(&engine))
+            let gpu = blur_padded_tile(&padded, radius, sigma, padded_width, true, Some(&engine))
                 .expect("blur dispatch");
             assert_eq!(gpu.len(), crate::shader::TILE_RGBA_VALUES);
             for (i, (actual, expected)) in gpu.chunks_exact(4).zip(cpu.iter()).enumerate() {

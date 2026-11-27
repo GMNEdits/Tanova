@@ -247,28 +247,15 @@ fn constant_sample(input: &Raster2D, inverse: &Mat3x3, region: BBox) -> Option<[
 }
 
 fn bilinear(input: &Raster2D, x: f32, y: f32) -> [f32; 4] {
-    let bbox = input.bbox;
     let (ix, iy) = (x.floor() as i32, y.floor() as i32);
-    // Match the spatial renderer's black exterior and clamp taps on the final pixel.
-    if !bbox.contains(ix, iy) || x > (bbox.max_x - 1) as f32 || y > (bbox.max_y - 1) as f32 {
-        return [0.0; 4];
-    }
-
     let (fx, fy) = (x - ix as f32, y - iy as f32);
-    let sample_row = |row| {
-        let left = input.sample_rgba(ix, row);
-        if fx == 0.0 {
-            return left;
-        }
-        let right = input.sample_rgba(ix + 1, row);
-        std::array::from_fn(|c| left[c] * (1.0 - fx) + right[c] * fx)
-    };
-    let lower = sample_row(iy);
-    if fy == 0.0 {
-        return lower;
-    }
-    let upper = sample_row(iy + 1);
-    std::array::from_fn(|c| lower[c] * (1.0 - fy) + upper[c] * fy)
+    let c00 = input.sample_rgba(ix, iy);
+    let c10 = input.sample_rgba(ix + 1, iy);
+    let c01 = input.sample_rgba(ix, iy + 1);
+    let c11 = input.sample_rgba(ix + 1, iy + 1);
+    let top: [f32; 4] = std::array::from_fn(|c| c00[c] * (1.0 - fx) + c10[c] * fx);
+    let bottom: [f32; 4] = std::array::from_fn(|c| c01[c] * (1.0 - fx) + c11[c] * fx);
+    std::array::from_fn(|c| top[c] * (1.0 - fy) + bottom[c] * fy)
 }
 
 inventory::submit! {

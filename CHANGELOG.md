@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Canvas:** 2.0 px `Color32::from_rgb(235,75,70)` border plus `"CRASH"`/`"ERR"` pill on erroring nodes; the `Order::Tooltip` hover area shows the truncated error reason even without timing data.
 - **`ViewerPanel::active_error`:** non-blocking dark-red banner (`Color32::from_rgba_unmultiplied(120,24,24,225)`, 1 px bright-red border, one truncated line, full text on hover) pinned to the top interior edge of the Viewer viewport.
 
+### Fixed
+
+- **`Blur` now filters alpha:** `BlurParams` carries `blur_alpha` (`u32` for 16-byte WGSL alignment), and `Blur` convolves all four premultiplied RGBA channels so antialiased cutouts stay halo-free; `Glow` sets it to `0` and keeps RGB-only bloom with untouched base alpha.
+- **`Glow` zero-highlight `effect_only`:** no longer emits an all-zero RGBA tile before reading the mask input; it routes through the mask-aware composite with `bloom = [0,0,0]`, so mask `0` returns the input, mask `0.5` blends halfway toward black, and base alpha survives.
+- **Grade-family unpremult policy:** `Grade`, `ColorCorrect` and `Saturation` use exact `effective_mix <= 0`/`>= 1` endpoints, a consistent `unpremult -> process -> premult` order, and force processed RGB to `[0,0,0]` at `alpha == 0` or non-finite alpha so `offset`/`lift`/`gain` can never leak RGB onto transparent pixels. `Saturation` no longer produces `inf`/`NaN` from `rgb / tiny_alpha`.
+- **`Merge2` Multiply:** two super-blacks stay negative per component (`if a < 0.0 && b < 0.0 { a } else { a * b }`) on both CPU and WGSL, with exact mix `0`/`1` endpoints.
+- **`Unpremult` tiny alpha:** removed the `|alpha| <= 1e-5` passthrough; only `alpha == 0` or non-finite alpha is a passthrough, and tiny signed factors (`±1e-6`) round-trip cleanly with `Premult`.
+- **Missing-alpha consistency:** an absent `RgbaAlpha` plane is implicit `1.0` inside `raster.bbox` and `0.0` outside in `BlackOutside` (uniform, gathered, warped, defocused, premult and blur paths, plus the fast display converter); a present-but-sparse alpha tile stays `0.0`.
+- **Resampler boundary taps:** `Transform`, `Reformat`, `CornerPin2D` and downsampling resolve each bilinear tap independently against the bbox/edge mode, so the outer `[-0.5..0.5]` half-pixel strip blends toward transparent black instead of being rejected or hard-clamped.
+- **Mask uniformity:** `uniform_mask_value` checks an empty region / empty bbox intersection (`Some(0.0)`) and a region crossing the bbox boundary (`None`) before the `Some(1.0)` fallback, matching `mask_value`.
+- **Viewer error banner text:** drawn at `banner_rect.left() + 10.0` with `Align2::LEFT_CENTER`, vertically centered against the banner.
+
 ## [0.6.5] - 2026-11-26
 
 **Phase 8 — Project Format Versioning, Atomic Save & Crash Recovery (Milestone 25).**

@@ -198,6 +198,7 @@ impl BloomTile {
                 radius,
                 sigma,
                 TILE_SIZE + 2 * radius,
+                false,
                 ctx.gpu(),
             )?
         };
@@ -237,23 +238,23 @@ impl NodeTrait for GlowNode {
         }
 
         let mut packet = Packet::new();
-        let Some(highlights) = op.extract_highlights(input, ctx)? else {
-            if !op.effect_only {
-                return Ok(inputs[0].clone());
-            }
-            let mut output = output_with_aovs(input, input.bbox);
-            let zero = Arc::new(TileBuffer::new_uniform(0.0));
-            for tile in output.bbox.tile_coords() {
-                for channel in RGBA {
-                    output
-                        .channels
-                        .entry(channel)
-                        .or_default()
-                        .insert(tile, Arc::clone(&zero));
+        // Zero highlights with `effect_only`: still run the mask-aware
+        // composite with `bloom = [0, 0, 0]` so base alpha is preserved, a
+        // `0.0` mask returns the input untouched, and a `0.5` mask blends
+        // halfway toward black. An empty (all-zero) highlights raster makes
+        // `BloomTile` report zero bloom everywhere.
+        let highlights = match op.extract_highlights(input, ctx)? {
+            Some(h) => h,
+            None => {
+                if !op.effect_only {
+                    return Ok(inputs[0].clone());
                 }
+                let mut empty = Raster2D::new(input.format.clone(), input.bbox, input.edge_mode);
+                for channel in RGB {
+                    empty.insert_channel(channel, ChannelPlane::new());
+                }
+                empty
             }
-            packet.insert(output);
-            return Ok(packet);
         };
 
         let mask = raster_input(inputs, 1);
@@ -376,7 +377,9 @@ mod tests {
             .clone();
         let mut packet = Packet::new();
         packet.insert(input);
-        let governor = MemoryGovernor::new(0);
+        // The padded apron is transparent outside the input bbox while the
+        // interior alpha is implicitly opaque, so the alpha plane is dense.
+        let governor = MemoryGovernor::new(4 * 1024 * 1024);
         let mut ctx = EvalContext::new();
         ctx.insert(governor.clone());
 
@@ -395,9 +398,10 @@ mod tests {
             .evaluate(&ctx, &[packet])
             .unwrap();
         let raster = output.get::<Raster2D>().unwrap();
-        assert_eq!(raster.bbox, BBox::new(0, 0, 8, 8));
-        assert_eq!(raster.sample_rgba(2, 2), [0.0; 4]);
-        assert_eq!(governor.allocated_bytes(), 0);
+        assert_eq!(raster.bbox, BBox::new(-10, -10, 18, 18));
+        // Zero highlights + `effect_only` zeroes RGB but preserves the base
+        // alpha, which is implicitly opaque inside the bbox.
+        assert_eq!(raster.sample_rgba(2, 2), [0.0, 0.0, 0.0, 1.0]);
     }
 
     #[test]

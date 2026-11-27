@@ -76,16 +76,18 @@ impl UnpremultOp {
     }
     /// Applies the operation with an already sampled factor from the selected plane.
     pub fn apply_pixel(&self, rgba: [f32; 4], alpha: f32) -> [f32; 4] {
-        if self.alpha == AlphaSource::None
-            || self.mix == 0.0
-            || alpha.abs() <= 1e-5
-            || alpha.is_nan()
-        {
+        if self.alpha == AlphaSource::None || self.mix == 0.0 {
+            return rgba;
+        }
+        // Guard cleanly: zero or non-finite alpha is a passthrough; tiny
+        // signed factors (e.g. `±1e-6`) round-trip cleanly with `Premult`.
+        if alpha == 0.0 || !alpha.is_finite() {
             return rgba;
         }
         let mut out = rgba;
         for c in 0..3 {
-            let corrected = rgba[c] / alpha;
+            let q = rgba[c] / alpha;
+            let corrected = if q.is_finite() { q } else { rgba[c] };
             out[c] = if self.mix == 1.0 {
                 corrected
             } else {
@@ -227,14 +229,31 @@ mod tests {
     }
     #[test]
     fn tiny_alpha_is_safe() {
-        for alpha in [0.0, 1e-5, -1e-5] {
+        // Alpha exactly zero is a passthrough (nothing to divide by).
+        let p = UnpremultNode::new()
+            .evaluate(&EvalContext::new(), &[input([0.2, 0.4, 0.8, 0.0])])
+            .unwrap();
+        assert_eq!(
+            p.get::<Raster2D>().unwrap().sample_rgba(0, 0),
+            [0.2, 0.4, 0.8, 0.0]
+        );
+
+        // Tiny signed alphas are no longer swallowed by an absolute cutoff:
+        // they divide through and stay finite.
+        for alpha in [1e-5f32, 1e-6, -1e-6] {
             let p = UnpremultNode::new()
                 .evaluate(&EvalContext::new(), &[input([0.2, 0.4, 0.8, alpha])])
                 .unwrap();
-            assert_eq!(
-                p.get::<Raster2D>().unwrap().sample_rgba(0, 0),
-                [0.2, 0.4, 0.8, alpha]
-            );
+            let rgba = p.get::<Raster2D>().unwrap().sample_rgba(0, 0);
+            assert!(rgba[..3].iter().all(|value| value.is_finite()));
+            for (actual, original) in rgba[..3].iter().zip([0.2f32, 0.4, 0.8]) {
+                let expected = original / alpha;
+                assert!(
+                    (actual - expected).abs() <= expected.abs() * 1e-6,
+                    "unpremult must divide through tiny alpha {alpha}: {actual} vs {expected}"
+                );
+            }
+            assert_eq!(rgba[3], alpha);
         }
     }
     #[test]

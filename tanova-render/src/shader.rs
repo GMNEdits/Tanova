@@ -118,16 +118,23 @@ pub struct BlurParams {
     pub apron: u32,
     /// Row stride of the padded input buffer, in pixels.
     pub padded_width: u32,
+    /// `1` blurs all four premultiplied RGBA channels (`Blur`); `0` blurs RGB
+    /// only and leaves alpha untouched (`Glow`).
+    pub blur_alpha: u32,
+    /// Padding keeps the uniform block at 32 bytes (16-byte aligned).
+    pub padding: [u32; 3],
 }
 
 impl BlurParams {
     /// Packs the blur geometry into GPU-ready uniforms.
-    pub fn new(radius: u32, sigma: f32, padded_width: u32) -> Self {
+    pub fn new(radius: u32, sigma: f32, padded_width: u32, blur_alpha: bool) -> Self {
         Self {
             radius,
             sigma,
             apron: radius,
             padded_width,
+            blur_alpha: u32::from(blur_alpha),
+            padding: [0; 3],
         }
     }
 }
@@ -706,6 +713,11 @@ struct GradeParams {
 @group(0) @binding(2) var<uniform> params: GradeParams;
 @group(0) @binding(3) var<storage, read_write> output_pixels: array<vec4<f32>>;
 
+// WGSL has no `isNan`/`isInf`; NaN and infinity both fail these comparisons.
+fn is_finite(value: f32) -> bool {
+    return value > -3.4028234e38 && value < 3.4028234e38;
+}
+
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= 256u || id.y >= 256u) {
@@ -714,11 +726,31 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let index = id.y * 256u + id.x;
     let rgba = input_pixels[index];
     let alpha = rgba.a;
-    let unpremultiply = params.flags.x != 0u && alpha > 1e-5;
+    let effective_mix = clamp(params.mix.x * mask_values[index], 0.0, 1.0);
+    if (effective_mix <= 0.0) {
+        output_pixels[index] = rgba;
+        return;
+    }
 
+    let unpremultiply = params.flags.x != 0u;
+    let alpha_invalid = alpha == 0.0 || !is_finite(alpha);
     var work_rgb = rgba.rgb;
+    var zero_processed = false;
     if (unpremultiply) {
-        work_rgb = rgba.rgb / alpha;
+        if (alpha_invalid) {
+            zero_processed = true;
+            work_rgb = vec3<f32>(0.0);
+        } else {
+            let divided = rgba.rgb / alpha;
+            if (!is_finite(divided.x) ||
+                !is_finite(divided.y) ||
+                !is_finite(divided.z)) {
+                zero_processed = true;
+                work_rgb = vec3<f32>(0.0);
+            } else {
+                work_rgb = divided;
+            }
+        }
     }
 
     var graded = vec3<f32>(0.0);
@@ -747,11 +779,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         graded[channel] = value;
     }
 
-    let effective_mix = clamp(params.mix.x * mask_values[index], 0.0, 1.0);
-    var out_rgb = work_rgb + (graded - work_rgb) * effective_mix;
     if (unpremultiply) {
-        out_rgb = out_rgb * alpha;
+        if (zero_processed) {
+            graded = vec3<f32>(0.0);
+        } else {
+            graded = graded * alpha;
+        }
     }
+
+    if (effective_mix >= 1.0) {
+        output_pixels[index] = vec4<f32>(graded, alpha);
+        return;
+    }
+    let out_rgb = rgba.rgb + (graded - rgba.rgb) * effective_mix;
     output_pixels[index] = vec4<f32>(out_rgb, alpha);
 }
 "#;
@@ -783,7 +823,14 @@ fn apply(op: u32, a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
             return a - b;
         }
         case 5u: {
-            return a * b;
+            // Nuke's `multiply`: two super-blacks stay negative instead of
+            // flipping positive, per component.
+            var product = a * b;
+            if (a.x < 0.0 && b.x < 0.0) { product.x = a.x; }
+            if (a.y < 0.0 && b.y < 0.0) { product.y = a.y; }
+            if (a.z < 0.0 && b.z < 0.0) { product.z = a.z; }
+            if (a.w < 0.0 && b.w < 0.0) { product.w = a.w; }
+            return product;
         }
         case 6u: {
             return b * (1.0 - a.a);
@@ -805,8 +852,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let index = id.y * 256u + id.x;
     let a = foreground_pixels[index];
     let b = background_pixels[index];
-    let result = apply(params.operation.x, a, b);
     let effective_mix = clamp(params.mix.x * mask_values[index], 0.0, 1.0);
+    if (effective_mix <= 0.0) {
+        output_pixels[index] = b;
+        return;
+    }
+    let result = apply(params.operation.x, a, b);
+    if (effective_mix >= 1.0) {
+        output_pixels[index] = result;
+        return;
+    }
     output_pixels[index] = b + (result - b) * effective_mix;
 }
 "#;
@@ -817,6 +872,10 @@ struct BlurParams {
     sigma: f32,
     apron: u32,
     padded_width: u32,
+    blur_alpha: u32,
+    padding0: u32,
+    padding1: u32,
+    padding2: u32,
 };
 
 // Horizontal 1D pass: convolves each padded row across `dx`, writing one
@@ -841,19 +900,23 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let sigma = max(params.sigma, 1e-5);
     let denom = max(2.0 * sigma * sigma, 1e-10);
 
-    var sum = vec3<f32>(0.0);
+    var sum = vec4<f32>(0.0);
     var weight_sum = 0.0;
     for (var dx = -radius; dx <= radius; dx = dx + 1) {
         let weight = exp(-f32(dx * dx) / denom);
         let sample = input_pixels[center_y * stride + (center_x + dx)];
-        sum = sum + sample.rgb * weight;
+        sum = sum + sample * weight;
         weight_sum = weight_sum + weight;
     }
 
-    // Alpha is intentionally untouched: premultiplied pipeline, center coverage
-    // survives the RGB convolution.
+    // `Blur` filters all four premultiplied channels so antialiased cutouts
+    // stay halo-free; `Glow` keeps the center alpha and blooms RGB only.
     let center = input_pixels[center_y * stride + center_x];
-    output_pixels[id.y * 256u + id.x] = vec4<f32>(sum / weight_sum, center.a);
+    var result = vec4<f32>(sum.rgb / weight_sum, center.a);
+    if (params.blur_alpha != 0u) {
+        result = sum / weight_sum;
+    }
+    output_pixels[id.y * 256u + id.x] = result;
 }
 "#;
 
@@ -863,6 +926,10 @@ struct BlurParams {
     sigma: f32,
     apron: u32,
     padded_width: u32,
+    blur_alpha: u32,
+    padding0: u32,
+    padding1: u32,
+    padding2: u32,
 };
 
 // Vertical 1D pass: convolves the horizontal intermediate down the `dy` axis,
@@ -885,17 +952,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let sigma = max(params.sigma, 1e-5);
     let denom = max(2.0 * sigma * sigma, 1e-10);
 
-    var sum = vec3<f32>(0.0);
+    var sum = vec4<f32>(0.0);
     var weight_sum = 0.0;
     for (var dy = -radius; dy <= radius; dy = dy + 1) {
         let weight = exp(-f32(dy * dy) / denom);
         let sample = input_pixels[(center_y + dy) * stride + center_x];
-        sum = sum + sample.rgb * weight;
+        sum = sum + sample * weight;
         weight_sum = weight_sum + weight;
     }
 
     let center = input_pixels[center_y * stride + center_x];
-    output_pixels[id.y * 256u + id.x] = vec4<f32>(sum / weight_sum, center.a);
+    var result = vec4<f32>(sum.rgb / weight_sum, center.a);
+    if (params.blur_alpha != 0u) {
+        result = sum / weight_sum;
+    }
+    output_pixels[id.y * 256u + id.x] = result;
 }
 "#;
 
@@ -912,6 +983,16 @@ struct TransformParams {
 @group(0) @binding(0) var<storage, read> input_pixels: array<vec4<f32>>;
 @group(0) @binding(1) var<uniform> params: TransformParams;
 @group(0) @binding(2) var<storage, read_write> output_pixels: array<vec4<f32>>;
+
+// Each bilinear tap is resolved independently: exterior taps read transparent
+// black, so the half-pixel strip before the first / after the last pixel
+// center blends against zero instead of being rejected outright.
+fn sample_tap(ix: i32, iy: i32, width: i32, height: i32) -> vec4<f32> {
+    if (ix < 0 || iy < 0 || ix >= width || iy >= height) {
+        return vec4<f32>(0.0);
+    }
+    return input_pixels[iy * width + ix];
+}
 
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -932,28 +1013,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         dot(params.inv_row1.xyz, local),
     ) / w;
 
-    let width = f32(params.input_size.x);
-    let height = f32(params.input_size.y);
-
-    // Outside the gathered footprint is transparent black. The +2 px gather
-    // margin keeps tile interiors away from this branch.
-    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > width - 1.0 || uv.y > height - 1.0) {
-        output_pixels[index] = vec4<f32>(0.0);
-        return;
-    }
-
+    let width = i32(params.input_size.x);
+    let height = i32(params.input_size.y);
     let x0 = i32(floor(uv.x));
     let y0 = i32(floor(uv.y));
     let fx = uv.x - f32(x0);
     let fy = uv.y - f32(y0);
-    let stride = i32(params.input_size.x);
-    let x1 = min(x0 + 1, i32(params.input_size.x) - 1);
-    let y1 = min(y0 + 1, i32(params.input_size.y) - 1);
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
 
-    let c00 = input_pixels[y0 * stride + x0];
-    let c10 = input_pixels[y0 * stride + x1];
-    let c01 = input_pixels[y1 * stride + x0];
-    let c11 = input_pixels[y1 * stride + x1];
+    let c00 = sample_tap(x0, y0, width, height);
+    let c10 = sample_tap(x1, y0, width, height);
+    let c01 = sample_tap(x0, y1, width, height);
+    let c11 = sample_tap(x1, y1, width, height);
 
     let top = mix(c00, c10, fx);
     let bottom = mix(c01, c11, fx);
@@ -1007,7 +1079,7 @@ mod tests {
     fn uniform_structs_match_wgsl_alignment() {
         assert_eq!(std::mem::size_of::<GradeParams>(), 144);
         assert_eq!(std::mem::size_of::<MergeParams>(), 32);
-        assert_eq!(std::mem::size_of::<BlurParams>(), 16);
+        assert_eq!(std::mem::size_of::<BlurParams>(), 32);
         assert_eq!(std::mem::size_of::<TransformParams>(), 64);
         assert_eq!(std::mem::align_of::<GradeParams>(), 4);
     }
@@ -1076,9 +1148,9 @@ mod tests {
         }
 
         let gpu = engine
-            .blur_tile(&padded, &BlurParams::new(radius, sigma, padded_width))
+            .blur_tile(&padded, &BlurParams::new(radius, sigma, padded_width, true))
             .expect("blur dispatch");
-        let cpu = crate::ops::blur_padded_rgba(&padded, radius, sigma, padded_width);
+        let cpu = crate::ops::blur_padded_rgba(&padded, radius, sigma, padded_width, true);
 
         assert_eq!(gpu.len(), TILE_RGBA_VALUES);
         for (index, (actual, expected)) in gpu.chunks_exact(4).zip(cpu.iter()).enumerate() {

@@ -241,3 +241,7 @@ All budgets are measured on our daily reference laptop with the OS and browser t
 - [x] **Canvas error badges:** 2.0 px `Color32::from_rgb(235,75,70)` border plus `"CRASH"`/`"ERR"` pill; `Order::Tooltip` hover area shows the truncated error reason even without timing data.
 
 - [x] **Viewer error banner:** `ViewerPanel::active_error`, non-blocking dark-red banner pinned to the top interior edge of the Viewer viewport.
+
+- [x] **Alpha & Premultiplication Audit (Milestone 28 Part 2):** `Blur` filters all four premultiplied channels while `Glow` keeps RGB-only bloom and base alpha; zero-highlight `Glow` `effect_only` routes through the mask-aware composite; `Grade`/`ColorCorrect`/`Saturation` use exact mix endpoints and never leak RGB at zero/non-finite alpha; `Merge2` Multiply keeps two super-blacks negative; `Unpremult` round-trips tiny signed alpha; missing-alpha planes are implicit `1.0` inside the bbox and `0.0` outside in `BlackOutside`; `Transform`/`Reformat`/`CornerPin2D`/downsample resolve each bilinear tap independently across the outer half-pixel strip; `uniform_mask_value` matches `mask_value`; Viewer banner text is vertically centered.
+
+- [x] **Milestone 28 final commit:** live GUI verification passed on `v0.7.0-testing`; Alpha & Premultiplication audit fixes and centered Viewer error banner committed.

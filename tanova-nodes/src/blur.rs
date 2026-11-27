@@ -149,7 +149,7 @@ impl NodeTrait for BlurNode {
                 ]);
             }
 
-            let pixels = blur_padded_tile(&padded, radius, sigma, padded_width, gpu)?;
+            let pixels = blur_padded_tile(&padded, radius, sigma, padded_width, true, gpu)?;
             insert_dense(
                 [&mut red, &mut green, &mut blue, &mut alpha],
                 tile,
@@ -186,12 +186,29 @@ fn padded_channel(
     match input.channel(channel) {
         Some(plane) => extract_padded_tile(plane, tile, apron, input.bbox, input.edge_mode),
         None => {
-            let value = if *channel == Channel::RgbaAlpha {
-                1.0
+            if *channel == Channel::RgbaAlpha {
+                // Missing alpha plane: implicit opaque (`1.0`) strictly inside
+                // `input.bbox`, transparent black (`0.0`) on the exterior apron
+                // for `BlackOutside` — not `1.0` across the whole padded tile.
+                let padded_width = (padded_pixels as f64).sqrt() as u32;
+                let (origin_x, origin_y) = tile.origin_world();
+                let start_x = origin_x.saturating_sub(apron as i32);
+                let start_y = origin_y.saturating_sub(apron as i32);
+                let bbox = input.bbox;
+                let mut out = vec![0.0f32; padded_pixels];
+                for py in 0..padded_width {
+                    let y = start_y + py as i32;
+                    for px in 0..padded_width {
+                        let x = start_x + px as i32;
+                        if bbox.contains(x, y) {
+                            out[(py * padded_width + px) as usize] = 1.0;
+                        }
+                    }
+                }
+                out
             } else {
-                0.0
-            };
-            vec![value; padded_pixels]
+                vec![0.0; padded_pixels]
+            }
         }
     }
 }
@@ -393,8 +410,14 @@ mod tests {
             neighbour[0] > 0.0 && neighbour[0] < center[0],
             "the impulse must bleed into the neighbour: {neighbour:?}"
         );
-        assert_eq!(center[3], 1.0, "alpha must pass through untouched");
-        assert_eq!(neighbour[3], 0.0, "alpha must not blur");
+        assert!(
+            (center[3] - center[0]).abs() < 1e-6,
+            "alpha must blur identically to RGB: {center:?}"
+        );
+        assert!(
+            (neighbour[3] - neighbour[0]).abs() < 1e-6,
+            "blurred alpha must match blurred RGB in the neighbour: {neighbour:?}"
+        );
     }
 
     #[test]

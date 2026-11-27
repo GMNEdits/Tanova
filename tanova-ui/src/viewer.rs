@@ -960,7 +960,7 @@ impl ViewerPanel {
             format!("{truncated}...")
         };
         painter.text(
-            banner_rect.min + Vec2::new(8.0, 0.0),
+            egui::pos2(banner_rect.left() + 10.0, banner_rect.center().y),
             Align2::LEFT_CENTER,
             display,
             font,

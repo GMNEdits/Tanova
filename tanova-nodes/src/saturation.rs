@@ -87,29 +87,35 @@ impl SaturationOp {
     fn apply(&self, [r, g, b, alpha]: [f32; 4], mask: f32) -> [f32; 3] {
         let mix = (self.mix * mask).clamp(0.0, 1.0);
         let original = [r, g, b];
-        if mix == 0.0 {
+        if mix <= 0.0 {
             return original;
         }
-        let unpremult = self.unpremult && alpha != 0.0;
-        let rgb = if unpremult {
-            original.map(|value| value / alpha)
-        } else {
-            original
-        };
-        let luma = self.mode.luminance(rgb);
-        std::array::from_fn(|c| {
-            let adjusted = luma + (rgb[c] - luma) * self.saturation;
-            let adjusted = if unpremult {
-                adjusted * alpha
+        let unpremult = self.unpremult;
+        let alpha_invalid = alpha == 0.0 || !alpha.is_finite();
+        let mut rgb = original;
+        if unpremult {
+            if alpha_invalid {
+                rgb = [0.0, 0.0, 0.0];
             } else {
-                adjusted
-            };
-            if mix == 1.0 {
-                adjusted
-            } else {
-                original[c] + (adjusted - original[c]) * mix
+                rgb = std::array::from_fn(|c| {
+                    let q = original[c] / alpha;
+                    if q.is_finite() { q } else { original[c] }
+                });
             }
-        })
+        }
+        let luma = self.mode.luminance(rgb);
+        let mut adjusted = std::array::from_fn(|c| luma + (rgb[c] - luma) * self.saturation);
+        if unpremult {
+            adjusted = if alpha_invalid {
+                [0.0, 0.0, 0.0]
+            } else {
+                adjusted.map(|value| value * alpha)
+            };
+        }
+        if mix >= 1.0 {
+            return adjusted;
+        }
+        std::array::from_fn(|c| original[c] + (adjusted[c] - original[c]) * mix)
     }
 }
 

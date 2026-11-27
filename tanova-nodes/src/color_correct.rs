@@ -71,39 +71,57 @@ impl ColorCorrectOp {
         }
     }
     pub fn apply_pixel(&self, rgba: [f32; 4], mask: f32) -> [f32; 4] {
-        let corrected = {
-            let mut out = rgba;
-            let unpremult = self.unpremult && rgba[3].abs() > 1e-5;
-            if unpremult {
-                for value in &mut out[..3] {
-                    *value /= rgba[3];
-                }
-            }
-            let luma = 0.2126 * out[0] + 0.7152 * out[1] + 0.0722 * out[2];
-            for value in &mut out[..3] {
-                *value = luma + (*value - luma) * self.saturation;
-                *value = 0.18 + (*value - 0.18) * self.contrast;
-                let gamma = self.gamma;
-                if *value > 0.0 && gamma > 1e-6 {
-                    *value = value.powf(self.inverse_gamma);
-                }
-                *value = *value * self.gain + self.offset;
-                if unpremult {
-                    *value *= rgba[3];
-                }
-            }
-            out
-        };
+        let alpha = rgba[3];
         let mix = (self.mix * mask).clamp(0.0, 1.0);
-        if mix == 0.0 {
+        // Exact endpoints: mix 0.0 returns the original pixel; mix 1.0 returns
+        // the processed result directly (no round-trip drift).
+        if mix <= 0.0 {
             return rgba;
         }
-        if mix == 1.0 {
-            return corrected;
+
+        let unpremultiply = self.unpremult;
+        let alpha_invalid = alpha == 0.0 || !alpha.is_finite();
+        let mut work = [rgba[0], rgba[1], rgba[2]];
+        if unpremultiply {
+            if alpha_invalid {
+                work = [0.0, 0.0, 0.0];
+            } else {
+                work = std::array::from_fn(|c| {
+                    let q = rgba[c] / alpha;
+                    if q.is_finite() { q } else { rgba[c] }
+                });
+            }
+        }
+
+        let luma = 0.2126 * work[0] + 0.7152 * work[1] + 0.0722 * work[2];
+        let mut graded = work;
+        for value in &mut graded {
+            *value = luma + (*value - luma) * self.saturation;
+            *value = 0.18 + (*value - 0.18) * self.contrast;
+            let gamma = self.gamma;
+            if *value > 0.0 && gamma > 1e-6 {
+                *value = value.powf(self.inverse_gamma);
+            }
+            *value = *value * self.gain + self.offset;
+        }
+
+        // Always repremultiply: `offset`/`gain` can never leak RGB onto
+        // transparent or non-finite alpha pixels because the processed RGB is
+        // forced to `[0, 0, 0]` there.
+        if unpremultiply {
+            graded = if alpha_invalid {
+                [0.0, 0.0, 0.0]
+            } else {
+                graded.map(|value| value * alpha)
+            };
+        }
+
+        if mix >= 1.0 {
+            return [graded[0], graded[1], graded[2], alpha];
         }
         let mut out = rgba;
         for c in 0..3 {
-            out[c] = rgba[c] + (corrected[c] - rgba[c]) * mix;
+            out[c] = rgba[c] + (graded[c] - rgba[c]) * mix;
         }
         out
     }
